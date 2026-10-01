@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import type { ElixConfig } from "./config.js";
 import { getActiveProfile } from "./config.js";
 import { pingServer } from "../connection/ping.js";
+import { expectedProtocol, hasDataFor } from "../connection/version.js";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -139,23 +140,55 @@ export async function checkLiveApiKeys(
   };
 }
 
+/**
+ * Is there local protocol data for the target version? Without it Elix cannot
+ * join (A11 — the version is a config value, the data must exist for it).
+ */
+export function checkVersionData(version: string): CheckResult {
+  if (!hasDataFor(version)) {
+    return {
+      name: "version-data",
+      status: "fail",
+      note: `no minecraft-data for "${version}" — vendored data covers 26.2; update vendor/minecraft-data to move versions`,
+    };
+  }
+  const protocol = expectedProtocol(version);
+  if (protocol === 0) {
+    return { name: "version-data", status: "fail", note: `protocol unknown for "${version}"` };
+  }
+  return { name: "version-data", status: "ok", note: `${version} = protocol ${protocol}` };
+}
+
+/**
+ * Ping the server and compare its protocol to the one we expect for the
+ * configured version (A11/A13: warn on a mismatch rather than failing).
+ */
 export async function checkServer(
   host: string,
   port: number,
   ping: (h: string, p: number) => Promise<{ version: string; protocol: number; software: string; motd: string; players: { online: number; max: number } }> = pingServer,
+  targetVersion?: string,
 ): Promise<CheckResult> {
+  const expected = targetVersion ? expectedProtocol(targetVersion) : 0;
   try {
     const r = await ping(host, port);
-    return {
-      name: "server",
-      status: "ok",
-      note: `${host}:${port} — ${r.software} ${r.version} (protocol ${r.protocol}), ${r.players.online}/${r.players.max} players`,
-    };
+    const base = `${host}:${port} — ${r.software} "${r.version}" (protocol ${r.protocol}), ${r.players.online}/${r.players.max} players`;
+    if (r.motd.length > 0) {
+      return { name: "server", status: "ok", note: `${base} — motd: ${r.motd}` };
+    }
+    if (expected !== 0 && r.protocol !== expected) {
+      return {
+        name: "server",
+        status: "warn",
+        note: `${base} — protocol mismatch: expected ${expected} for ${targetVersion}, server reports ${r.protocol}`,
+      };
+    }
+    return { name: "server", status: "ok", note: base };
   } catch (err) {
     return {
       name: "server",
       status: "warn",
-      note: `${host}:${port} ping failed: ${(err as Error).message}`,
+      note: `${host}:${port} ping failed: ${(err as Error).message} (elix start will retry with backoff)`,
     };
   }
 }
@@ -174,10 +207,11 @@ export async function runDoctor(opts: DoctorOptions): Promise<CheckResult[]> {
 
   return Promise.all([
     Promise.resolve(checkNodeVersion()),
+    Promise.resolve(checkVersionData(profile.version)),
     checkFfmpeg(exec),
     Promise.resolve(checkApiKeys(env)),
     checkLiveApiKeys(env, liveCall),
-    checkServer(profile.host, profile.port, ping),
+    checkServer(profile.host, profile.port, ping, profile.version),
   ]);
 }
 

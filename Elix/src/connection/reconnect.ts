@@ -38,8 +38,11 @@ const PERMANENT_TRANSLATE_KEYS: Array<[string, DisconnectKind]> = [
 ];
 
 /** Whole-word regex patterns for text-based kick reasons. */
+// Vanilla's English text is "You are not white-listed on this server!", while
+// proxies and forks also produce "whitelisted" and "white listed". The old
+// /\bwhitelist\b/ matched none of those reliably.
 const BAN_PATTERNS = [/\bbanned\b/, /\bban\b(?!ned\s+from\s+being\s+over)/];
-const WHITELIST_PATTERNS = [/\bnot\s+whitelisted\b/, /\bwhitelist\b/, /\bwhite-list\b/];
+const WHITELIST_PATTERNS = [/\bnot\s+white[-\s]?listed\b/, /\bwhite[-\s]?list(ed)?\b/];
 const ONLINE_MODE_PATTERNS = [
   /\bonline[ -]?mode\b/,
   /\bfailed\s+to\s+verify\s+username\b/,

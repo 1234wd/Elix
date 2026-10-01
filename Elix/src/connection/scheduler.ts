@@ -21,7 +21,8 @@ export class ReconnectScheduler {
 
   /**
    * Schedule a reconnect if the disconnect is retryable.
-   * Returns null if the disconnect is permanent (ban/whitelist/etc).
+   * Returns null if the disconnect is permanent (ban/whitelist/etc) or if
+   * a reconnect is already pending.
    */
   scheduleReconnect(
     shouldRetry: boolean,
@@ -30,12 +31,14 @@ export class ReconnectScheduler {
   ): ScheduleResult | null {
     if (this.cancelled) return null;
     if (!shouldRetry) return null;
+    if (this.timer !== null) return null; // already pending — refuse
 
     this.attempt++;
     const attempt = this.attempt;
     const delayMs = retryAfterMs;
 
     this.timer = setTimeout(() => {
+      this.timer = null; // clear before firing so a new one can be scheduled
       if (!this.cancelled) {
         reconnectFn();
       }
@@ -51,6 +54,15 @@ export class ReconnectScheduler {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  /**
+   * Forget the backoff ladder after a successful spawn, so the next kick starts
+   * at 5 s again. A pending timer is deliberately NOT cancelled — the
+   * connection is live right now.
+   */
+  reset(): void {
+    this.attempt = 0;
   }
 
   /** Whether a reconnect is currently pending. */

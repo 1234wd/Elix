@@ -12,7 +12,7 @@ export const PROJECT_ROOT = resolve(fileURLToPath(new URL(".", import.meta.url))
 // ---------------------------------------------------------------------------
 
 const botSchema = z.object({
-  username: z.string().min(1).max(16).default("Elix"),
+  username: z.string().regex(/^[A-Za-z0-9_]{3,16}$/).default("Elix"),
   /** Target server version — a config value, never hard-coded in source. */
   version: z.string().min(1).default("26.2"),
   serverAllowlist: z.array(z.string()).default([]),
@@ -73,7 +73,7 @@ export type ServerProfile = z.infer<typeof profileSchema>;
 // models.yaml schema
 // ---------------------------------------------------------------------------
 
-const providerNameSchema = z.enum(["groq", "nvidia", "hf", "local"]);
+const providerNameSchema = z.enum(["groq", "nvidia", "hf", "builtin"]);
 
 const modelRefSchema = z.object({
   provider: providerNameSchema,
@@ -181,9 +181,15 @@ export function resolveFromRoot(p: string): string {
 /** Get the active server profile. Falls back to a synthetic profile from CLI overrides. */
 export function getActiveProfile(
   config: ElixConfig,
-  overrides?: { host?: string; port?: number; version?: string },
-): ServerProfile & { name: string } {
-  const name = overrides?.host ? "(cli)" : (config.server.profile ?? "main");
+  overrides?: {
+    host?: string;
+    port?: number;
+    version?: string;
+    username?: string;
+    profile?: string;
+  },
+): ServerProfile & { name: string; username: string } {
+  const name = overrides?.profile ?? (overrides?.host ? "(cli)" : (config.server.profile ?? "main"));
   const profile = config.profiles[name] ?? config.profiles["main"];
   if (!profile) {
     throw new ConfigError(`No server profile "${name}" found in config/elix.yaml`);
@@ -194,5 +200,6 @@ export function getActiveProfile(
     port: overrides?.port ?? profile.port,
     version: overrides?.version ?? profile.version,
     description: profile.description,
+    username: overrides?.username ?? config.bot.username,
   };
 }

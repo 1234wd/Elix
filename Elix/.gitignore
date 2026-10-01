@@ -1,7 +1,9 @@
 node_modules/
 dist/
 .env
-data/
+data/elix.db*
+data/backups/
+data/kb/
 *.log
 .DS_Store
 Thumbs.db

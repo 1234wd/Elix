@@ -39,7 +39,7 @@ roles:
     # Prompt-injection / safety filter.
     preference:
       - { provider: groq, model: "openai/gpt-oss-safeguard-20b" }
-      - { provider: local, model: "keyword-regex" }
+      - { provider: builtin, model: "keyword-regex" }
 
 providers:
   groq:
@@ -51,6 +51,6 @@ providers:
   hf:
     baseUrl: https://router.huggingface.co/v1
     env: HF_TOKEN
-  local:
+  builtin:
     baseUrl: null
     env: null

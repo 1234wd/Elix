@@ -81,7 +81,7 @@ describe("modelsConfigSchema", () => {
     expect(models.roles.stt.preference[0]).toMatchObject({ provider: "groq" });
     expect(models.roles.tts.preference[0]).toMatchObject({ provider: "nvidia" });
     expect(models.roles.embeddings.preference[0]).toMatchObject({ provider: "nvidia" });
-    expect(models.providers.groq.baseUrl).toBe("https://api.groq.com/openai/v1");
+    expect(models.providers.groq?.baseUrl).toBe("https://api.groq.com/openai/v1");
   });
 
   it("rejects an unknown provider", () => {

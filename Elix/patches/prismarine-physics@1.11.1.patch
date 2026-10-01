@@ -1,4 +1,5 @@
 diff --git a/lib/features.json b/lib/features.json
+index 647ea481d2521ef1f4b19c18a1e9af4857272a5a..8003be58c738bef42c42fa11fc0d335f29c4b873 100644
 --- a/lib/features.json
 +++ b/lib/features.json
 @@ -7,7 +7,7 @@
@@ -10,3 +11,12 @@ diff --git a/lib/features.json b/lib/features.json
    },
    {
      "name": "velocityBlocksOnCollision",
+@@ -22,7 +22,7 @@
+   {
+     "name": "climbUsingJump",
+     "description": "Entity can climb ladders and vines by pressing jump",
+-    "versions": ["1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "1.21", "26.1"]
++    "versions": ["1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "1.21", "26.1", "26.2"]
+   },
+   {
+     "name": "climbableTrapdoor",

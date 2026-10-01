@@ -1,9 +1,17 @@
+#!/usr/bin/env node
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { loadElixConfig, ConfigError } from "../core/config.js";
+import { config as loadDotenv } from "dotenv";
+import { resolve } from "node:path";
+import { loadElixConfig, ConfigError, PROJECT_ROOT } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
 import { bus } from "../core/events.js";
 import { registerDoctor } from "./doctor.js";
 import { registerStubs } from "./stubs.js";
+
+// Load .env before anything else so API keys are available from any folder (A5).
+loadDotenv({ path: resolve(PROJECT_ROOT, ".env"), quiet: true });
 
 export async function main(argv: string[] = process.argv): Promise<number> {
   const program = new Command();
@@ -42,12 +50,43 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   return 0;
 }
 
-// Allow `node dist/cli/index.js` and tsx direct execution.
-const isDirectRun =
-  process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
-if (isDirectRun) {
-  main().catch((err) => {
-    console.error(err);
+/**
+ * Robust direct-run detection (A10).
+ *
+ * The old check compared `import.meta.url` against `file://${process.argv[1]}`,
+ * which breaks on Windows (drive-letter case, backslashes, spaces) and made
+ * `elix` silently do nothing. Comparing realpath on both sides, case-insensitively
+ * on win32, is reliable.
+ */
+export function isDirectRun(argv1: string | undefined = process.argv[1]): boolean {
+  if (!argv1) return false;
+  try {
+    const selfPath = realpathSync(fileURLToPath(import.meta.url));
+    const invokedPath = realpathSync(argv1);
+    const norm = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+    return norm(selfPath) === norm(invokedPath);
+  } catch {
+    // argv[1] may be a loader/eval path that doesn't exist on disk.
+    return false;
+  }
+}
+
+export async function run(): Promise<void> {
+  try {
+    const code = await main();
+    if (code !== 0) process.exit(code);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
     process.exit(1);
-  });
+  }
+}
+
+/**
+ * Auto-run when this module IS the process entrypoint (i.e. `tsx src/cli/index.ts`
+ * during development). The published binary uses bin.ts, which calls run()
+ * unconditionally — bundling folds both into one file, so the guard has to
+ * tolerate argv[1] pointing at the bundle rather than at index.ts.
+ */
+if (isDirectRun() && process.env["ELIX_NO_AUTORUN"] !== "1") {
+  void run();
 }

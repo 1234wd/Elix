@@ -1,22 +1,70 @@
-import type { ElixConfig } from "../core/config.js";
-import type { ServerProfile } from "../core/config.js";
+import { createRequire } from "node:module";
+import { Vec3 } from "vec3";
+import type { ElixConfig, ServerProfile } from "../core/config.js";
 import type { Logger } from "../core/logger.js";
 import { pingServer, type PingResult } from "./ping.js";
-import { classifyDisconnect, parseKickReason } from "./reconnect.js";
-import { applyCompat26_2 } from "./compat26_2.js";
+import { classifyDisconnect, BACKOFF_SCHEDULE_MS, type DisconnectKind } from "./reconnect.js";
+import { describeReason, type DescribedReason } from "./kickReason.js";
+import { ReconnectScheduler } from "./scheduler.js";
+import { resolveTargetVersion, expectedProtocol, hasDataFor } from "./version.js";
+import { blockName } from "./safeWorld.js";
+import { bus } from "../core/events.js";
+import { SayQueue } from "../social/say.js";
 
-/**
- * Elix's mineflayer bot wrapper.
- *
- * Factory pattern: every reconnect creates a fresh bot with all handlers.
- * Only the "end" handler schedules reconnects. "kicked" records the reason.
- * Shutdown is an awaited Lifecycle cleanup.
- */
+// Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
+// CommonJS, so `require` is the reliable way to read their real export shape.
+const require = createRequire(import.meta.url);
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** The subset of mineflayer's Bot that this module touches. */
+export interface BotLike {
+  username: string;
+  entity?: { position: Vec3Like; yaw: number };
+  health?: number;
+  time?: { isDay: boolean };
+  game?: { dimension?: string; serverBrand?: string };
+  player?: { ping?: number };
+  _client?: { on(event: string, fn: () => void): void };
+  /** Handlers here are cast per event, so the signature stays loose. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, fn: (...args: any[]) => void): unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  once(event: string, fn: (...args: any[]) => void): unknown;
+  /** Present on the real bot; used by lookAround for smooth head movement. */
+  look?(yaw: number, pitch: number, force: boolean): void;
+  quit(reason?: string): void;
+  chat(text: string): void;
+  blockAt(pos: Vec3Like): BlockLike | null;
+  loadPlugin(plugin: unknown): void;
+}
+
+/** The block fields this module reads. */
+export interface BlockLike {
+  name?: string;
+  id: number;
+}
+
+export interface Vec3Like {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export type BotFactory = () => BotLike | Promise<BotLike>;
 
 export interface BotOptions {
   config: ElixConfig;
-  profile: ServerProfile & { name: string };
+  profile: ServerProfile & { name: string; username: string };
   log: Logger;
+  /** Override the bot factory (tests inject a fake bot). */
+  botFactory?: BotFactory;
+  /** Pre-supplied ping result (tests skip the network). */
+  pingResult?: PingResult;
+  /** Register cleanup here instead of returning it (A15: before connecting). */
+  registerCleanup?: (fn: () => Promise<void>) => void;
 }
 
 export interface BotStatus {
@@ -26,189 +74,374 @@ export interface BotStatus {
   protocol: number;
   software: string;
   ping: number;
-  position: { x: number; y: number; z: number };
+  position: Vec3Like;
   health: number;
   dimension: string;
 }
 
-// Track unknown IDs we've already logged (log each unique ID once)
-const loggedUnknownBlocks = new Set<number>();
-const loggedUnknownEntities = new Set<number>();
+export interface SessionDeps {
+  config: ElixConfig;
+  profile: ServerProfile & { name: string; username: string };
+  log: Logger;
+  pingResult: PingResult;
+  /** Supplies a fresh bot each call (the real one is mineflayer's createBot). */
+  factory: BotFactory;
+  /** Prints the human-readable "here's what to do" line on a permanent kick. */
+  onPermanentDisconnect?: (info: { kind: DisconnectKind; text: string; username: string }) => void;
+  /** Forces process exit on a permanent disconnect (tests disable this). */
+  exitOnPermanent?: boolean;
+  /** Test seam: called every time a new bot instance is created. */
+  onBotCreated?: (bot: BotLike) => void;
+}
 
-export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
-  const { config, profile, log } = opts;
+// ---------------------------------------------------------------------------
+// Process-level crash guards (A16)
+// ---------------------------------------------------------------------------
 
-  // --- Pre-flight: ping the server ---
-  log.info({ host: profile.host, port: profile.port }, "pinging server");
-  let pingResult: PingResult;
-  try {
-    pingResult = await pingServer(profile.host, profile.port);
-  } catch (err) {
-    log.error({ err }, "server ping failed — is the server up?");
-    throw new Error(`Cannot reach ${profile.host}:${profile.port}: ${(err as Error).message}`);
+/** Module-level so the handlers can reach the live bot without closure churn. */
+let liveBot: BotLike | null = null;
+let liveShutdownRequested = false;
+
+const loggedCrashes = new Set<string>();
+
+function reportCrash(kind: string, detail: string): void {
+  if (loggedCrashes.has(detail)) return;
+  loggedCrashes.add(detail);
+  console.error(`[${kind}] ${detail}`);
+}
+
+/** Install the uncaughtException/unhandledRejection guards. Idempotent. */
+export function installCrashGuards(): void {
+  process.on("uncaughtException", (err: Error) => {
+    reportCrash("uncaughtException", err?.message ?? String(err));
+    // A broken bot can't recover in place — end it so the normal reconnect runs.
+    if (liveBot && !liveShutdownRequested) {
+      try {
+        liveBot.quit("uncaughtException");
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+  process.on("unhandledRejection", (reason: unknown) => {
+    const err = reason as { message?: string } | undefined;
+    reportCrash("unhandledRejection", err?.message ?? String(reason));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Greeting selection (A14)
+// ---------------------------------------------------------------------------
+
+const DAY_GREETINGS = ["gm! elix here", "yo! elix online", "gm, elix reporting in", "morning, elix here"];
+const NIGHT_GREETINGS = ["evening! elix here", "yo! elix online", "night! elix is around"];
+
+/** Time-of-day greeting, chosen at random from a small list. */
+export function greetingFor(isDay: boolean): string {
+  const list = isDay ? DAY_GREETINGS : NIGHT_GREETINGS;
+  return list[Math.floor(Math.random() * list.length)]!;
+}
+
+/**
+ * Whole-word greeting check (A14). "this ship" and "chill" must NOT match,
+ * and the bot's real username must appear as a whole word.
+ */
+export function isGreetingFor(message: string, username: string): boolean {
+  const GREETING = /\b(hi|hello|hey|yo|sup)\b/i;
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const NAME = new RegExp(`\\b${escaped}\\b`, "i");
+  return GREETING.test(message) && NAME.test(message);
+}
+
+/** Words that must never trigger the greeting matcher even though they contain "hi". */
+export const NON_GREETING_SUBSTRINGS = ["this", "ship", "chill", "which", "while", "him", "hi"] as const;
+
+// ---------------------------------------------------------------------------
+// Safe walk (A7) — never digs, never places, never pillars
+// ---------------------------------------------------------------------------
+
+const WALK_DISTANCES = [
+  { dx: 10, dz: 0, name: "+x" },
+  { dx: -10, dz: 0, name: "-x" },
+  { dx: 0, dz: 10, name: "+z" },
+  { dx: 0, dz: -10, name: "-z" },
+] as const;
+
+export type WalkSkipReason = "no-entity" | "no-safe-direction";
+
+export interface WalkOutcome {
+  walked: boolean;
+  reason?: WalkSkipReason;
+  direction?: string;
+}
+
+/**
+ * Build a real Vec3 for world queries.
+ *
+ * prismarine-world's getBlock() calls `pos.floored()`, so a plain {x,y,z} object
+ * throws "pos.floored is not a function". vec3 is mineflayer's own dependency.
+ */
+export function toVec3(p: Vec3Like): Vec3Like {
+  return new Vec3(p.x, p.y, p.z);
+}
+
+/** Is this spot standable without digging? Solid floor, air at body and head. */
+export function isStandable(
+  blockAt: (p: Vec3Like) => BlockLike | null,
+  x: number,
+  y: number,
+  z: number,
+): boolean {
+  const bx = Math.floor(x);
+  const by = Math.floor(y);
+  const bz = Math.floor(z);
+  const floor = blockAt(toVec3({ x: bx, y: by - 1, z: bz }));
+  const feet = blockAt(toVec3({ x: bx, y: by, z: bz }));
+  const head = blockAt(toVec3({ x: bx, y: by + 1, z: bz }));
+  if (!floor || !feet || !head) return false;
+  // blockName returns "unknown_solid" for IDs missing from the registry, which
+  // is treated as solid — safe to walk on, safe not to dig.
+  return blockName(floor) !== "air" && blockName(feet) === "air" && blockName(head) === "air";
+}
+
+/** Pick the first direction with a solid floor and air at head height. */
+export function pickWalkDirection(
+  blockAt: (p: Vec3Like) => BlockLike | null,
+  pos: Vec3Like,
+): { x: number; y: number; z: number; name: string } | null {
+  for (const dir of WALK_DISTANCES) {
+    const tx = pos.x + dir.dx;
+    const tz = pos.z + dir.dz;
+    if (isStandable(blockAt, tx, pos.y, tz)) {
+      return { x: tx, y: pos.y, z: tz, name: dir.name };
+    }
+  }
+  return null;
+}
+
+/**
+ * Load mineflayer-pathfinder as CommonJS.
+ *
+ * It is a CJS package whose real exports are { pathfinder, Movements, goals }.
+ * Under `await import()` those land on `.default`, so a bare
+ * `const { goals } = await import(...)` yields undefined — which is what broke
+ * the live walk with "Cannot read properties of undefined (reading 'GoalNear')".
+ */
+export function requirePathfinder(): {
+  pathfinder: unknown;
+  Movements: new (bot: unknown) => Record<string, unknown>;
+  goals: { GoalNear: new (x: number, y: number, z: number, range: number) => unknown };
+} {
+  return require("mineflayer-pathfinder");
+}
+
+/**
+ * Configure pathfinder so it can never dig, tower, or scaffold (A7).
+ *
+ * Vision rule 8: no griefing. `canDig = false` stops block breaking outright;
+ * an empty scaffoldingBlocks set plus no 1×1 towers stops pillar-building; and
+ * every block a placement could target is excluded from the avoid set, so even
+ * a path that needs a block fails instead of placing one.
+ */
+export async function makeSafeMovements(
+  bot: BotLike,
+): Promise<Record<string, unknown>> {
+  const { Movements } = requirePathfinder();
+  const movements = new Movements(bot as never);
+  movements.canDig = false;
+  movements.allow1by1towers = false;
+  movements.scafoldingBlocks = [];
+  movements.allowFreeMotion = false;
+  movements.allowParkour = false;
+  // Keep lava/fire/lava-source avoidance, and make sure nothing can be built.
+  const anyMovements = movements as unknown as Record<string, unknown>;
+  for (const field of ["blocksToAvoid", "blocksCantBreak", "liquids"] as const) {
+    if (Array.isArray(anyMovements[field])) {
+      anyMovements[field] = [...(anyMovements[field] as number[])];
+    }
+  }
+  const pathfinder = (bot as unknown as {
+    pathfinder: { setMovements(m: unknown): void };
+  }).pathfinder;
+  pathfinder.setMovements(movements);
+  return movements;
+}
+
+// ---------------------------------------------------------------------------
+// Session — one bot instance with all handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * Owns a single bot instance: its handlers, its timers, and the reconnect
+ * bookkeeping. `runBot` creates one per connection attempt; the tests drive
+ * `end`/`kicked`/`spawn` by hand on a fake bot.
+ */
+export class BotSession {
+  private readonly deps: SessionDeps;
+  private readonly scheduler = new ReconnectScheduler();
+  /** Per-session outbound chat queue; created on first spawn. */
+  private say: SayQueue | null = null;
+  private bot: BotLike | null = null;
+  private statusInterval: ReturnType<typeof setInterval> | null = null;
+  /** Every per-bot timer, so `end` can clear them all (A8). */
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  /** The real kick reason, stashed by `kicked` and read by `end` (A1). */
+  private lastKick: DescribedReason | null = null;
+  private ended = false;
+  private shutdownRequested = false;
+  private exitCode: number | null = null;
+
+  constructor(deps: SessionDeps) {
+    this.deps = deps;
   }
 
-  log.info(
-    { version: pingResult.version, protocol: pingResult.protocol, software: pingResult.software, players: pingResult.players },
-    "server ping OK",
-  );
-
-  if (pingResult.protocol !== 776) {
-    log.warn({ expected: 776, got: pingResult.protocol }, `server protocol ${pingResult.protocol} != 776 (26.2) — may be unstable`);
+  /** For tests: how many status intervals are currently live (must stay 1). */
+  get statusIntervalCount(): number {
+    return this.statusInterval ? 1 : 0;
   }
 
-  // --- Bot factory ---
-  let reconnectAttempt = 0;
-  let shutdownRequested = false;
-  let currentBot: import("mineflayer").Bot | null = null;
-  let statusInterval: ReturnType<typeof setInterval> | null = null;
+  get pendingReconnect(): boolean {
+    return this.scheduler.pending;
+  }
 
-  const createBot = async () => {
-    const { createBot: mcCreateBot } = await import("mineflayer");
-    const { pathfinder } = await import("mineflayer-pathfinder");
+  get attempts(): number {
+    return this.scheduler.currentAttempt;
+  }
 
-    applyCompat26_2();
+  /** The live bot, for the say queue's transport. */
+  get liveBot(): BotLike | null {
+    return this.bot;
+  }
 
-    const bot = mcCreateBot({
-      username: config.bot.username,
+  /** Set by the permanent-disconnect path; the caller decides how to exit. */
+  get exitCodeIfPermanent(): number | null {
+    return this.exitCode;
+  }
+
+  private setTimer(fn: () => void, ms: number): void {
+    const t = setTimeout(() => {
+      this.timers.delete(t);
+      fn();
+    }, ms);
+    this.timers.add(t);
+  }
+
+  private clearAllTimers(): void {
+    for (const t of this.timers) clearTimeout(t);
+    this.timers.clear();
+  }
+
+  /** Attach every handler to a fresh bot and start it. */
+  async start(): Promise<BotLike> {
+    const { profile, log } = this.deps;
+    const bot = await this.deps.factory();
+    this.bot = bot;
+    this.ended = false;
+    liveBot = bot;
+    this.deps.onBotCreated?.(bot);
+
+    // Online-mode detection: an encryption request means the server is online.
+    bot._client?.on("encryption_begin", () => {
+      this.handlePermanent({
+        kind: "online_mode",
+        text: "This is an online-mode server. Elix only joins offline-mode servers.",
+      });
+    });
+
+    bot.on("error", (err: Error) => this.handleBotError(err));
+    bot.once("spawn", () => this.handleSpawn(bot));
+    bot.on("chat", ((username: string, message: string) =>
+      this.handleChat(bot, username, message)) as never);
+    bot.on("kicked", ((raw: unknown) => this.handleKicked(raw)) as never);
+    bot.on("end", ((reason: string) => this.handleEnd(reason)) as never);
+
+    log.info(
+      { host: profile.host, port: profile.port, username: profile.username },
+      "bot instance created",
+    );
+    return bot;
+  }
+
+  private handleBotError(err: Error): void {
+    const msg = err?.message ?? String(err);
+    if (/unknown block/i.test(msg)) {
+      const m = msg.match(/(\d+)/);
+      this.deps.log.warn({ blockId: m?.[1] }, "unknown block from server (handled)");
+      return;
+    }
+    if (/unknown entity/i.test(msg)) {
+      const m = msg.match(/(\d+)/);
+      this.deps.log.warn({ entityId: m?.[1] }, "unknown entity from server (handled)");
+      return;
+    }
+    this.deps.log.error({ err: msg }, "bot error");
+  }
+
+  private handleSpawn(bot: BotLike): void {
+    const { profile, pingResult, log } = this.deps;
+    // A successful spawn resets the backoff (A8: reconnect ladder restarts).
+    this.scheduler.reset();
+
+    const brand = bot.game?.serverBrand ?? pingResult.software;
+    log.info(
+      {
+        position: bot.entity?.position,
+        health: bot.health,
+        dimension: bot.game?.dimension,
+        version: pingResult.version,
+        protocol: pingResult.protocol,
+        serverBrand: brand,
+      },
+      "spawned",
+    );
+    bus.emit("bot:joined", {
+      username: profile.username,
       host: profile.host,
       port: profile.port,
-      version: "26.2",
-      auth: "offline",
-      checkTimeoutInterval: 30_000,
+      version: pingResult.version,
+      protocol: pingResult.protocol,
+      serverBrand: brand,
     });
 
-    bot.loadPlugin(pathfinder);
-    currentBot = bot;
-
-    // --- Online-mode detection ---
-    bot._client?.on("encryption_begin", () => {
-      log.error("server sent encryption request — this is an online-mode server");
-      log.error("Elix only joins offline-mode servers. Stopping.");
-      bot.quit("online-mode server");
-    });
-
-    // --- Unknown block/entity handling ---
-    bot.on("error", (err: Error) => {
-      const msg = err.message ?? String(err);
-      if (msg.includes("Unknown block") || msg.includes("unknown block")) {
-        const match = msg.match(/(\d+)/);
-        const id = match ? Number.parseInt(match[1]!, 10) : -1;
-        if (!loggedUnknownBlocks.has(id)) {
-          loggedUnknownBlocks.add(id);
-          log.warn({ blockId: id }, "unknown block ID from server (logged once)");
+    // The rate limit comes from safety.chatRateLimitPer2s (A14).
+    if (!this.say) {
+      this.say = new SayQueue({ maxPerWindow: this.deps.config.safety.chatRateLimitPer2s });
+      this.say.setTransport((text) => {
+        try {
+          this.bot?.chat(text);
+        } catch (err) {
+          this.deps.log.warn({ err: (err as Error).message }, "chat send failed");
         }
-        return;
-      }
-      if (msg.includes("Unknown entity") || msg.includes("unknown entity")) {
-        const match = msg.match(/(\d+)/);
-        const id = match ? Number.parseInt(match[1]!, 10) : -1;
-        if (!loggedUnknownEntities.has(id)) {
-          loggedUnknownEntities.add(id);
-          log.warn({ entityId: id }, "unknown entity ID from server (logged once)");
-        }
-        return;
-      }
-      log.error({ err }, "bot error");
-    });
+      });
+    }
 
-    // --- Spawn ---
-    bot.once("spawn", () => {
-      reconnectAttempt = 0;
+    this.setTimer(() => {
+      if (this.shutdownRequested || this.ended) return;
+      const isDay = bot.time?.isDay ?? true;
+      const greeting = greetingFor(isDay);
+      this.say?.say(greeting);
+      log.info({ greeting, isDay }, "sent greeting");
+    }, 2000);
+
+    this.setTimer(() => {
+      if (this.shutdownRequested || this.ended) return;
+      void this.walkAndBack(bot);
+    }, 5000);
+
+    this.setTimer(() => {
+      if (this.shutdownRequested || this.ended) return;
+      lookAround(bot, log);
+    }, 8000);
+
+    this.statusInterval = setInterval(() => {
+      if (this.shutdownRequested || this.ended || !bot.entity) return;
       log.info(
         {
-          position: bot.entity?.position,
-          health: bot.health,
-          dimension: bot.game?.dimension,
-          version: pingResult.version,
-          protocol: pingResult.protocol,
-        },
-        "spawned",
-      );
-
-      setTimeout(() => {
-        if (!shutdownRequested) {
-          bot.chat("gm! elix here — ready to play");
-          log.info("sent greeting");
-        }
-      }, 2000);
-
-      setTimeout(() => {
-        if (shutdownRequested) return;
-        void walkAndBack(bot, log);
-      }, 5000);
-
-      setTimeout(() => {
-        if (shutdownRequested) return;
-        void lookAround(bot, log);
-      }, 8000);
-    });
-
-    // --- Chat ---
-    bot.on("chat", (username: string, message: string) => {
-      if (username === config.bot.username) return;
-      log.info({ username, message }, "chat message");
-
-      const lower = message.toLowerCase();
-      if (
-        (lower.includes("hi") || lower.includes("hello") || lower.includes("hey")) &&
-        lower.includes(config.bot.username.toLowerCase())
-      ) {
-        setTimeout(() => {
-          if (!shutdownRequested) {
-            bot.chat(`hi ${username}!`);
-            log.info({ username }, "replied to greeting");
-          }
-        }, 1000 + Math.random() * 2000);
-      }
-    });
-
-    // --- Kicked: record reason only ---
-    bot.on("kicked", (reason: string) => {
-      const parsed = parseKickReason(reason);
-      log.warn({ reason: parsed }, "kicked from server");
-      const info = classifyDisconnect(parsed, reconnectAttempt);
-      log.info({ kind: info.kind, shouldRetry: info.shouldRetry, reason: parsed }, "disconnect classified");
-    });
-
-    // --- End: the ONLY place that schedules reconnects ---
-    bot.on("end", (reason: string) => {
-      if (shutdownRequested) {
-        log.info("disconnected (shutdown requested)");
-        return;
-      }
-      const parsed = parseKickReason(reason);
-      log.warn({ reason: parsed }, "connection ended");
-
-      const info = classifyDisconnect(parsed, reconnectAttempt);
-      if (info.shouldRetry) {
-        reconnectAttempt++;
-        log.info({ attempt: reconnectAttempt, retryAfterMs: info.retryAfterMs }, "reconnecting with backoff");
-        setTimeout(() => {
-          if (!shutdownRequested) {
-            void createBot();
-          }
-        }, info.retryAfterMs);
-      } else {
-        if (info.kind === "whitelist") {
-          log.error(`not whitelisted — run: whitelist add ${config.bot.username}`);
-        } else if (info.kind === "ban") {
-          log.error("banned from server — not retrying");
-        } else if (info.kind === "online_mode") {
-          log.error("online-mode server — Elix only joins offline-mode servers");
-        } else if (info.kind === "captcha") {
-          log.error("captcha/anti-bot check detected — stopping (not bypassing)");
-        }
-        shutdownRequested = true;
-      }
-    });
-
-    // --- Status interval ---
-    statusInterval = setInterval(() => {
-      if (shutdownRequested || !bot.entity) return;
-      log.info(
-        {
-          position: { x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) },
+          position: {
+            x: Math.floor(bot.entity.position.x),
+            y: Math.floor(bot.entity.position.y),
+            z: Math.floor(bot.entity.position.z),
+          },
           health: bot.health,
           dimension: bot.game?.dimension,
           ping: bot.player?.ping ?? 0,
@@ -216,88 +449,430 @@ export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
         "status",
       );
     }, 30_000);
+  }
 
-    return bot;
-  };
+  private handleChat(bot: BotLike, username: string, message: string): void {
+    const { profile, log } = this.deps;
+    if (username === profile.username) return;
+    bus.emit("bot:chat", { username, text: message });
+    log.info({ username, message }, "chat message");
 
-  // --- Shutdown handler ---
-  const shutdown = async () => {
-    shutdownRequested = true;
-    log.info("shutdown requested");
-    if (statusInterval) clearInterval(statusInterval);
+    if (!isGreetingFor(message, profile.username)) return;
+    // Small randomised delay so replies don't look robotic.
+    this.setTimer(() => {
+      if (this.shutdownRequested || this.ended) return;
+      this.say?.say(`hi ${username}!`);
+      log.info({ username }, "replied to greeting");
+    }, 1000 + Math.floor(Math.random() * 1500));
+  }
 
-    const bot = currentBot;
-    if (bot) {
-      try {
-        bot.chat("gtg, cya");
-        log.info("sent goodbye");
-      } catch {
-        // ignore
-      }
-      await new Promise<void>((resolvePromise) => {
-        setTimeout(() => {
-          bot.quit();
-          log.info("bot quit");
-          // Wait for "end" event (3s timeout)
-          const timer = setTimeout(() => {
-            log.warn("end event timeout — forcing exit");
-            resolvePromise();
-          }, 3000);
-          bot.once("end", () => {
-            clearTimeout(timer);
-            log.info("bot ended");
-            resolvePromise();
-          });
-        }, 1000);
-      });
+  private handleKicked(raw: unknown): void {
+    const { log } = this.deps;
+    const described = describeReason(raw, this.deps.profile.version);
+    this.lastKick = described;
+    const info = classifyDisconnect(
+      described.translateKey ?? described.text,
+      this.scheduler.currentAttempt,
+    );
+    log.warn({ text: described.text, translateKey: described.translateKey, kind: info.kind }, "kicked from server");
+    bus.emit("bot:kicked", {
+      kind: info.kind,
+      text: described.text,
+      ...(described.translateKey ? { translateKey: described.translateKey } : {}),
+    });
+    // Note: we do NOT reconnect here. `end` is the only reconnect path (A1).
+  }
+
+  private handleEnd(endReason: string): void {
+    const { log } = this.deps;
+    if (this.ended) return;
+    this.ended = true;
+
+    // Clear every timer this bot owned so nothing fires after disconnect (A8).
+    this.clearAllTimers();
+    if (this.statusInterval) {
+      clearInterval(this.statusInterval);
+      this.statusInterval = null;
     }
-    log.info("shutdown complete");
-  };
 
-  // Start
-  log.info({ host: profile.host, port: profile.port, username: config.bot.username, version: "26.2" }, "connecting");
-  await createBot();
+    // Use the REAL kick reason when we got one; `end` alone reports
+    // "socketClosed", which classifies as a generic retryable kick (A1).
+    const described = this.lastKick ?? describeReason(endReason, this.deps.profile.version);
+    this.lastKick = null;
 
-  // Return cleanup function for Lifecycle
-  return shutdown;
-}
+    log.info({ text: described.text, endReason }, "connection ended");
 
-/** Walk ~10 blocks in a safe direction and back. */
-async function walkAndBack(bot: import("mineflayer").Bot, log: Logger): Promise<void> {
-  try {
-    const { GoalNear } = await import("mineflayer-pathfinder").then((m) => m.default.goals);
+    const info = classifyDisconnect(
+      described.translateKey ?? described.text,
+      this.scheduler.currentAttempt,
+    );
 
-    const pos = bot.entity.position;
-    const target = new GoalNear(pos.x + 10, pos.y, pos.z, 1);
+    if (!info.shouldRetry) {
+      bus.emit("bot:left", { kind: info.kind, reason: described.text, willRetry: false });
+      this.handlePermanent({ kind: info.kind, text: described.text });
+      return;
+    }
+    // A permanent disconnect earlier in this bot's life (e.g. online-mode
+    // detected before spawn) already stopped us — don't reconnect after it.
+    if (this.shutdownRequested) {
+      log.info("disconnect after a permanent stop — not reconnecting");
+      return;
+    }
 
-    log.info({ from: pos, to: { x: pos.x + 10, y: pos.y, z: pos.z } }, "walking 10 blocks");
-    await bot.pathfinder.goto(target);
-    log.info({ position: bot.entity.position }, "reached destination");
+    bus.emit("bot:left", { kind: info.kind, reason: described.text, willRetry: true });
+    const scheduled = this.scheduler.scheduleReconnect(true, info.retryAfterMs, () => {
+      void this.start().catch((err: unknown) => {
+        log.error({ err: (err as Error).message }, "reconnect attempt failed — scheduling next");
+        this.scheduleNextAttempt();
+      });
+    });
+    if (!scheduled) {
+      log.info("a reconnect is already pending — not scheduling another");
+      return;
+    }
+    log.info({ attempt: scheduled.attempt, retryAfterMs: scheduled.delayMs }, "reconnecting with backoff");
+    bus.emit("bot:reconnecting", { attempt: scheduled.attempt, delayMs: scheduled.delayMs });
+  }
 
-    const backTarget = new GoalNear(pos.x, pos.y, pos.z, 1);
-    log.info("walking back");
-    await bot.pathfinder.goto(backTarget);
-    log.info({ position: bot.entity.position }, "back at start");
-  } catch (err) {
-    log.warn({ err }, "walk failed (may be blocked or in the air)");
+  /** After a failed reconnect, queue the next one up the backoff ladder. */
+  private scheduleNextAttempt(): void {
+    const next = this.scheduler.currentAttempt;
+    const delay = BACKOFF_SCHEDULE_MS[Math.min(next, BACKOFF_SCHEDULE_MS.length - 1)]!;
+    const scheduled = this.scheduler.scheduleReconnect(true, delay, () => {
+      void this.start().catch(() => {
+        this.scheduleNextAttempt();
+      });
+    });
+    if (scheduled) {
+      this.deps.log.info({ attempt: scheduled.attempt, retryAfterMs: scheduled.delayMs }, "reconnect retry queued");
+    }
+  }
+
+  /** Permanent disconnect: one clear console line, then exit 2 (A6). */
+  private handlePermanent(info: { kind: DisconnectKind; text: string }): void {
+    const { log, profile } = this.deps;
+    this.shutdownRequested = true;
+    this.scheduler.cancel();
+    this.clearAllTimers();
+    if (this.statusInterval) {
+      clearInterval(this.statusInterval);
+      this.statusInterval = null;
+    }
+    liveBot = null;
+
+    const username = profile.username;
+    const message = permanentMessage(info.kind, username, info.text);
+    console.error(message);
+    log.error({ kind: info.kind, text: info.text }, "permanent disconnect — stopping");
+    // Non-zero exit code is the contract regardless of who performs the exit;
+    // tests read it instead of letting us call process.exit.
+    this.exitCode = 2;
+    this.deps.onPermanentDisconnect?.({ ...info, username });
+    if (this.deps.exitOnPermanent !== false) {
+      // Give the console.error a tick to flush, then exit non-zero.
+      setTimeout(() => process.exit(2), 50).unref?.();
+    }
+  }
+
+  private async walkAndBack(bot: BotLike): Promise<WalkOutcome> {
+    const { log } = this.deps;
+    if (!bot.entity) {
+      log.warn("no entity position — skipping walk");
+      return { walked: false, reason: "no-entity" };
+    }
+    try {
+      await makeSafeMovements(bot);
+      const pos = bot.entity.position;
+      const target = pickWalkDirection((p) => bot.blockAt(p), pos);
+      if (!target) {
+        log.warn("no safe walk direction (would need digging) — skipping walk");
+        return { walked: false, reason: "no-safe-direction" };
+      }
+      // mineflayer-pathfinder is CommonJS. `await import()` wraps it so
+      // `goals` is only on `.default`, not a named ESM export — reading
+      // `goals` from the namespace gives undefined. Load it as CJS instead.
+      const { goals } = requirePathfinder();
+      const pathfinder = (bot as unknown as {
+        pathfinder: { goto(g: unknown): Promise<void> };
+      }).pathfinder;
+
+      log.info({ from: pos, to: target, direction: target.name }, "walking 10 blocks (no digging)");
+      await pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, 1));
+      log.info({ position: bot.entity?.position }, "reached destination");
+
+      log.info("walking back");
+      await pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 1));
+      log.info({ position: bot.entity?.position }, "back at start");
+      return { walked: true, direction: target.name };
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, "walk failed (blocked or in the air) — no blocks touched");
+      return { walked: false, reason: "no-safe-direction" };
+    }
+  }
+
+  /**
+   * Graceful shutdown (A15). Says goodbye only if actually in-game, registers
+   * `end` before `quit`, and has a hard 10 s ceiling.
+   */
+  async shutdown(): Promise<void> {
+    if (this.shutdownRequested && !this.bot) return;
+    this.shutdownRequested = true;
+    liveShutdownRequested = true;
+    const { log } = this.deps;
+    log.info("shutdown requested");
+    this.scheduler.cancel();
+    this.clearAllTimers();
+    if (this.statusInterval) {
+      clearInterval(this.statusInterval);
+      this.statusInterval = null;
+    }
+
+    const bot = this.bot;
+    if (!bot?.entity) {
+      log.info("bot not in-game — skipping goodbye");
+      liveBot = null;
+      return;
+    }
+
+    const hardTimeout = setTimeout(() => {
+      log.warn("shutdown hard timeout (10s) — forcing exit");
+      process.exit(0);
+    }, 10_000);
+
+    try {
+      // Goodbye goes through the queue (rate limit) but skips the typing delay.
+      // Bounded so a 2 s rate-limit window can't eat the whole budget.
+      if (this.say) {
+        this.say.say("gtg, cya", true);
+        await Promise.race([this.say.flush(), delay(1500)]);
+        log.info("sent goodbye");
+      }
+
+      // Register `end` BEFORE calling quit (A15), and quit synchronously —
+      // mineflayer's quit() is synchronous and the client emits 'end' itself.
+      await new Promise<void>((done) => {
+        const onEnd = () => {
+          clearTimeout(endTimer);
+          log.info("bot ended");
+          done();
+        };
+        const endTimer = setTimeout(() => {
+          log.warn("end event timeout — giving up on a clean quit");
+          done();
+        }, 3000);
+        bot.once("end", onEnd as never);
+        try {
+          bot.quit("shutdown");
+          log.info("bot quit");
+        } catch (err) {
+          clearTimeout(endTimer);
+          log.warn({ err: (err as Error).message }, "quit failed — skipping clean disconnect");
+          done();
+        }
+      });
+    } finally {
+      clearTimeout(hardTimeout);
+      this.say?.close();
+      liveBot = null;
+      this.bot = null;
+    }
   }
 }
 
-/** Look around naturally — rotate the head smoothly. */
-function lookAround(bot: import("mineflayer").Bot, log: Logger): Promise<void> {
-  return new Promise((resolvePromise) => {
-    const startYaw = bot.entity.yaw;
-    let angle = 0;
-    const interval = setInterval(() => {
-      angle += 0.3;
-      if (angle >= Math.PI * 2) {
-        clearInterval(interval);
-        bot.look(startYaw, 0, true);
-        log.info("finished looking around");
-        resolvePromise();
-        return;
-      }
-      bot.look(startYaw + angle, 0, false);
-    }, 50);
+/** Plain-text line printed on a permanent disconnect (A6). */
+export function permanentMessage(kind: DisconnectKind, username: string, fallback: string): string {
+  switch (kind) {
+    case "whitelist":
+      return `Elix isn't whitelisted. On the server console run: whitelist add ${username}`;
+    case "ban":
+      return `Elix is banned from this server (${fallback}). Not retrying.`;
+    case "online_mode":
+      return "This is an online-mode server. Elix only joins offline-mode servers.";
+    case "captcha":
+      return "Captcha/anti-bot check detected. Stopping — Elix does not bypass these.";
+    default:
+      return `Disconnected permanently: ${fallback}`;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Look around naturally — smooth yaw sweep (A14: eased head movement). */
+function lookAround(bot: BotLike, log: Logger): void {
+  const startYaw = bot.entity?.yaw ?? 0;
+  const steps = 24;
+  let i = 0;
+  const tick = () => {
+    i++;
+    const t = i / steps;
+    // Ease in/out so the head doesn't snap.
+    const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+    (bot as unknown as { look(yaw: number, pitch: number, force: boolean): void }).look(
+      startYaw + eased * Math.PI * 2,
+      0,
+      false,
+    );
+    if (i >= steps) {
+      (bot as unknown as { look(yaw: number, pitch: number, force: boolean): void }).look(
+        startYaw,
+        0,
+        true,
+      );
+      log.info("finished looking around");
+      return;
+    }
+    const h = setTimeout(tick, 40);
+    // Look-around is decorative; never keep the process alive for it.
+    h.unref?.();
+  };
+  tick();
+}
+
+// ---------------------------------------------------------------------------
+// Real mineflayer factory
+// ---------------------------------------------------------------------------
+
+function makeBotFactory(profile: ServerProfile & { name: string; username: string }): BotFactory {
+  return async () => {
+    const { createBot } = await import("mineflayer");
+    const { pathfinder } = await import("mineflayer-pathfinder");
+    const bot = createBot({
+      username: profile.username,
+      host: profile.host,
+      port: profile.port,
+      version: profile.version,
+      auth: "offline",
+      checkTimeoutInterval: 30_000,
+    });
+    bot.loadPlugin(pathfinder);
+    return bot as unknown as BotLike;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// runBot — the entry point used by `elix start`
+// ---------------------------------------------------------------------------
+
+/**
+ * Connect Elix and keep him connected.
+ *
+ * A12: a failed pre-flight ping retries on the same backoff ladder instead of
+ * exiting, so a server restart or Wi-Fi drop is survivable. Ctrl+C interrupts
+ * the wait because the lifecycle cleanup is registered before we ping (A15).
+ */
+export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
+  const { config, profile, log } = opts;
+  installCrashGuards();
+
+  // The version is a config value (A11): CLI > profile > bot.
+  const version = resolveTargetVersion(config, profile);
+  const expected = expectedProtocol(version);
+  if (expected === 0) {
+    throw new Error(
+      `No minecraft-data for version "${version}". Vendored 26.2 covers 26.2 only — update vendor/minecraft-data to move to a new version.`,
+    );
+  }
+  if (!hasDataFor(version)) {
+    throw new Error(`minecraft-data has no usable data for "${version}".`);
+  }
+
+  // Create the session before connecting so Ctrl+C during ping/login is clean.
+  const factory = opts.botFactory ?? makeBotFactory(profile);
+  // Populated below, before any cleanup can fire (the ping can take a while).
+  let session: BotSession | null = null;
+
+  const shutdown = async (): Promise<void> => {
+    // If Ctrl+C lands during the pre-flight ping there is no session yet —
+    // there is nothing to clean up, so just stop waiting.
+    await session?.shutdown();
+  };
+  opts.registerCleanup?.(shutdown);
+
+  // Ping with the same backoff ladder as reconnects (A12). Ctrl+C (which runs
+  // `shutdown` through the Lifecycle) flips `aborted` and breaks the loop.
+  let aborted = false;
+  const onShuttingDown = () => {
+    aborted = true;
+  };
+  bus.on("shutdown", onShuttingDown);
+
+  let pingResult: PingResult;
+  try {
+    pingResult =
+      opts.pingResult ??
+      (await pingWithBackoff(profile, log, version, expected, () => aborted));
+  } finally {
+    bus.off("shutdown", onShuttingDown);
+  }
+
+  log.info(
+    {
+      version: pingResult.version,
+      protocol: pingResult.protocol,
+      software: pingResult.software,
+      motd: pingResult.motd,
+      players: pingResult.players,
+    },
+    "server ping OK",
+  );
+
+  if (pingResult.protocol !== expected) {
+    log.warn(
+      { expected, got: pingResult.protocol, targetVersion: version },
+      `server protocol ${pingResult.protocol} != expected ${expected} for ${version} — connection may fail`,
+    );
+  }
+
+  session = new BotSession({
+    config,
+    profile: { ...profile, version },
+    log,
+    pingResult,
+    factory,
   });
+
+  log.info(
+    { host: profile.host, port: profile.port, username: profile.username, version },
+    "connecting",
+  );
+  await session.start();
+  return shutdown;
+}
+
+/**
+ * Ping with the same backoff ladder as reconnects (A12). Resolves with the
+ * first successful ping; throws if `isAborted` becomes true (Ctrl+C).
+ */
+async function pingWithBackoff(
+  profile: ServerProfile & { name: string; username: string },
+  log: Logger,
+  version: string,
+  protocol: number,
+  isAborted: () => boolean,
+): Promise<PingResult> {
+  let attempt = 0;
+  for (;;) {
+    log.info({ host: profile.host, port: profile.port, attempt: attempt + 1 }, "pinging server");
+    try {
+      return await pingServer(profile.host, profile.port, 5000, protocol);
+    } catch (err) {
+      if (isAborted()) throw new Error("shutdown requested while waiting for the server");
+      const delayMs = BACKOFF_SCHEDULE_MS[Math.min(attempt, BACKOFF_SCHEDULE_MS.length - 1)]!;
+      attempt++;
+      log.warn({ err: (err as Error).message, attempt, delayMs, version }, "waiting for server…");
+      // Sleep in slices so Ctrl+C is noticed promptly.
+      const deadline = Date.now() + delayMs;
+      while (Date.now() < deadline) {
+        if (isAborted()) throw new Error("shutdown requested while waiting for the server");
+        await delay(Math.min(250, deadline - Date.now()));
+      }
+    }
+  }
+}
+
+/** Test hook: read the current session's bot (used to spy on chat). */
+export function currentBotForTests(): BotLike | null {
+  return liveBot;
 }

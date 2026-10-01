@@ -6,7 +6,9 @@ import { runDoctor, renderDoctor, type CheckResult } from "../core/doctor.js";
 export function registerDoctor(program: Command): void {
   program
     .command("doctor")
-    .description("Check Node, Java, ffmpeg, Docker, API keys, and server reachability")
+    .description(
+      "Check Node, the 26.2 data, ffmpeg (voice only), provider API keys, and server reachability",
+    )
     .option("--json", "machine-readable output")
     .action(async (opts: { json?: boolean }, cmd: Command) => {
       const config = cmd.optsWithGlobals().elixConfig as ElixConfig;
@@ -16,7 +18,11 @@ export function registerDoctor(program: Command): void {
       } else {
         console.log(renderDoctor(results));
       }
+      // Set exitCode instead of calling process.exit(): an abrupt exit races
+      // pino's transport worker, which on Windows can abort with
+      // "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)" and turns a
+      // successful doctor run into a crash (exit -1073740791).
       const fails = results.filter((r) => r.status === "fail").length;
-      process.exit(fails > 0 ? 1 : 0);
+      process.exitCode = fails > 0 ? 1 : 0;
     });
 }

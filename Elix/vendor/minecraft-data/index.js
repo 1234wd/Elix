@@ -13,7 +13,7 @@
 
 const base = require('minecraft-data-base')
 const mcDataToNode = require('minecraft-data-base/lib/loader')
-const supportFeature = require('minecraft-data-base/lib/supportsFeature')
+const supportFeatureFactory = require('minecraft-data-base/lib/supportsFeature')
 
 // ---------------------------------------------------------------------------
 // Load vendored 26.2 data
@@ -81,13 +81,15 @@ nmcData.version = version26_2
 nmcData.isNewerOrEqualTo = (v) => version26_2['>='](v)
 nmcData.isOlderThan = (v) => version26_2['<'](v)
 
-// Wrap base supportFeature — add liquid gravity features missing from base features.json
-const baseSupportFeature = supportFeature(version26_2, base.versions.pc)
-nmcData.supportFeature = (feature) => {
-  if (feature === 'independentLiquidGravity') return true
-  if (feature === 'proportionalLiquidGravity') return false
-  return baseSupportFeature(feature)
-}
+// Support the real minecraft-data feature list for 26.2. The base package
+// attaches this itself in its index.js, but we build the 26.2 object by hand,
+// so we must attach it too — prismarine-chat calls supportFeature() and would
+// crash without it.
+//
+// We do NOT override individual liquid-gravity features here: those live in
+// prismarine-physics' own features.json (patched via patches/), which is the
+// single source of truth for physics behaviour.
+nmcData.supportFeature = supportFeatureFactory(version26_2, base.versions.pc)
 
 // ---------------------------------------------------------------------------
 // Export: wrap the real package, intercepting 26.2

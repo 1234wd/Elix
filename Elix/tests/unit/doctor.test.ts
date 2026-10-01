@@ -5,6 +5,7 @@ import {
   checkApiKeys,
   checkLiveApiKeys,
   checkServer,
+  checkVersionData,
   runDoctor,
   renderDoctor,
   type CheckResult,
@@ -100,8 +101,51 @@ describe("checkServer", () => {
   });
 });
 
+describe("checkVersionData", () => {
+  it("passes for the vendored 26.2 data", () => {
+    const r = checkVersionData("26.2");
+    expect(r.status).toBe("ok");
+    expect(r.note).toContain("776");
+  });
+
+  it("fails when there is no data for the configured version", () => {
+    const r = checkVersionData("1.2.3");
+    expect(r.status).toBe("fail");
+    expect(r.note).toContain("no minecraft-data");
+  });
+});
+
+describe("checkServer", () => {
+  it("warns when the server protocol differs from the expected one (A11)", async () => {
+    const fakePing = async () => ({
+      version: "26.1",
+      protocol: 775,
+      software: "Paper",
+      motd: "",
+      players: { online: 0, max: 20 },
+    });
+    const r = await checkServer("127.0.0.1", 25565, fakePing, "26.2");
+    expect(r.status).toBe("warn");
+    expect(r.note).toContain("expected 776");
+    expect(r.note).toContain("775");
+  });
+
+  it("includes the MOTD when the server has one (A13)", async () => {
+    const fakePing = async () => ({
+      version: "Paper 26.2",
+      protocol: 776,
+      software: "Paper",
+      motd: "Ali's server",
+      players: { online: 0, max: 20 },
+    });
+    const r = await checkServer("127.0.0.1", 25565, fakePing, "26.2");
+    expect(r.status).toBe("ok");
+    expect(r.note).toContain("Ali's server");
+  });
+});
+
 describe("runDoctor", () => {
-  it("runs all five checks with injected mocks", async () => {
+  it("runs all six checks with injected mocks", async () => {
     const fakeExec = async () => {
       throw new Error("not found");
     };
@@ -120,9 +164,10 @@ describe("runDoctor", () => {
       ping: fakePing,
       liveApiCall: fakeLive,
     });
-    expect(results).toHaveLength(5);
+    expect(results).toHaveLength(6);
     const names = results.map((r) => r.name);
     expect(names).toContain("node");
+    expect(names).toContain("version-data");
     expect(names).toContain("ffmpeg");
     expect(names).toContain("api-keys");
     expect(names).toContain("api-live");

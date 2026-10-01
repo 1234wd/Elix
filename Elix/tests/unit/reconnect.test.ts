@@ -3,8 +3,10 @@ import {
   classifyDisconnect,
   parseKickReason,
   BACKOFF_SCHEDULE_MS,
+  type DisconnectKind,
 } from "../../src/connection/reconnect.js";
 import { ReconnectScheduler } from "../../src/connection/scheduler.js";
+import { describeReason } from "../../src/connection/kickReason.js";
 
 describe("classifyDisconnect", () => {
   it("classifies ban as permanent", () => {
@@ -55,39 +57,67 @@ describe("classifyDisconnect", () => {
   });
 });
 
-describe("classifyDisconnect — JSON translate keys", () => {
-  it("classifies JSON whitelist kick as whitelist", () => {
-    const r = classifyDisconnect('{"translate":"multiplayer.disconnect.not_whitelisted"}', 0);
+describe("classifyDisconnect — translate keys", () => {
+  const permanentKeys: Array<[string, DisconnectKind]> = [
+    ["multiplayer.disconnect.not_whitelisted", "whitelist"],
+    ["multiplayer.disconnect.banned", "ban"],
+    ["multiplayer.disconnect.banned.reason", "ban"],
+    ["multiplayer.disconnect.banned.expiration", "ban"],
+    ["multiplayer.disconnect.banned_ip", "ban"],
+    ["multiplayer.disconnect.online_mode", "online_mode"],
+  ];
+
+  for (const [key, kind] of permanentKeys) {
+    it(`classifies ${key} as permanent ${kind}`, () => {
+      const r = classifyDisconnect(`{"translate":"${key}"}`, 0);
+      expect(r.kind).toBe(kind);
+      expect(r.shouldRetry).toBe(false);
+    });
+  }
+});
+
+describe("A2 — vanilla's hyphenated 'white-listed' text", () => {
+  // The old pattern /\bwhite-list\b/ did not match "white-listed", so a real
+  // vanilla whitelist kick was classified as a generic retryable kick.
+  it("matches 'You are not white-listed on this server!'", () => {
+    const r = classifyDisconnect("You are not white-listed on this server!", 0);
     expect(r.kind).toBe("whitelist");
     expect(r.shouldRetry).toBe(false);
   });
 
-  it("classifies JSON banned kick as ban", () => {
-    const r = classifyDisconnect('{"translate":"multiplayer.disconnect.banned"}', 0);
-    expect(r.kind).toBe("ban");
-    expect(r.shouldRetry).toBe(false);
+  it("matches the hyphenated and unhyphenated spellings", () => {
+    expect(classifyDisconnect("You are not whitelisted here", 0).kind).toBe("whitelist");
+    expect(classifyDisconnect("You are not white listed here", 0).kind).toBe("whitelist");
+    expect(classifyDisconnect("You are not white-listed here", 0).kind).toBe("whitelist");
   });
 
-  it("classifies JSON banned.reason kick as ban", () => {
-    const r = classifyDisconnect('{"translate":"multiplayer.disconnect.banned.reason","with":["Elix"]}', 0);
-    expect(r.kind).toBe("ban");
-    expect(r.shouldRetry).toBe(false);
+  it("does not misfire on unrelated words containing 'ban'", () => {
+    expect(classifyDisconnect("urban exploration server", 0).kind).not.toBe("ban");
   });
+});
 
-  it("classifies JSON online_mode kick as online_mode", () => {
-    const r = classifyDisconnect('{"translate":"multiplayer.disconnect.online_mode"}', 0);
-    expect(r.kind).toBe("online_mode");
-    expect(r.shouldRetry).toBe(false);
+describe("classifyDisconnect — retryable network reasons", () => {
+  it("does NOT classify a connection-reset message as ban", () => {
+    const r = classifyDisconnect(
+      "Internal Exception: io.netty.handler.codec.DecoderError: java.io.IOException: An existing connection was forcibly closed by the remote host",
+      0,
+    );
+    expect(r.kind).not.toBe("ban");
+    expect(r.shouldRetry).toBe(true);
   });
 
   it("does NOT classify 'bandwidth exceeded' as ban", () => {
-    const r = classifyDisconnect("Internal Exception: io.netty.handler.codec.DecoderError: java.io.IOException: An existing connection was forcibly closed by the remote host", 0);
-    expect(r.kind).not.toBe("ban");
-  });
-
-  it("does NOT classify 'bandwidth exceeded' as ban (simple)", () => {
     const r = classifyDisconnect("bandwidth exceeded", 0);
     expect(r.kind).not.toBe("ban");
+    expect(r.shouldRetry).toBe(true);
+  });
+
+  it("treats a bare socketClosed as a retryable network drop", () => {
+    // This is what minecraft-protocol emits after a kick when there is no
+    // stored kick reason — the reason A1 exists.
+    const r = classifyDisconnect("socketClosed", 0);
+    expect(r.shouldRetry).toBe(true);
+    expect(r.retryAfterMs).toBe(5_000);
   });
 });
 
@@ -120,15 +150,14 @@ describe("ReconnectScheduler — one kick = exactly one reconnect", () => {
     expect(scheduler.pending).toBe(false);
   });
 
-  it("does NOT schedule a second reconnect while one is pending", () => {
-    scheduler.scheduleReconnect(true, 5000, reconnectFn);
-    // Second call while first is still pending — should still only have one timer
+  it("refuses a second reconnect while one is pending", () => {
+    const first = scheduler.scheduleReconnect(true, 5000, reconnectFn);
+    expect(first).not.toBeNull();
+    // Second call while the first is still pending must be refused, otherwise
+    // one kick produces two reconnects.
     const second = scheduler.scheduleReconnect(true, 5000, reconnectFn);
-    // The scheduler allows multiple schedules (each "end" event is a new disconnect),
-    // but the bot factory only calls this from "end", and "end" fires once per disconnect.
-    // So in practice, one kick → one "end" → one scheduleReconnect call.
-    expect(second).not.toBeNull();
-    expect(second!.attempt).toBe(2);
+    expect(second).toBeNull();
+    expect(scheduler.currentAttempt).toBe(1);
   });
 
   it("cancel prevents the reconnect from firing", () => {
@@ -154,19 +183,42 @@ describe("ReconnectScheduler — one kick = exactly one reconnect", () => {
     }
   });
 
+  it("allows a new reconnect once the previous one has fired", () => {
+    vi.useFakeTimers();
+    try {
+      scheduler.scheduleReconnect(true, 5000, reconnectFn);
+      vi.advanceTimersByTime(5000);
+      expect(scheduler.pending).toBe(false);
+      const second = scheduler.scheduleReconnect(true, 5000, reconnectFn);
+      expect(second).not.toBeNull();
+      expect(second!.attempt).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reset() clears the attempt count without cancelling a pending timer", () => {
+    vi.useFakeTimers();
+    try {
+      scheduler.scheduleReconnect(true, 5000, reconnectFn);
+      scheduler.scheduleReconnect(true, 5000, reconnectFn); // refused
+      expect(scheduler.currentAttempt).toBe(1);
+      scheduler.reset();
+      expect(scheduler.currentAttempt).toBe(0);
+      expect(scheduler.pending).toBe(true);
+      vi.advanceTimersByTime(5000);
+      expect(reconnectFn).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("full flow: kick → end → one reconnect scheduled", () => {
-    // Simulate what happens in bot.ts:
-    // 1. "kicked" event fires (records reason only)
-    // 2. "end" event fires → scheduleReconnect called once
     const info = classifyDisconnect("Kicked by an operator", 0);
     expect(info.shouldRetry).toBe(true);
-
     const result = scheduler.scheduleReconnect(info.shouldRetry, info.retryAfterMs, reconnectFn);
     expect(result).not.toBeNull();
     expect(result!.attempt).toBe(1);
-    expect(scheduler.pending).toBe(true);
-
-    // Only one reconnect scheduled — no duplicates
     expect(scheduler.currentAttempt).toBe(1);
   });
 });
@@ -187,8 +239,9 @@ describe("parseKickReason", () => {
   });
 
   it("handles JSON chat component with extra array", () => {
-    const raw = { extra: [{ text: "You are " }, { text: "banned!" }] };
-    expect(parseKickReason(raw)).toBe("You are banned!");
+    expect(parseKickReason({ extra: [{ text: "You are " }, { text: "banned!" }] })).toBe(
+      "You are banned!",
+    );
   });
 
   it("handles reason field", () => {
@@ -200,5 +253,34 @@ describe("parseKickReason", () => {
   it("handles null/undefined gracefully", () => {
     expect(parseKickReason(null)).toBe("null");
     expect(parseKickReason(undefined)).toBe("undefined");
+  });
+});
+
+describe("A1 — the real kick reason must win over the end reason", () => {
+  /** Exactly what bot.ts does: stash on kicked, read + clear on end. */
+  function simulate(reason: unknown, endReason = "socketClosed"): DisconnectKind {
+    let lastKick: string | undefined;
+    const described = describeReason(reason);
+    lastKick = described.translateKey ?? described.text;
+    const used = lastKick ?? describeReason(endReason).text;
+    const info = classifyDisconnect(used, 0);
+    lastKick = undefined;
+    return info.kind;
+  }
+
+  it("classifies a whitelist kick, not the socketClosed fallback", () => {
+    expect(simulate('{"translate":"multiplayer.disconnect.not_whitelisted"}')).toBe("whitelist");
+  });
+
+  it("classifies a ban kick, not the socketClosed fallback", () => {
+    expect(
+      simulate({ type: "compound", value: { translate: { type: "string", value: "multiplayer.disconnect.banned" } } }),
+    ).toBe("ban");
+  });
+
+  it("still retries a generic operator kick", () => {
+    expect(
+      simulate({ type: "compound", value: { text: { type: "string", value: "Kicked by an operator" } } }),
+    ).toBe("kick");
   });
 });

@@ -8,3 +8,4 @@ overrides:
 patchedDependencies:
   mineflayer@4.39.0: patches/mineflayer@4.39.0.patch
   prismarine-chunk@1.41.0: patches/prismarine-chunk@1.41.0.patch
+  prismarine-physics@1.11.1: patches/prismarine-physics@1.11.1.patch
