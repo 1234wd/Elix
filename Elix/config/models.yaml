@@ -1,0 +1,56 @@
+# Model roles and provider preference lists.
+# On startup Elix calls each provider's /models and picks the first available
+# match from each role's preference list. IDs are never hard-coded in source.
+#
+# Cloud AI only — no local models. If all providers are down or out of quota,
+# Elix uses scripted in-character lines and keeps playing on reflex/skill code.
+
+roles:
+  fast:
+    # Chat, reactions, social layer.
+    preference:
+      - { provider: groq, model: "openai/gpt-oss-20b" }
+      - { provider: nvidia, model: "meta/llama-3.3-70b-instruct" }
+      - { provider: hf, model: "meta-llama/Llama-3.3-70B-Instruct" }
+  smart:
+    # Planning, hard questions, memory consolidation.
+    preference:
+      - { provider: groq, model: "openai/gpt-oss-120b" }
+      - { provider: groq, model: "qwen/qwen3.8-27b" }
+      - { provider: nvidia, model: "deepseek-ai/DeepSeek-V3" }
+      - { provider: hf, model: "deepseek-ai/DeepSeek-V3" }
+  stt:
+    # Speech-to-text (voice).
+    preference:
+      - { provider: groq, model: "whisper-large-v3-turbo" }
+      - { provider: groq, model: "whisper-large-v3" }
+      - { provider: nvidia, model: "nvidia/parakeet-tdt-0.6b-v2" }
+  tts:
+    # Text-to-speech (voice).
+    preference:
+      - { provider: nvidia, model: "nvidia/magpie-tts" }
+      - { provider: groq, model: "orpheus-3b-0.1-ft" }
+  embeddings:
+    # Memory vector embeddings.
+    preference:
+      - { provider: nvidia, model: "nvidia/nv-embedqa-e5-v5" }
+      - { provider: hf, model: "BAAI/bge-small-en-v1.5" }
+  guard:
+    # Prompt-injection / safety filter.
+    preference:
+      - { provider: groq, model: "openai/gpt-oss-safeguard-20b" }
+      - { provider: local, model: "keyword-regex" }
+
+providers:
+  groq:
+    baseUrl: https://api.groq.com/openai/v1
+    env: GROQ_API_KEY
+  nvidia:
+    baseUrl: https://integrate.api.nvidia.com/v1
+    env: NVIDIA_API_KEY
+  hf:
+    baseUrl: https://router.huggingface.co/v1
+    env: HF_TOKEN
+  local:
+    baseUrl: null
+    env: null

@@ -1,0 +1,10 @@
+allowBuilds:
+  esbuild: true
+  ffmpeg-static: true
+
+overrides:
+  minecraft-data: file:vendor/minecraft-data
+
+patchedDependencies:
+  mineflayer@4.39.0: patches/mineflayer@4.39.0.patch
+  prismarine-chunk@1.41.0: patches/prismarine-chunk@1.41.0.patch

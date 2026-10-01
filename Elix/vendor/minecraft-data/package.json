@@ -1,0 +1,9 @@
+{
+  "name": "minecraft-data",
+  "version": "3.117.0+26.2",
+  "description": "Vendored minecraft-data with 26.2 (protocol 776) support from PR #1298",
+  "main": "index.js",
+  "dependencies": {
+    "minecraft-data-base": "npm:minecraft-data@3.117.0"
+  }
+}

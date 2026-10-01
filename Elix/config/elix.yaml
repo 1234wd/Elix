@@ -1,0 +1,51 @@
+# Elix main config. Validated by src/core/config.ts (zod) at startup.
+# Secrets live in .env (gitignored) — never here.
+
+version: 1
+
+bot:
+  username: Elix
+  # Target server version — a config value, never hard-coded in source.
+  # Vendored 26.2 data (protocol 776) from PR #1298; no ViaProxy needed.
+  version: "26.2"
+  # Only join servers listed here (empty = ask at startup). Protects against
+  # accidentally joining a server whose rules don't allow bots.
+  serverAllowlist:
+    - "145.241.127.222"
+
+server:
+  # Default profile — override with --profile <name> or --host/--port.
+  profile: main
+
+# Saved server profiles. `elix start --profile <name>` uses these.
+profiles:
+  main:
+    host: 145.241.127.222
+    port: 25565
+    version: "26.2"
+    description: "Main server (offline mode, whitelist on)"
+
+brain:
+  # Prompt budgeter caps (see brief §4).
+  fastMaxTokens: 1500
+  smartMaxTokens: 4000
+  timeoutsMs:
+    fast: 6000
+    smart: 20000
+  # Quota saving: no AI calls for combat or movement; cache repeated answers.
+  idleChatterBudgetPerHour: 60
+
+voice:
+  enabled: false
+  # If SVC isn't on the server, push text-only mode instead of failing.
+  textOnlyFallback: true
+
+safety:
+  # kid-safe | adult (romantic/sexual content is always refused regardless)
+  contentLevel: kid-safe
+  # Max 1 chat message per 2 seconds.
+  chatRateLimitPer2s: 1
+
+persona: config/persona.md
+dataDir: data
+logLevel: info
