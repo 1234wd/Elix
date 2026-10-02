@@ -30,7 +30,8 @@ export class Lifecycle {
   /** A1: set once shutdown begins, and the promise waitForShutdown() hands out. */
   private shutdownStarted = false;
   private shutdownPromise: Promise<void> | null = null;
-  private onShutdownBegin: (() => void) | null = null;
+  /** Fired after EVERY cleanup has completed (A1). */
+  private onShutdownComplete: (() => void) | null = null;
 
   constructor(log: Logger, opts: LifecycleOptions = {}) {
     this.log = log;
@@ -80,12 +81,17 @@ export class Lifecycle {
   }
 
   /**
-   * Resolve once shutdown begins (A1).
+   * Resolve once shutdown has FINISHED, not when it begins (A1).
    *
    * `elix start` must not return when the bot connects — that is when play
    * begins, not when it ends. The action awaits this so the process stays
-   * alive, and so the `finally` block that closes the brain can only run after
-   * the cleanup registered with onCleanup has already run.
+   * alive, and the `finally` block that closes the brain only runs after every
+   * cleanup has completed.
+   *
+   * The distinction matters in Phase 4: the shutdown backup and the
+   * consolidation pass live in the brain cleanup, and both need the database
+   * open. Resolving at the START of shutdown let the brain's `finally` close the
+   * store in parallel with those cleanups, so they would hit a closed database.
    *
    * Resolves on the FIRST shutdown only, so a second Ctrl+C (force exit 130)
    * is unaffected.
@@ -93,20 +99,24 @@ export class Lifecycle {
   waitForShutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     const p = new Promise<void>((resolve) => {
-      this.onShutdownBegin = resolve;
+      this.onShutdownComplete = resolve;
     });
     this.shutdownPromise = p;
     return p;
   }
 
-  async shutdown(reason: string): Promise<void> {
+  /**
+   * A2: `exitCode` lets a caller choose the process exit status.
+   *
+   * A permanent disconnect used to call exitCleanly() directly, so no cleanup
+   * ran and the database was never closed cleanly. It now comes through here
+   * with code 2. A second Ctrl+C still force-exits 130 regardless.
+   */
+  async shutdown(reason: string, exitCode = 0): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.shutdownStarted = true;
-    // Wake anything blocked in waitForShutdown() BEFORE the cleanups run, so
-    // it can observe ordering without racing the goodbye.
-    this.onShutdownBegin?.();
-    this.log.info({ reason }, "shutting down");
+    this.log.info({ reason, exitCode }, "shutting down");
     bus.emit("shutdown", reason);
 
     // Hard ceiling: if a cleanup hangs, we still exit. This is the single
@@ -129,7 +139,10 @@ export class Lifecycle {
     } finally {
       clearTimeout(hardTimeout);
       this.removeSignals();
-      this.exitFn(0);
+      this.exitFn(exitCode);
     }
+
+    // A1: only now is it safe for a caller to close the database.
+    this.onShutdownComplete?.();
   }
 }

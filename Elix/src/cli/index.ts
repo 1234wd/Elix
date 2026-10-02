@@ -12,6 +12,7 @@ import { registerDoctor } from "./doctor.js";
 import { registerStubs } from "./stubs.js";
 import { registerDebug } from "./debug.js";
 import { registerBrain } from "./brain.js";
+import { registerMemoryCommands } from "./memory.js";
 
 // Load .env before anything else so API keys are available from any folder (A5).
 loadDotenv({ path: resolve(PROJECT_ROOT, ".env"), quiet: true });
@@ -54,6 +55,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   registerDoctor(program);
   registerStubs(program);
   registerBrain(program);
+  registerMemoryCommands(program);
   registerDebug(program);
 
   await program.parseAsync(argv);

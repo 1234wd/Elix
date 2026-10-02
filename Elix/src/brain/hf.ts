@@ -22,6 +22,7 @@
  */
 import { stripReasoning } from "./reasoning.js";
 import { isCreditOrQuotaError } from "./ratelimit.js";
+import { EMBEDDINGS_TIMEOUT_MS } from "./router.js";
 import type {
   CompletionRequest,
   FetchLike,
@@ -180,7 +181,23 @@ export class HuggingFaceProvider implements ProviderAdapter {
    * Embed a batch of strings. Phase 4 memory uses this; each memory is
    * embedded exactly once and stored, because free credit is about $0.10/month.
    */
-  async embed(inputs: string[], model: string): Promise<number[][]> {
+  /**
+   * Embed a batch of strings. Phase 4 memory uses this; each memory is
+   * embedded exactly once and stored, because free credit is about $0.10/month.
+   *
+   * A6: takes an AbortSignal and applies the 10 s embeddings timeout. Without
+   * it a hung request blocked the backfill worker forever and no memory would
+   * ever get a vector. A timeout throws, the caller leaves the row unembedded,
+   * and the next pass retries it.
+   */
+  async embed(
+    inputs: string[],
+    model: string,
+    signal?: AbortSignal,
+    timeoutMs = EMBEDDINGS_TIMEOUT_MS,
+  ): Promise<number[][]> {
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
     const res = await this.fetchImpl(hfEmbeddingsUrl(model, this.baseUrl), {
       method: "POST",
       headers: {
@@ -188,6 +205,7 @@ export class HuggingFaceProvider implements ProviderAdapter {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ inputs }),
+      signal: combined,
     });
     const text = await res.text();
     if (!res.ok) {

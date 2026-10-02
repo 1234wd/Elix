@@ -24,6 +24,9 @@ export interface BuildBrainOptions {
   random?: () => number;
   fastMaxTokens?: number;
   smartMaxTokens?: number;
+  /** A3: explicit overrides; otherwise taken from config.brain.timeoutsMs. */
+  fastTimeoutMs?: number;
+  smartTimeoutMs?: number;
   idleChatterBudgetPerHour?: number;
 }
 
@@ -64,6 +67,11 @@ export function buildBrain(opts: BuildBrainOptions): BrainHandle {
     store,
     fastMaxTokens: opts.fastMaxTokens ?? opts.config?.brain.fastMaxTokens,
     smartMaxTokens: opts.smartMaxTokens ?? opts.config?.brain.smartMaxTokens,
+    // A3: brain.timeoutsMs was validated by the config schema and then never
+    // read, so every call silently used the hard-coded defaults. Changing
+    // timeoutsMs.fast in config/elix.yaml did nothing at all.
+    fastTimeoutMs: opts.fastTimeoutMs ?? opts.config?.brain.timeoutsMs.fast,
+    smartTimeoutMs: opts.smartTimeoutMs ?? opts.config?.brain.timeoutsMs.smart,
     idleChatterBudgetPerHour:
       opts.idleChatterBudgetPerHour ?? opts.config?.brain.idleChatterBudgetPerHour,
     ...(opts.now ? { now: opts.now } : {}),

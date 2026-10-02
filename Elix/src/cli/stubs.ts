@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import { join } from "node:path";
 import type { ElixConfig } from "../core/config.js";
 import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config.js";
 import { runBot } from "../connection/bot.js";
@@ -6,8 +7,69 @@ import { Lifecycle } from "../core/lifecycle.js";
 import { exitCleanly } from "../core/exit.js";
 import { bus } from "../core/events.js";
 import { buildBrain, type BrainHandle } from "../brain/index.js";
-import { ChatBridge } from "../brain/bridge.js";
+import { ChatBridge, type MemoryHook } from "../brain/bridge.js";
+import { MemoryStore, defaultMemoryPath } from "../memory/store.js";
+import { MemoryEngine } from "../memory/engine.js";
+import { HuggingFaceProvider } from "../brain/hf.js";
+import { createBackup } from "../memory/backup.js";
+import { consolidate, SHUTDOWN_CALL_CAP } from "../memory/consolidation.js";
 import type { Logger } from "../core/logger.js";
+
+/** Where backups live, alongside the database. */
+function backupDir(projectRoot: string): string {
+  return join(projectRoot, "data", "backups");
+}
+
+function startOfDay(): number {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * Open the memory store and wrap it as the bridge's hook.
+ *
+ * Returns null when the database cannot be opened, because a bot that cannot
+ * remember is still a bot that can talk (vision rule 3, "never silent").
+ */
+function openMemory(
+  brain: BrainHandle | undefined,
+  log: Logger,
+): { store: MemoryStore; engine: MemoryEngine; hook: MemoryHook; storePath: string } | null {
+  const storePath = defaultMemoryPath(PROJECT_ROOT);
+  try {
+    const store = new MemoryStore({ path: storePath });
+    const vec = store.loadVec();
+    if (!vec.loaded) {
+      log.info({ error: vec.error }, "vector search unavailable — FTS5 keyword search only");
+    }
+    const hfKey = process.env["HF_TOKEN"]?.trim();
+    const engine = new MemoryEngine({
+      store,
+      embeddingProvider: hfKey ? new HuggingFaceProvider({ apiKey: hfKey }) : null,
+      embeddingModel: "BAAI/bge-small-en-v1.5",
+    });
+    const hook: MemoryHook = {
+      record: (input) => {
+        engine.record({
+          text: input.text,
+          speaker: input.speaker,
+          player: input.player ?? null,
+          kind: (input.kind as never) ?? "chat",
+          meta: input.meta ?? null,
+        });
+      },
+      context: (player, query) => engine.context(player, query, null),
+      preference: (player, kind) => engine.preference(player, kind),
+      capturePreference: (player, text) => engine.capturePreference(player, text),
+    };
+    void brain;
+    return { store, engine, hook, storePath };
+  } catch (err) {
+    log.warn({ err: (err as Error).message }, "memory unavailable — Elix will not remember");
+    return null;
+  }
+}
 
 /**
  * Phase-2 start command — connects Elix to the server.
@@ -71,6 +133,13 @@ export function registerStubs(program: Command): void {
       const lifecycle = new Lifecycle(log);
       // Signal handlers go up before connecting, so Ctrl+C during ping/login is clean (A15).
       lifecycle.handleSignals();
+
+      // A2: a permanent disconnect and a crash burst both shut down through the
+      // Lifecycle with a specific exit code, so every registered cleanup runs —
+      // including the brain close and, in Phase 4, the shutdown backup.
+      const requestShutdown = (reason: string, code: number): void => {
+        void lifecycle.shutdown(reason, code);
+      };
 
       // B7/B9: build the brain and the in-game chat bridge. A missing key is
       // not an error — that provider is simply absent and the router falls
@@ -143,6 +212,51 @@ export function registerStubs(program: Command): void {
       // never waits on the network.
       bus.on("shutdown", () => brainAbort.abort());
 
+      // D6/D7: memory. Opened here, wired into the bridge, and closed in the
+      // brain cleanup — which runs LAST, after the shutdown backup and
+      // consolidation, because Lifecycle reverses cleanup order (A1).
+      const memory = openMemory(brain, log);
+      if (memory) {
+        chatBridge?.setMemory(memory.hook);
+        lifecycle.onCleanup(async () => {
+          // Cleanup order is REVERSED. The brain close was registered first, so
+          // it runs last; this runs before it, with the database still open.
+          const backup = createBackup({
+            dbPath: memory.storePath,
+            backupDir: backupDir(PROJECT_ROOT),
+          });
+          log.info(
+            { path: backup.path, bytes: backup.bytes, error: backup.error },
+            "shutdown backup written",
+          );
+          // Embed whatever is outstanding, best effort, bounded.
+          const backfill = await memory.engine.embedder.drain(2);
+          log.info(backfill, "embedding backfill");
+          memory.store.close();
+        });
+        // Run consolidation on the way out, with its own single-call budget.
+        lifecycle.onCleanup(async () => {
+          try {
+            const result = await consolidate({
+              store: memory.store,
+              router: brain?.router as never,
+              since: startOfDay(),
+              callCap: SHUTDOWN_CALL_CAP,
+            });
+            log.info(
+              { status: result.status, facts: result.factsMade, calls: result.calls },
+              "shutdown consolidation",
+            );
+          } catch (err) {
+            log.warn({ err: (err as Error).message }, "shutdown consolidation failed");
+          }
+        });
+        // Background embedding, so a busy chat never waits on a provider.
+        void memory.engine.embedder.drain(2).then((r) => {
+          if (r.embedded > 0) log.info(r, "embedded new memories");
+        });
+      }
+
       try {
         // runBot registers its own cleanup synchronously (before the first await
         // of the network work), so a Ctrl+C during ping still unwinds properly.
@@ -152,9 +266,15 @@ export function registerStubs(program: Command): void {
           log,
           registerCleanup: (fn) => void lifecycle.onCleanup(fn),
           ...(chatBridge ? { chatBridge } : {}),
+          requestShutdown,
         });
         // runBot has resolved but Elix is STILL PLAYING. Nothing may close the
         // brain here — the lifecycle cleanup registered above owns that.
+        //
+        // A1: this now resolves AFTER every cleanup has finished, so the
+        // `finally` below runs last. It used to resolve when shutdown began,
+        // which let this block close the database in parallel with the cleanups
+        // that need it open.
         await lifecycle.waitForShutdown();
       } catch (err) {
         log.error({ err: (err as Error).message }, "failed to start");
@@ -186,26 +306,8 @@ export function registerStubs(program: Command): void {
 
   // `usage` and `ask` are real now (Phase 3) — registered in cli/brain.ts.
 
-  const memory = program.command("memory").description("Search and manage memory");
-  memory
-    .command("search")
-    .argument("<query>", "what to look for")
-    .description("Search remembered episodes and facts")
-    .action(phaseStub(4, "Memory search"));
-  // A10: `.command("forget --player <name>")` made commander reject `--player`.
-  // `requiredOption` is the correct form.
-  memory
-    .command("forget")
-    .requiredOption("--player <name>", "player whose data to delete")
-    .description("Delete a player's data on request")
-    .action((opts: { player: string }) => phaseStub(4, `Player data deletion for ${opts.player}`)());
-
-  // The vision's CLI is `elix forget --player <name>` — keep a top-level alias.
-  program
-    .command("forget")
-    .requiredOption("--player <name>", "player whose data to delete")
-    .description("Delete a player's data on request (alias for `elix memory forget`)")
-    .action((opts: { player: string }) => phaseStub(4, `Player data deletion for ${opts.player}`)());
+  // `memory search`, `memory stats` and `forget` are real now (Phase 4, D8) —
+  // registered in cli/memory.ts, which also owns the top-level `forget` alias.
 
   const kb = program.command("kb").description("Minecraft knowledge base");
   kb.command("build")

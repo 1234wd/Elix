@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import type { ElixConfig } from "./config.js";
 import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "./config.js";
 import { pingServer } from "../connection/ping.js";
@@ -94,10 +96,19 @@ export const PROVIDER_KEYS: ReadonlyArray<readonly [env: string, label: string, 
 export function checkApiKeys(env: NodeJS.ProcessEnv = process.env): CheckResult {
   const present = PROVIDER_KEYS.filter(([k]) => !!env[k]);
   if (present.length === 0) {
+    // A5: a missing .env file is a different problem from an empty one, and it
+    // has an exact one-line fix. Saying only "no keys" sent people hunting.
+    const envFile = resolve(PROJECT_ROOT, ".env");
+    const example = resolve(PROJECT_ROOT, ".env.example");
+    const note = existsSync(envFile)
+      ? "no provider keys in .env — Elix will run on scripted fallback lines until keys are added"
+      : existsSync(example)
+        ? "no .env file — run: copy .env.example .env   (then fill in GROQ_API_KEY)"
+        : "no .env file and no .env.example — Elix will run on scripted fallback lines";
     return {
       name: "api-keys",
       status: "warn",
-      note: "no provider keys in .env — Elix will run on scripted fallback lines until keys are added",
+      note,
     };
   }
   return {

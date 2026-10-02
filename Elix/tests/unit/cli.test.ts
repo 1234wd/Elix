@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Command } from "commander";
 import { registerStubs } from "../../src/cli/stubs.js";
+import { registerMemoryCommands } from "../../src/cli/memory.js";
 import { registerDoctor } from "../../src/cli/doctor.js";
 import { elixConfigSchema, PROJECT_ROOT } from "../../src/core/config.js";
 
@@ -112,9 +114,23 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
     // A .env in cwd must NOT be read — the path is resolved from PROJECT_ROOT.
     await writeFile(join(tmp, ".env"), "HF_TOKEN=cwd_key\n", "utf8");
     const { stdout } = await runCli(["doctor", "--json"], tmp);
+    const results = JSON.parse(stdout) as Array<{ name: string; note: string; status: string }>;
+    const keys = results.find((r) => r.name === "api-keys");
+    // The cwd key was ignored, so the note must report no usable key. Which of
+    // the two wordings it uses depends on whether PROJECT_ROOT/.env exists (A5
+    // distinguishes "no .env file" from "no keys in .env").
+    expect(keys?.note).toMatch(/no provider keys|no \.env file/);
+    expect(keys?.status).toBe("warn");
+  });
+
+  it("names the exact fix when .env is missing (A5)", async () => {
+    const { stdout } = await runCli(["doctor", "--json"], tmp);
     const results = JSON.parse(stdout) as Array<{ name: string; note: string }>;
     const keys = results.find((r) => r.name === "api-keys");
-    expect(keys?.note).toContain("no provider keys");
+    if (!existsSync(join(PROJECT_ROOT, ".env"))) {
+      // A new user gets told the command, not just the symptom.
+      expect(keys?.note).toContain("copy .env.example .env");
+    }
   });
 });
 
@@ -193,11 +209,24 @@ describe("A10 — getActiveProfile wires every flag", () => {
 });
 
 describe("A10 — the forget command accepts --player", () => {
-  function parseForget(argv: string[]): { ok: boolean; error?: string; player?: string } {
+  /**
+   * `forget` lives in registerMemoryCommands (Phase 4, D8) rather than in the
+   * Phase 1 stubs, so both registrars run here. Registering only the stubs would
+   * silently test a CLI that has no forget command at all.
+   */
+  function buildProgram(): Command {
     const program = new Command();
     program.exitOverride();
     registerStubs(program);
+    registerMemoryCommands(program);
+    return program;
+  }
+
+  function parseForget(argv: string[]): { ok: boolean; error?: string; player?: string } {
+    const program = buildProgram();
     let player: string | undefined;
+    // Overriding the action is the point: it proves the option parsed without
+    // ever opening the database.
     const forget = program.commands.find((c) => c.name() === "forget")!;
     forget.action((opts: { player: string }) => {
       player = opts.player;
@@ -217,9 +246,7 @@ describe("A10 — the forget command accepts --player", () => {
   });
 
   it("elix memory forget --player Ali parses", () => {
-    const program = new Command();
-    program.exitOverride();
-    registerStubs(program);
+    const program = buildProgram();
     const memory = program.commands.find((c) => c.name() === "memory")!;
     let player: string | undefined;
     const forget = memory.commands.find((c) => c.name() === "forget")!;
@@ -234,6 +261,25 @@ describe("A10 — the forget command accepts --player", () => {
     const r = parseForget(["forget"]);
     expect(r.ok).toBe(false);
     expect(r.error).toContain("--player");
+  });
+
+  it("registers memory search and stats exactly once each (D8)", () => {
+    // Commander throws "cannot add command 'memory' as already have command
+    // 'memory'" if the parent is created twice, which broke the whole CLI.
+    const program = buildProgram();
+    const memory = program.commands.filter((c) => c.name() === "memory");
+    expect(memory).toHaveLength(1);
+    const names = memory[0]!.commands.map((c) => c.name()).sort();
+    expect(names).toEqual(["forget", "search", "stats"]);
+    // The top-level alias exists alongside the subcommand.
+    expect(program.commands.filter((c) => c.name() === "forget")).toHaveLength(1);
+    // Both entry points accept --yes.
+    expect(program.commands.find((c) => c.name() === "forget")!.options.map((o) => o.long)).toContain(
+      "--yes",
+    );
+    expect(memory[0]!.commands.find((c) => c.name() === "forget")!.options.map((o) => o.long)).toContain(
+      "--yes",
+    );
   });
 });
 

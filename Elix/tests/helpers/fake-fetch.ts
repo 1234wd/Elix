@@ -37,10 +37,18 @@ export interface Route {
   /** Matched against the request URL with `String.includes`, or a RegExp. */
   match: string | RegExp;
   /**
-   * One reply, or a queue consumed in order. A queue repeats its last entry once
-   * exhausted, so a test only has to script the calls it cares about.
+   * One reply, a queue consumed in order, or a function called per request.
+   *
+   * A queue repeats its last entry once exhausted, so a test only has to script
+   * the calls it cares about.
+   *
+   * The function form exists because a queue cannot express "count the calls and
+   * answer differently each time". It is NOT optional politeness: before this
+   * existed, passing a function was silently treated as an empty reply — a
+   * function has no `.body`, so every request answered 200 with an empty string
+   * and the test failed for a reason that had nothing to do with the code.
    */
-  reply: FakeReply | FakeReply[];
+  reply: FakeReply | FakeReply[] | (() => FakeReply);
 }
 
 export interface FakeFetch {
@@ -80,10 +88,16 @@ export function fakeFetch(routes: Route[] = []): FakeFetch {
     if (!route) {
       return Promise.reject(new Error(`fake fetch: no route for ${target}`));
     }
-    const list = Array.isArray(route.reply) ? route.reply : [route.reply];
-    const i = cursors.get(route) ?? 0;
-    cursors.set(route, i + 1);
-    const reply = list[Math.min(i, list.length - 1)]!;
+
+    let reply: FakeReply;
+    if (typeof route.reply === "function") {
+      reply = route.reply();
+    } else {
+      const list = Array.isArray(route.reply) ? route.reply : [route.reply];
+      const i = cursors.get(route) ?? 0;
+      cursors.set(route, i + 1);
+      reply = list[Math.min(i, list.length - 1)]!;
+    }
 
     if (reply.throws) return Promise.reject(reply.throws);
     const text = reply.body ?? "";
@@ -221,4 +235,9 @@ export function groqHfRoutes(groqChat: FakeReply | FakeReply[], hfChat: FakeRepl
     { match: "api.groq.com/openai/v1/chat/completions", reply: groqChat },
     { match: "router.huggingface.co/v1/chat/completions", reply: hfChat },
   ];
+}
+
+/** A route that answers with whatever `next()` returns, counted by the test. */
+export function countingRoute(match: string | RegExp, next: () => FakeReply): Route {
+  return { match, reply: next };
 }

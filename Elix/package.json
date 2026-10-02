@@ -16,6 +16,7 @@
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e": "tsx scripts/e2e-chat.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "doctor": "tsx src/cli/bin.ts doctor",

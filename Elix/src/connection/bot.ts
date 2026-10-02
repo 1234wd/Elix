@@ -78,6 +78,8 @@ export interface BotOptions {
    * exactly as it did in Phase 2: scripted greeting, no AI replies.
    */
   chatBridge?: ChatBridgeLike;
+  /** A2: ask the Lifecycle to shut down with a specific exit code. */
+  requestShutdown?: (reason: string, exitCode: number) => void;
 }
 
 export interface BotStatus {
@@ -110,6 +112,12 @@ export interface SessionDeps {
    * need no brain, and so a bot with no keys and no config still joins.
    */
   chatBridge?: ChatBridgeLike;
+  /**
+   * A2: ask the Lifecycle to shut down with a specific exit code, so cleanups
+   * run before the process ends. Absent in bare unit tests, which then fall
+   * back to calling exitCleanly directly.
+   */
+  requestShutdown?: (reason: string, exitCode: number) => void;
 }
 
 /**
@@ -148,7 +156,10 @@ const CRASH_BURST_WINDOW_MS = 60_000;
  * corrupted process cannot recover, so a burst of crashes now triggers a
  * graceful shutdown with exit 1 instead of limping on.
  */
-export function installCrashGuards(log?: Logger): void {
+export function installCrashGuards(
+  log?: Logger,
+  onCrashBurst?: (reason: string) => void,
+): void {
   if (crashGuardsInstalled) return;
   crashGuardsInstalled = true;
 
@@ -176,6 +187,14 @@ export function installCrashGuards(log?: Logger): void {
           "too many uncaught errors — shutting down",
         );
       }
+      // A2: route through the Lifecycle so cleanups run. A crash burst means
+      // the process is unhealthy, but the database must still be closed cleanly
+      // and the shutdown backup must still happen.
+      if (onCrashBurst) {
+        onCrashBurst(`crash burst: ${crashCount} uncaught errors`);
+        return;
+      }
+      // No lifecycle wired (a bare unit test, or a library consumer).
       exitCleanly(1);
     }
   };
@@ -793,8 +812,17 @@ export class BotSession {
     this.exitCode = 2;
     this.deps.onPermanentDisconnect?.({ ...info, username });
     if (this.deps.exitOnPermanent !== false) {
-      // exitCleanly sets process.exitCode and drains the loop, so the console
-      // line above is never truncated by a racing worker thread (A2).
+      // A2: route through the Lifecycle so every registered cleanup runs. A
+      // whitelist kick used to call exitCleanly(2) directly, so the database was
+      // never closed cleanly and — in Phase 4 — the shutdown backup and the
+      // diary entry would be skipped too.
+      if (this.deps.requestShutdown) {
+        this.deps.requestShutdown(`permanent disconnect: ${info.kind}`, 2);
+        return;
+      }
+      // No lifecycle wired (bare unit test): fall back to the direct path, which
+      // sets process.exitCode and drains the loop so the console line above is
+      // never truncated by a racing worker thread (A2).
       exitCleanly(2);
     }
   }
@@ -1000,7 +1028,8 @@ function makeBotFactory(profile: ServerProfile & { name: string; username: strin
  */
 export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
   const { config, profile, log } = opts;
-  installCrashGuards(log);
+  // A2: the crash-burst guard shuts down through the same path, so cleanups run.
+  installCrashGuards(log, (reason) => opts.requestShutdown?.(reason, 1));
 
   // The version is a config value (A11): CLI > profile > bot.
   const version = resolveTargetVersion(config, profile);
@@ -1068,6 +1097,7 @@ export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
     pingResult,
     factory,
     ...(opts.chatBridge ? { chatBridge: opts.chatBridge } : {}),
+    ...(opts.requestShutdown ? { requestShutdown: opts.requestShutdown } : {}),
   });
 
   log.info(

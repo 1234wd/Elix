@@ -20,11 +20,36 @@ import { checkOutputSafety, DEFLECTION_LINES } from "./leakFilter.js";
 import { trimChatReply } from "./reasoning.js";
 import { PROJECT_ROOT } from "../core/config.js";
 
+/**
+ * D7: the memory hook the bridge calls around a reply.
+ *
+ * Declared structurally so src/brain does not import src/memory (which would
+ * drag SQLite into every bridge test).
+ */
+export interface MemoryHook {
+  /** Store a player line. Must never throw. */
+  record(input: {
+    text: string;
+    speaker: "player" | "elix";
+    player?: string | null;
+    kind?: string;
+    meta?: string | null;
+  }): void;
+  /** The memory block for a prompt, quoted as data. Must never throw. */
+  context(player: string, query: string): string;
+  /** A stored preference, e.g. "block" -> "cherry planks". */
+  preference(player: string, kind: string): string | null;
+  /** Capture a preference from the player's own words. */
+  capturePreference(player: string, text: string): string | null;
+}
+
 export interface ChatBridgeOptions {
   router: BrainRouter;
   username: string;
   log: Logger;
   personaLite?: string;
+  /** D7: memory. Optional, so a bot with no database still talks. */
+  memory?: MemoryHook;
   /** Stop after this many replies — used by tests. */
   maxReplies?: number;
   /**
@@ -78,6 +103,17 @@ export class ChatBridge {
   }
 
   /**
+   * Attach memory after construction.
+   *
+   * The CLI opens the database itself (it needs the path and the backup
+   * lifecycle), so the hook is injected rather than constructed here. That also
+   * keeps src/brain free of a SQLite import.
+   */
+  setMemory(memory: MemoryHook): void {
+    this.opts.memory = memory;
+  }
+
+  /**
    * Handle one inbound chat line. Returns why it did or did not reply, so the
    * decision is observable in tests and in logs.
    */
@@ -110,9 +146,14 @@ export class ChatBridge {
     const controller = new AbortController();
     this.inFlight.set(sender, { message, controller });
 
+    // D7: remember what the player said, and pull in what we already know.
+    // Both are wrapped because a reply must never fail because of the database.
+    this.recordSilently(message, "player", sender);
+    const memoryBlock = this.memoryContext(sender, message);
+
     try {
       const result = await this.opts.router.complete({
-        messages: buildChatMessages(sender, message, this.persona),
+        messages: buildChatMessages(sender, message, this.persona, memoryBlock),
         role: "fast",
         // A4: reasoning models need room to think or they return nothing. The
         // router clamps this up to its per-model floor.
@@ -158,6 +199,10 @@ export class ChatBridge {
       // check, so a leak is detected in the FULL text, not the trimmed one.
       const text = trimChatReply(raw, this.opts.maxReplyChars ?? 200);
 
+      // D7: Elix's own line is an episode too, so he remembers what he said.
+      // Recorded AFTER the leak filter, so a deflected line is never stored.
+      this.recordSilently(text, "elix", sender);
+
       this.replies += 1;
       sayQueue?.say(text, false);
       return {
@@ -171,6 +216,41 @@ export class ChatBridge {
       if (this.inFlight.get(sender)?.controller === controller) {
         this.inFlight.delete(sender);
       }
+    }
+  }
+
+  /**
+   * Store a line, never letting a database problem cost a reply.
+   *
+   * A memory failure is logged at debug and swallowed: the player still gets an
+   * answer, and the next line will be stored normally.
+   */
+  private recordSilently(
+    text: string,
+    speaker: "player" | "elix",
+    player: string,
+  ): void {
+    if (!this.opts.memory) return;
+    try {
+      this.opts.memory.record({ text, speaker, player, kind: "chat" });
+      if (speaker === "player") {
+        // D7: "my favourite block is X" is captured directly, so it works before
+        // any consolidation has run and survives a restart.
+        this.opts.memory.capturePreference(player, text);
+      }
+    } catch (err) {
+      this.opts.log?.debug({ err: (err as Error).message }, "memory write failed");
+    }
+  }
+
+  /** The memory block for this reply, or "" when memory is unavailable. */
+  private memoryContext(player: string, query: string): string {
+    if (!this.opts.memory) return "";
+    try {
+      return this.opts.memory.context(player, query);
+    } catch (err) {
+      this.opts.log?.debug({ err: (err as Error).message }, "memory read failed");
+      return "";
     }
   }
 
