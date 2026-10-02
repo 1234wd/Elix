@@ -37,6 +37,9 @@ export default defineConfig({
     "js-yaml",
     "commander",
     "ffmpeg-static",
+    // node:sqlite is loaded via createRequire, not a static import, because
+    // esbuild strips the `node:` prefix from externals and there is no bare
+    // `sqlite` module for Node to resolve. See src/brain/store.ts.
     /^node:/,
   ],
 });

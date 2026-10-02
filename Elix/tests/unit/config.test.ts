@@ -107,10 +107,41 @@ describe("A3 — a typo'd profile must NOT silently connect to main", () => {
     expect(() => getActiveProfile(broken)).toThrow(/No server profile "ghost"/);
   });
 
-  it("an explicit --host without --profile still uses main as the base", () => {
+  it("an explicit --host without --profile gets a synthetic (cli) profile", () => {
+    // A4: --host alone must NOT borrow main's port and version, nor fail when
+    // there is no main profile.
     const p = getActiveProfile(cfg, { host: "9.9.9.9" });
+    expect(p.name).toBe("(cli)");
     expect(p.host).toBe("9.9.9.9");
-    expect(p.port).toBe(25565); // main's port, host overridden
+    expect(p.port).toBe(25565);
+    expect(p.version).toBe("26.2");
+  });
+
+  it("--port alone also produces a synthetic (cli) profile", () => {
+    const p = getActiveProfile(cfg, { port: 25577 });
+    expect(p.name).toBe("(cli)");
+    expect(p.port).toBe(25577);
+    expect(p.host).toBe("127.0.0.1");
+  });
+
+  it("a (cli) profile takes its version from the CLI or bot.version, never main", () => {
+    const noMain = elixConfigSchema.parse({
+      version: 1,
+      bot: { username: "Elix", version: "26.3" },
+      profiles: { alt: { host: "2.2.2.2", port: 25566, version: "26.1" } },
+    });
+    // No `main` at all — the synthetic profile must still resolve.
+    expect(getActiveProfile(noMain, { host: "5.5.5.5" }).version).toBe("26.3");
+    expect(getActiveProfile(noMain, { host: "5.5.5.5", version: "26.2" }).version).toBe("26.2");
+    // And it must not be labelled `alt`.
+    expect(getActiveProfile(noMain, { host: "5.5.5.5" }).name).toBe("(cli)");
+  });
+
+  it("an explicit --profile wins over --host", () => {
+    const p = getActiveProfile(cfg, { profile: "alt", host: "7.7.7.7" });
+    expect(p.name).toBe("alt");
+    expect(p.host).toBe("7.7.7.7");
+    expect(p.port).toBe(25566); // alt's port, not main's
   });
 });
 

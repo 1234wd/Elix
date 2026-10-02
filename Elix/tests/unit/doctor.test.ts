@@ -7,7 +7,8 @@ import {
   checkServer,
   checkVersionData,
   checkHfEmbeddingsAsync,
-  HF_EMBEDDING_ENDPOINT,
+  hfFeatureExtractionUrl,
+  hfChatCompletionsUrl,
   PROVIDER_KEYS,
   runDoctor,
   renderDoctor,
@@ -148,7 +149,7 @@ describe("checkServer", () => {
 });
 
 describe("runDoctor", () => {
-  it("runs all seven checks with injected mocks", async () => {
+  it("runs all eight checks with injected mocks", async () => {
     const fakeExec = async () => {
       throw new Error("not found");
     };
@@ -169,7 +170,8 @@ describe("runDoctor", () => {
       liveApiCall: fakeLive,
       embeddingsCall: fakeEmbed,
     });
-    expect(results).toHaveLength(7);
+    // Eight checks as of Phase 3: `models` is the B2 role -> model resolution.
+    expect(results).toHaveLength(8);
     const names = results.map((r) => r.name);
     expect(names).toContain("node");
     expect(names).toContain("version-data");
@@ -177,6 +179,7 @@ describe("runDoctor", () => {
     expect(names).toContain("api-keys");
     expect(names).toContain("api-live");
     expect(names).toContain("hf-embeddings");
+    expect(names).toContain("models");
     expect(names).toContain("server");
   });
 });
@@ -204,8 +207,36 @@ describe("checkHfEmbeddingsAsync", () => {
 
   it("uses the separate pipeline route, not /v1", () => {
     // HF embeddings are NOT on the chat completions route.
-    expect(HF_EMBEDDING_ENDPOINT).toContain("/hf-inference/models/");
-    expect(HF_EMBEDDING_ENDPOINT).toContain("/pipeline/feature-extraction");
+    expect(hfFeatureExtractionUrl("x/y")).toContain("/hf-inference/models/");
+    expect(hfFeatureExtractionUrl("x/y")).toContain("/pipeline/feature-extraction");
+  });
+});
+
+describe("A3 — the model id's slash must survive URL encoding", () => {
+  // encodeURIComponent("BAAI/bge-small-en-v1.5") yields BAAI%2Fbge-small-en-v1.5,
+  // which the router path does not route. Each segment is encoded separately.
+  it("keeps the real slash between owner and model", () => {
+    expect(hfFeatureExtractionUrl("BAAI/bge-small-en-v1.5")).toBe(
+      "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5/pipeline/feature-extraction",
+    );
+  });
+
+  it("does not percent-encode the separator", () => {
+    expect(hfFeatureExtractionUrl("BAAI/bge-small-en-v1.5")).not.toContain("%2F");
+  });
+
+  it("still encodes characters that need it", () => {
+    expect(hfFeatureExtractionUrl("owner/mod el?v")).toContain("mod%20el%3Fv");
+  });
+
+  it("handles a bare model name with no owner segment", () => {
+    expect(hfFeatureExtractionUrl("bge-small-en-v1.5")).toBe(
+      "https://router.huggingface.co/hf-inference/models/bge-small-en-v1.5/pipeline/feature-extraction",
+    );
+  });
+
+  it("the chat route is the /v1 one", () => {
+    expect(hfChatCompletionsUrl()).toBe("https://router.huggingface.co/v1/chat/completions");
   });
 });
 

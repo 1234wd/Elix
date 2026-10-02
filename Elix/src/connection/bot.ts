@@ -72,6 +72,12 @@ export interface BotOptions {
   pingResult?: PingResult;
   /** Register cleanup here instead of returning it (A15: before connecting). */
   registerCleanup?: (fn: () => Promise<void>) => void;
+  /**
+   * Phase 3 in-game chat bridge (B9). Built by the CLI layer so src/connection
+   * does not import the brain (and therefore SQLite). When omitted, Elix plays
+   * exactly as it did in Phase 2: scripted greeting, no AI replies.
+   */
+  chatBridge?: ChatBridgeLike;
 }
 
 export interface BotStatus {
@@ -99,6 +105,24 @@ export interface SessionDeps {
   exitOnPermanent?: boolean;
   /** Test seam: called every time a new bot instance is created. */
   onBotCreated?: (bot: BotLike) => void;
+  /**
+   * Phase 3 in-game chat bridge (B9). Optional so the Phase 1/2 lifecycle tests
+   * need no brain, and so a bot with no keys and no config still joins.
+   */
+  chatBridge?: ChatBridgeLike;
+}
+
+/**
+ * The slice of ChatBridge this module needs. Declared structurally so
+ * src/connection does not import src/brain (which would drag SQLite into every
+ * connection test).
+ */
+export interface ChatBridgeLike {
+  handle(
+    sender: string,
+    message: string,
+    sayQueue?: SayQueue,
+  ): Promise<{ replied: boolean; reason: string; text?: string; usedProvider?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,29 +250,68 @@ export interface WalkOutcome {
 }
 
 /**
- * Blocks that must never be walked onto or through (A10).
+ * Blocks that must never be walked onto or through (A10, corrected in A1).
  *
- * The 26.2 sulfur hazards come from the master brief: sulfur caves are the main
- * late-game danger, so sulfur and cinnabar-adjacent blocks are treated as lethal
- * even where the block itself is not obviously on fire.
+ * Every name here is verified against vendor/minecraft-data/data/pc/26.2/
+ * blocks.json by a unit test — a typo or an invented name would silently never
+ * match, which is how `flowing_lava` and `sulfur_vent` got in before.
+ *
+ * Deliberately NOT hazards, despite looking alarming:
+ *
+ *   sulfur, cinnabar, sulfur_bricks, cinnabar_bricks
+ *     Ordinary solid blocks (boundingBox "block"). Sulfur is the main rock of
+ *     sulfur caves; treating it as a hazard would make those caves
+ *     unnavigable and break the explore-sulfur-caves goal.
+ *     https://minecraft.wiki/w/Sulfur
+ *
+ *   sulfur_spike
+ *     A solid block you can stand on. Its stalactites can fall and damage,
+ *     like pointed dripstone, but the block itself is not a hazard.
+ *     https://minecraft.wiki/w/Sulfur_Spike
+ *
+ *   campfire, soul_campfire
+ *     Light and smoke only — no damage on contact.
+ *
+ * Sources for the 26.2-specific entries:
+ *   potent_sulfur — "produces noxious gas, which gives Nausea temporarily, if
+ *     placed beneath shallow water. Placing a magma block below it in shallow
+ *     water turns it into a geyser." Avoiding it is the cheap safe play.
+ *     https://minecraft.wiki/w/Potent_Sulfur
+ *   geysers are potent_sulfur + magma_block + water, so magma_block is the
+ *     physical hazard and is listed below.
  */
 export const HAZARD_BLOCKS: ReadonlySet<string> = new Set([
+  // Damage on contact or from standing on it.
   "lava",
-  "flowing_lava",
   "magma_block",
   "fire",
   "soul_fire",
-  "campfire",
-  "soul_campfire",
   "powder_snow",
   "sweet_berry_bush",
   "wither_rose",
-  "sulfur",
-  "flowing_sulfur",
-  "sulfur_spike",
-  "sulfur_vent",
-  "cinnabar",
-  "cinnabar_block",
+  // Contact damage.
+  "cactus",
+  "pointed_dripstone",
+  // Traps and movement hazards.
+  "cobweb",
+  // Liquids: boundingBox is "empty", so a name-only check walks into them.
+  "water",
+  "bubble_column",
+  // 26.2: emits noxious gas, and spawns geysers with magma below it.
+  "potent_sulfur",
+]);
+
+/** Blocks whose boundingBox is "empty" but which still stop us. Liquids and traps. */
+export const HAZARD_PASSABLE_REJECTS: ReadonlySet<string> = new Set([
+  "water",
+  "bubble_column",
+  "lava",
+  "fire",
+  "soul_fire",
+  "powder_snow",
+  "cobweb",
+  "sweet_berry_bush",
+  "wither_rose",
 ]);
 
 /**
@@ -275,10 +338,13 @@ export function isSafeFloor(block: BlockLike | null): boolean {
 /** A10: is this block clear to walk through? Empty box, not a liquid. */
 export function isPassable(block: BlockLike | null): boolean {
   if (!block) return false;
-  // Every hazard is refused at body height too, whatever its bounding box.
-  if (HAZARD_BLOCKS.has(blockName(block))) return false;
+  const name = blockName(block);
+  // Liquids and traps are boundingBox "empty", so the name check is the only
+  // thing that stops us walking head-first into water (A1).
+  if (HAZARD_PASSABLE_REJECTS.has(name)) return false;
+  if (HAZARD_BLOCKS.has(name)) return false;
   const shape = block.boundingBox;
-  // "empty" covers air, cave_air, short_grass, flowers, torches and signs —
+  // "empty" covers air, cave_air, short_grass, flowers, torches and signs -
   // all passable despite having names that are not "air".
   return shape === "empty" || shape === undefined;
 }
@@ -561,13 +627,42 @@ export class BotSession {
     bus.emit("bot:chat", { username, text: message });
     log.info({ username, message }, "chat message");
 
-    if (!isGreetingFor(message, profile.username)) return;
-    // Small randomised delay so replies don't look robotic.
+    // B6: greetings are answered by scripted code and never spend quota. This
+    // is also the Phase 2 behaviour the owner already tested, so it stays first.
+    if (isGreetingFor(message, profile.username)) {
+      // Small randomised delay so replies don't look robotic.
+      this.setTimer(() => {
+        if (this.shutdownRequested || this.ended) return;
+        this.say?.say(`hi ${username}!`);
+        log.info({ username }, "replied to greeting");
+      }, 1000 + Math.floor(Math.random() * 1500));
+      return;
+    }
+
+    // B9: a player addressing Elix by name gets one short reply from the brain,
+    // routed through the same SayQueue so the rate limit still applies.
+    const bridge = this.deps.chatBridge;
+    if (!bridge || !this.deps.config.brain.chatReplies) return;
+
+    const startedAt = Date.now();
     this.setTimer(() => {
       if (this.shutdownRequested || this.ended) return;
-      this.say?.say(`hi ${username}!`);
-      log.info({ username }, "replied to greeting");
-    }, 1000 + Math.floor(Math.random() * 1500));
+      void bridge
+        .handle(username, message, this.say ?? undefined)
+        .then((outcome) => {
+          if (outcome.replied) {
+            log.info(
+              { username, reason: outcome.reason, provider: outcome.usedProvider, ms: Date.now() - startedAt },
+              "chat bridge replied",
+            );
+          } else {
+            log.debug({ username, reason: outcome.reason }, "chat bridge did not reply");
+          }
+        })
+        .catch((err: unknown) => {
+          log.warn({ username, err: (err as Error).message }, "chat bridge failed");
+        });
+    }, 800 + Math.floor(Math.random() * 1200));
   }
 
   private handleKicked(raw: unknown): void {
@@ -947,6 +1042,7 @@ export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
     log,
     pingResult,
     factory,
+    ...(opts.chatBridge ? { chatBridge: opts.chatBridge } : {}),
   });
 
   log.info(

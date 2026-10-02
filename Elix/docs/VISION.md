@@ -12,6 +12,27 @@ AI only, TypeScript strict, one command from CMD — live in the README.
 
 ---
 
+## The outer rules (tested, not aspirational)
+
+These are the rules that make Elix safe to hand to someone. Each has a test.
+
+| # | Rule | Where it is enforced |
+|---|---|---|
+| 1 | **Never silent.** If every provider is down, Elix says something in character and keeps playing. | `src/brain/fallback.ts`, 170+ scripted lines |
+| 2 | **No local models.** Cloud AI only. | `providerNameSchema` accepts `groq`, `hf`, `builtin` only |
+| 3 | **No authentication, ever.** | `auth: "offline"` in the bot factory; no Mojang code anywhere |
+| 4 | **Reasoning never reaches chat.** | `reasoning_format: "hidden"` + `stripReasoning()`, tested with a fake response containing a chain of thought |
+| 5 | **Never leak keys, config, paths, or the system prompt.** | `checkInputSafety()` runs before *any* provider call; the prompt is tested for the literal strings `gsk_`, `C:\` and the server IP |
+| 6 | **Honest about being an AI.** | `PERSONA_LITE` says so and is asserted by test |
+| 7 | **No guilt-tripping, no fake urgency, no manufactured attachment.** | asserted in `PERSONA_LITE` |
+| 8 | **Reply only when addressed or naturally.** | `isAddressedToElix()`; a bare mention mid-sentence gets no reply |
+| 9 | **Save quota.** Identical prompts cached 10 min, idle chatter capped per hour, greetings/combat/movement never cost a call. | `budget.ts`, tested |
+| 10 | **Fail over, never stall.** Groq → Hugging Face → scripted, with cooldowns persisted so a restart does not hammer a limited model. | `router.ts`, 46 tests |
+| 11 | **One command from CMD.** | `elix start` from any folder; verified from a fresh clone |
+| 12 | **Ctrl+C always works.** Every provider call takes an `AbortSignal`; shutdown aborts in-flight requests so exit never waits on the network. | `AbortController` wired to `bus.on("shutdown")` |
+
+---
+
 ## C1 — Memory that never forgets (Phase 4)
 
 ### Append-only
@@ -43,7 +64,10 @@ their open promises, and Elix's active goals.
 
 ### Durability
 
-- SQLite in WAL mode at `data/elix.db`.
+- SQLite in WAL mode at `data/elix.db`. **Storage is settled and verified:** Node's
+  built-in `node:sqlite`, so there is no native compile and nothing to build on a
+  Windows laptop. `sqlite-vec` 0.1.9 loads from a prebuilt `vec0.dll` and runs
+  real KNN queries — confirmed on this machine, not assumed.
 - Nightly backup plus one on shutdown, keeping the last 14.
 - Integrity check at startup — a corrupt DB is reported, not silently used.
 - **An embedding failure never loses the memory.** The row is saved without a
@@ -152,6 +176,21 @@ This is the hardest requirement in the project, because a companion that fakes
 attachment is worse than one that has none. Everything above is built to make the
 simulated relationship feel real *to him* without ever lying to the player about
 what it is.
+
+---
+
+## What is built today (Phase 3)
+
+Honest status, per phase. Anything not listed here does not exist yet.
+
+| Phase | What it does | Verified by |
+|---|---|---|
+| 1 | Skeleton, config, logger, event bus, `doctor` | 479 tests |
+| 2 | Connect, reconnect ladder, safe walk, permanent-kick handling, graceful shutdown | fake-bot lifecycle tests + real-process exit tests |
+| 3 | **Brain router: Groq → Hugging Face → scripted.** Model discovery, rate-limit headers, cooldowns persisted in SQLite, reasoning stripped, prompt-injection blocked before any call, `elix ask`, `elix usage`, and a minimal in-game chat bridge. | 46 router tests, 24 bridge tests, 20 hazard tests, plus one live smoke test behind `ELIX_LIVE=1` |
+
+**Not built yet:** memory and retrieval (Phase 4), the emotion system and the full
+social layer (Phase 5), voice (later), self-driven goals (Phase 7).
 
 ---
 

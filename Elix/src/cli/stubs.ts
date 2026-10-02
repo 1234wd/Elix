@@ -1,9 +1,12 @@
 import type { Command } from "commander";
 import type { ElixConfig } from "../core/config.js";
-import { getActiveProfile } from "../core/config.js";
+import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config.js";
 import { runBot } from "../connection/bot.js";
 import { Lifecycle } from "../core/lifecycle.js";
 import { exitCleanly } from "../core/exit.js";
+import { bus } from "../core/events.js";
+import { buildBrain, type BrainHandle } from "../brain/index.js";
+import { ChatBridge } from "../brain/bridge.js";
 import type { Logger } from "../core/logger.js";
 
 /**
@@ -69,13 +72,64 @@ export function registerStubs(program: Command): void {
       // Signal handlers go up before connecting, so Ctrl+C during ping/login is clean (A15).
       lifecycle.handleSignals();
 
+      // B7/B9: build the brain and the in-game chat bridge. Model discovery runs
+      // once here and is cached for 6 h, so joining does not wait on /models
+      // every time. A missing key is not an error — that provider is simply
+      // absent and the router falls through to the next one.
+      const brainAbort = new AbortController();
+      let chatBridge: ChatBridge | undefined;
+      let brain: BrainHandle | undefined;
+      try {
+        const models = await loadModelsConfig();
+        brain = buildBrain({
+          models,
+          config: config,
+          projectRoot: PROJECT_ROOT,
+        });
+        chatBridge = new ChatBridge({
+          router: brain.router,
+          username: profile.username,
+          log,
+          signal: brainAbort.signal,
+        });
+        // Log the role -> model resolution once at startup (B2).
+        const resolutions = await brain.router.resolveRoles(brainAbort.signal);
+        for (const r of resolutions) {
+          log.info(
+            { role: r.role, model: r.chosen ? `${r.chosen.provider}/${r.chosen.model}` : "builtin" },
+            "role resolved",
+          );
+        }
+      } catch (err) {
+        // A brain failure must never stop Elix from playing (vision rule 3).
+        log.warn(
+          { err: (err as Error).message },
+          "brain unavailable — playing without AI replies",
+        );
+        brain?.close();
+        brain = undefined;
+        chatBridge = undefined;
+      }
+
+      // B7: Ctrl+C aborts in-flight provider calls immediately, so shutdown
+      // never waits on the network.
+      bus.on("shutdown", () => brainAbort.abort());
+
       try {
         // runBot registers its own cleanup synchronously (before the first await
         // of the network work), so a Ctrl+C during ping still unwinds properly.
-        await runBot({ config, profile, log, registerCleanup: (fn) => void lifecycle.onCleanup(fn) });
+        await runBot({
+          config,
+          profile,
+          log,
+          registerCleanup: (fn) => void lifecycle.onCleanup(fn),
+          ...(chatBridge ? { chatBridge } : {}),
+        });
       } catch (err) {
         log.error({ err: (err as Error).message }, "failed to start");
         exitCleanly(1);
+      } finally {
+        brain?.close();
       }
     });
 
@@ -97,7 +151,7 @@ export function registerStubs(program: Command): void {
       console.log(`  log level:      ${config.logLevel}`);
     });
 
-  program.command("usage").description("Show today's LLM calls per provider").action(phaseStub(3, "Usage tracking"));
+  // `usage` and `ask` are real now (Phase 3) — registered in cli/brain.ts.
 
   const memory = program.command("memory").description("Search and manage memory");
   memory

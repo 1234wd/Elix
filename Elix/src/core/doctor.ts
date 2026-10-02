@@ -2,9 +2,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import type { ElixConfig } from "./config.js";
-import { getActiveProfile } from "./config.js";
+import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "./config.js";
 import { pingServer } from "../connection/ping.js";
 import { expectedProtocol, hasDataFor } from "../connection/version.js";
+import { buildBrain } from "../brain/index.js";
+import type { FetchLike } from "../brain/types.js";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -29,6 +31,8 @@ export interface DoctorOptions {
   liveApiCall?: (provider: string, apiKey: string, baseUrl: string) => Promise<boolean>;
   /** Override the Hugging Face embeddings probe (tests). */
   embeddingsCall?: (model: string, token: string) => Promise<boolean>;
+  /** Override the fetch used for model discovery (tests). */
+  fetchImpl?: FetchLike;
 }
 
 const MIN_NODE_MAJOR = 22;
@@ -124,16 +128,32 @@ async function testLiveApiCall(
  * Hugging Face embeddings are NOT on the /v1 chat route.
  *
  * The router exposes feature extraction on a separate pipeline endpoint, so
- * `elix doctor` probes it directly. If it fails, Phase 4 memory still works via
- * FTS5 keyword search and embeds lazily afterwards.
+ * `elix doctor` probes it directly. If it fails, memory falls back to FTS5
+ * keyword search and embeds lazily afterwards.
  */
-export const HF_EMBEDDING_ENDPOINT =
-  "https://router.huggingface.co/hf-inference/models/{model}/pipeline/feature-extraction";
+export const HF_ROUTER_BASE = "https://router.huggingface.co";
+
+/**
+ * Build the feature-extraction URL.
+ *
+ * A3: the model id contains a slash (`BAAI/bge-small-en-v1.5`) and the router
+ * path expects a real slash there. `encodeURIComponent` on the whole id turns it
+ * into `BAAI%2Fbge-small-en-v1.5`, which the router does not route. Each path
+ * segment is encoded individually so the separator survives.
+ */
+export function hfFeatureExtractionUrl(model: string, base = HF_ROUTER_BASE): string {
+  const encoded = model.split("/").map(encodeURIComponent).join("/");
+  return `${base}/hf-inference/models/${encoded}/pipeline/feature-extraction`;
+}
+
+/** Hugging Face chat completions — the fallback path for the chat role. */
+export function hfChatCompletionsUrl(base = HF_ROUTER_BASE): string {
+  return `${base}/v1/chat/completions`;
+}
 
 async function defaultHfEmbeddingCall(model: string, token: string): Promise<boolean> {
   try {
-    const url = HF_EMBEDDING_ENDPOINT.replace("{model}", encodeURIComponent(model));
-    const res = await fetch(url, {
+    const res = await fetch(hfFeatureExtractionUrl(model), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -167,8 +187,8 @@ export async function checkHfEmbeddingsAsync(
     name: "hf-embeddings",
     status: ok ? "ok" : "warn",
     note: ok
-      ? `${model} feature-extraction reachable`
-      : `${model} feature-extraction FAILED — memory will use FTS5 keyword search and embed later`,
+      ? `${model} reachable at ${hfFeatureExtractionUrl(model)}`
+      : `${model} FAILED at ${hfFeatureExtractionUrl(model)} — memory uses FTS5 keyword search and embeds later`,
   };
 }
 
@@ -193,6 +213,64 @@ export async function checkLiveApiKeys(
     status: allOk ? "ok" : "warn",
     note: results.join(", "),
   };
+}
+
+/**
+ * Which model each role resolves to, and which fall back to `builtin` (B2).
+ *
+ * Uses the router's real resolution so `doctor` cannot disagree with the game.
+ */
+export async function checkModelResolution(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl?: FetchLike,
+): Promise<CheckResult> {
+  const groqKey = env["GROQ_API_KEY"]?.trim();
+  const hfKey = env["HF_TOKEN"]?.trim();
+
+  if (!groqKey && !hfKey) {
+    return {
+      name: "models",
+      status: "warn",
+      note: "no provider keys — every role uses scripted fallback lines",
+    };
+  }
+
+  const models = await loadModelsConfig();
+  const brain = buildBrain({
+    models,
+    projectRoot: PROJECT_ROOT,
+    env,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+  try {
+    const resolutions = await brain.router.resolveRoles();
+    const lines: string[] = [];
+    const builtinRoles: string[] = [];
+    for (const r of resolutions) {
+      if (r.chosen) lines.push(`${r.role} → ${r.chosen.provider}/${r.chosen.model}`);
+      else {
+        lines.push(`${r.role} → builtin`);
+        builtinRoles.push(r.role);
+      }
+    }
+    const disabled = brain.router.disabledProviders();
+    const suffix =
+      disabled.length > 0
+        ? ` (disabled: ${disabled.map((d) => `${d.provider} ${d.reason}`).join(", ")})`
+        : "";
+    return {
+      name: "models",
+      status: builtinRoles.length === resolutions.length ? "warn" : "ok",
+      note:
+        lines.join("; ") +
+        suffix +
+        (builtinRoles.length > 0 ? ` — builtin fallback for: ${builtinRoles.join(", ")}` : ""),
+    };
+  } catch (err) {
+    return { name: "models", status: "warn", note: `resolution failed: ${(err as Error).message}` };
+  } finally {
+    brain.close();
+  }
 }
 
 /**
@@ -271,6 +349,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<CheckResult[]> {
     Promise.resolve(checkApiKeys(env)),
     checkLiveApiKeys(env, liveCall),
     checkHfEmbeddingsAsync(env, opts.embeddingsCall),
+    checkModelResolution(env, opts.fetchImpl),
     checkServer(profile.host, profile.port, ping, profile.version),
   ]);
 }

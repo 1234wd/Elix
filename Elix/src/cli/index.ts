@@ -11,6 +11,7 @@ import { bus } from "../core/events.js";
 import { registerDoctor } from "./doctor.js";
 import { registerStubs } from "./stubs.js";
 import { registerDebug } from "./debug.js";
+import { registerBrain } from "./brain.js";
 
 // Load .env before anything else so API keys are available from any folder (A5).
 loadDotenv({ path: resolve(PROJECT_ROOT, ".env"), quiet: true });
@@ -26,8 +27,9 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     .version("0.1.0", "-V, --elix-version");
 
   // Commands that need config load it up front so failures are clear.
-  // preAction hook args: (program, actionCommand) — we want the action command.
-  const configCommands = ["doctor", "start", "status"];
+  // `ask` and `usage` read the brain token/idle budgets, so they need it too —
+  // they were missing here and died on `undefined.brain`.
+  const configCommands = ["doctor", "start", "status", "ask", "usage"];
   program.hook("preAction", async (_program, actionCommand) => {
     if (!configCommands.includes(actionCommand.name())) return;
     try {
@@ -51,6 +53,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   registerDoctor(program);
   registerStubs(program);
+  registerBrain(program);
   registerDebug(program);
 
   await program.parseAsync(argv);

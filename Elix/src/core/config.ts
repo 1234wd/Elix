@@ -23,9 +23,12 @@ const serverSchema = z.object({
   profile: z.string().nullable().default("main"),
 });
 
+/** Minecraft's default server port, used when only --host is given. */
+export const DEFAULT_PORT = 25565;
+
 const profileSchema = z.object({
   host: z.string().min(1),
-  port: z.number().int().min(1).max(65535).default(25565),
+  port: z.number().int().min(1).max(65535).default(DEFAULT_PORT),
   /**
    * Deliberately optional with NO default (A4). With `.default("26.2")` every
    * profile had a version, so `bot.version` was dead config — setting it to
@@ -46,6 +49,13 @@ const brainSchema = z.object({
     .default({ fast: 6000, smart: 20000 }),
   /** Max idle-chatter AI calls per hour (quota saving). */
   idleChatterBudgetPerHour: z.number().int().nonnegative().default(60),
+  /**
+   * B9: the minimal in-game chat bridge. When false, a player addressing Elix
+   * by name gets no reply at all beyond the Phase 2 scripted greeting, so no
+   * quota is spent. Greetings, combat and movement never reach a model either
+   * way (B6) — they are handled by scripted code.
+   */
+  chatReplies: z.boolean().default(true),
 });
 
 const voiceSchema = z.object({
@@ -189,12 +199,19 @@ export function resolveFromRoot(p: string): string {
   return resolve(PROJECT_ROOT, p);
 }
 
+/** Name used for a profile synthesised entirely from CLI flags. */
+export const CLI_PROFILE_NAME = "(cli)";
+
 /**
  * Get the active server profile.
  *
  * A3: a named profile that does not exist must NOT silently fall back to `main`
  * — that connected the user to the wrong server while printing the name they
- * asked for. Only an absent profile name (the default case) uses `main`.
+ * asked for.
+ *
+ * A4: `--host` on its own produces a synthetic `(cli)` profile rather than
+ * borrowing main's port and version. `--host 1.2.3.4` alone now means
+ * 1.2.3.4:25565 at bot.version, and it works even with no `main` profile.
  */
 export function getActiveProfile(
   config: ElixConfig,
@@ -206,25 +223,58 @@ export function getActiveProfile(
     profile?: string;
   },
 ): ServerProfile & { name: string; username: string; version: string } {
-  const named = overrides?.profile ?? (overrides?.host ? undefined : (config.server.profile ?? "main"));
-  const available = Object.keys(config.profiles);
-  const name = named ?? "main";
+  const username = overrides?.username ?? config.bot.username;
 
-  const profile = config.profiles[name];
-  if (!profile) {
-    const list = available.length > 0 ? available.join(", ") : "(none configured)";
-    throw new ConfigError(`No server profile "${name}". Available: ${list}`);
+  // Explicit --profile always wins and must exist.
+  if (overrides?.profile) {
+    const profile = config.profiles[overrides.profile];
+    if (!profile) {
+      const list =
+        Object.keys(config.profiles).length > 0
+          ? Object.keys(config.profiles).join(", ")
+          : "(none configured)";
+      throw new ConfigError(`No server profile "${overrides.profile}". Available: ${list}`);
+    }
+    return {
+      name: overrides.profile,
+      host: overrides.host ?? profile.host,
+      port: overrides.port ?? profile.port,
+      // CLI > profile > bot.version.
+      version: overrides.version?.trim() || profile.version || config.bot.version,
+      description: profile.description,
+      username,
+    };
   }
 
-  // CLI > profile > bot.version (A4).
-  const version = overrides?.version?.trim() || profile.version || config.bot.version;
+  // --host or --port with no --profile: a synthetic CLI profile (A4).
+  if (overrides?.host || overrides?.port) {
+    return {
+      name: CLI_PROFILE_NAME,
+      host: overrides.host ?? "127.0.0.1",
+      port: overrides.port ?? DEFAULT_PORT,
+      // No profile to borrow from, so the CLI value or bot.version.
+      version: overrides.version?.trim() || config.bot.version,
+      description: "from command-line flags",
+      username,
+    };
+  }
 
+  // The configured default profile.
+  const name = config.server.profile ?? "main";
+  const profile = config.profiles[name];
+  if (!profile) {
+    const list =
+      Object.keys(config.profiles).length > 0
+        ? Object.keys(config.profiles).join(", ")
+        : "(none configured)";
+    throw new ConfigError(`No server profile "${name}". Available: ${list}`);
+  }
   return {
     name,
-    host: overrides?.host ?? profile.host,
-    port: overrides?.port ?? profile.port,
-    version,
+    host: profile.host,
+    port: profile.port,
+    version: overrides?.version?.trim() || profile.version || config.bot.version,
     description: profile.description,
-    username: overrides?.username ?? config.bot.username,
+    username,
   };
 }

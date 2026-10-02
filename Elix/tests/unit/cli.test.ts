@@ -56,7 +56,7 @@ describe("A9 — the built CLI works from any folder", () => {
     expect(stdout).toContain("forget");
   });
 
-  it("doctor lists all seven checks from another folder", async () => {
+  it("doctor lists all eight checks from another folder", async () => {
     const { stdout } = await runCli(["doctor", "--json"], tmp);
     const results = JSON.parse(stdout) as Array<{ name: string }>;
     expect(results.map((r) => r.name)).toEqual([
@@ -66,6 +66,7 @@ describe("A9 — the built CLI works from any folder", () => {
       "api-keys",
       "api-live",
       "hf-embeddings",
+      "models",
       "server",
     ]);
   });

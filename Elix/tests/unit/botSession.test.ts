@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { PROJECT_ROOT } from "../../src/core/config.js";
 import {
   BotSession,
   isGreetingFor,
@@ -10,6 +13,7 @@ import {
   isSafeFloor,
   isPassable,
   HAZARD_BLOCKS,
+  HAZARD_PASSABLE_REJECTS,
   toVec3,
   requirePathfinder,
   type BlockLike,
@@ -96,6 +100,7 @@ const CONFIG: ElixConfig = {
     smartMaxTokens: 4000,
     timeoutsMs: { fast: 6000, smart: 20000 },
     idleChatterBudgetPerHour: 60,
+    chatReplies: true,
   },
   voice: { enabled: false, textOnlyFallback: true },
   safety: { contentLevel: "kid-safe", chatRateLimitPer2s: 1 },
@@ -440,14 +445,13 @@ describe("A7 — mineflayer-pathfinder is loaded as CommonJS", () => {
 
 describe("A10 — floor and clearance use the bounding box, not the name", () => {
   const air = { name: "air", id: 0, boundingBox: "empty" };
-  const caveAir = { name: "cave_air", id: 163, boundingBox: "empty" };
   const stone = { name: "stone", id: 1, boundingBox: "block" };
-  const grass = { name: "short_grass", id: 1000, boundingBox: "empty" };
   const lava = { name: "lava", id: 9, boundingBox: "liquid" };
   const water = { name: "water", id: 8, boundingBox: "liquid" };
   const fire = { name: "fire", id: 81, boundingBox: "empty" };
   const magma = { name: "magma_block", id: 262, boundingBox: "block" };
-  const sulfur = { name: "sulfur", id: 9000, boundingBox: "block" };
+  const caveAir = { name: "cave_air", id: 163, boundingBox: "empty" };
+  const grass = { name: "short_grass", id: 1000, boundingBox: "empty" };
   const flower = { name: "poppy", id: 1001, boundingBox: "empty" };
 
   /** A flat world with a custom block at one position. */
@@ -471,8 +475,12 @@ describe("A10 — floor and clearance use the bounding box, not the name", () =>
     expect(isStandable(world(magma), 0, 65, 0)).toBe(false);
   });
 
-  it("rejects a sulfur floor (26.2 hazard)", () => {
-    expect(isStandable(world(sulfur), 0, 65, 0)).toBe(false);
+  it("rejects a potent_sulfur floor (26.2: vents noxious gas)", () => {
+    // A1: `sulfur` itself is ordinary rock and IS walkable — see the A1 block
+    // below. Only potent_sulfur, which emits gas, is a hazard.
+    expect(
+      isStandable(world({ name: "potent_sulfur", id: 999, boundingBox: "block" }), 0, 65, 0),
+    ).toBe(false);
   });
 
   it("rejects no floor at all", () => {
@@ -523,15 +531,136 @@ describe("A10 — floor and clearance use the bounding box, not the name", () =>
     }
   });
 
+  // A1: sulfur and cinnabar are ordinary building blocks. Listing them as
+  // hazards made sulfur caves unnavigable and broke the explore-caves goal.
+  it("treats a sulfur floor as safe", () => {
+    expect(isStandable(world({ name: "sulfur", id: 998, boundingBox: "block" }), 0, 65, 0)).toBe(true);
+  });
+
+  it("treats a cinnabar floor as safe", () => {
+    expect(isStandable(world({ name: "cinnabar", id: 1012, boundingBox: "block" }), 0, 65, 0)).toBe(true);
+  });
+
+  it("treats a cinnabar_bricks floor as safe", () => {
+    expect(
+      isStandable(world({ name: "cinnabar_bricks", id: 1020, boundingBox: "block" }), 0, 65, 0),
+    ).toBe(true);
+  });
+
+  it("treats a sulfur_bricks floor as safe", () => {
+    expect(
+      isStandable(world({ name: "sulfur_bricks", id: 1007, boundingBox: "block" }), 0, 65, 0),
+    ).toBe(true);
+  });
+
+  it("treats a sulfur_spike floor as safe — it is solid, only its stalactites fall", () => {
+    expect(
+      isStandable(world({ name: "sulfur_spike", id: 1134, boundingBox: "block" }), 0, 65, 0),
+    ).toBe(true);
+  });
+
+  it("treats a potent_sulfur floor as a hazard — it vents noxious gas", () => {
+    expect(
+      isStandable(world({ name: "potent_sulfur", id: 999, boundingBox: "block" }), 0, 65, 0),
+    ).toBe(false);
+  });
+
+  it("rejects water at the feet even though its boundingBox is empty", () => {
+    expect(isPassable(water)).toBe(false);
+    expect(isStandable(world(stone, water), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects a bubble_column at the feet", () => {
+    expect(isPassable({ name: "bubble_column", id: 0, boundingBox: "empty" })).toBe(false);
+  });
+
+  it("rejects a cactus floor", () => {
+    expect(isSafeFloor({ name: "cactus", id: 0, boundingBox: "block" })).toBe(false);
+  });
+
+  it("rejects a pointed_dripstone floor", () => {
+    expect(isSafeFloor({ name: "pointed_dripstone", id: 0, boundingBox: "block" })).toBe(false);
+  });
+
+  it("rejects a cobweb at the feet", () => {
+    expect(isPassable({ name: "cobweb", id: 0, boundingBox: "empty" })).toBe(false);
+  });
+});
+
+describe("A1 — every hazard name exists in the vendored 26.2 data", () => {
+  // A typo or an invented name never matches anything, so the hazard silently
+  // does nothing. This is how flowing_lava and sulfur_vent slipped in.
+  const blocks = (() => {
+    const file = readFileSync(
+      join(PROJECT_ROOT, "vendor", "minecraft-data", "data", "pc", "26.2", "blocks.json"),
+      "utf8",
+    );
+    return JSON.parse(file) as Array<{ name: string; boundingBox?: string }>;
+  })();
+  const byName = new Map(blocks.map((b) => [b.name, b]));
+
+  it("has block data to check against", () => {
+    expect(blocks.length).toBeGreaterThan(1000);
+  });
+
+  for (const name of [...HAZARD_BLOCKS, ...HAZARD_PASSABLE_REJECTS]) {
+    it(`"${name}" exists in 26.2 blocks.json`, () => {
+      expect(byName.has(name), `"${name}" is not a real 26.2 block name`).toBe(true);
+    });
+  }
+
+  it("does not list the invented names from the old list", () => {
+    for (const name of ["flowing_lava", "flowing_sulfur", "sulfur_vent", "cinnabar_block"]) {
+      expect(HAZARD_BLOCKS.has(name), `${name} does not exist in 26.2`).toBe(false);
+    }
+  });
+
+  it("does not treat sulfur or cinnabar as hazards", () => {
+    expect(HAZARD_BLOCKS.has("sulfur")).toBe(false);
+    expect(HAZARD_BLOCKS.has("cinnabar")).toBe(false);
+    expect(HAZARD_BLOCKS.has("sulfur_bricks")).toBe(false);
+    expect(HAZARD_BLOCKS.has("cinnabar_bricks")).toBe(false);
+  });
+
+  it("every hazard is either solid or a liquid/trap we must refuse", () => {
+    for (const name of HAZARD_BLOCKS) {
+      const block = byName.get(name);
+      expect(["block", "empty"], `${name} has shape ${String(block?.boundingBox)}`).toContain(
+        block?.boundingBox,
+      );
+    }
+  });
+});
+
+describe("A1 — walk selection over the blocks the user named", () => {
+  const air = { name: "air", id: 0, boundingBox: "empty" };
+  const floorAt = (name: string, id: number) => (p: Vec3Like): BlockLike | null =>
+    p.y < 65 ? { name, id, boundingBox: "block" } : air;
+
+  it("picks a direction over sulfur ground", () => {
+    const target = pickWalkDirection(floorAt("sulfur", 998), { x: 0, y: 65, z: 0 });
+    expect(target).not.toBeNull();
+  });
+
+  it("picks a direction over cinnabar_bricks ground", () => {
+    const target = pickWalkDirection(floorAt("cinnabar_bricks", 1020), { x: 0, y: 65, z: 0 });
+    expect(target).not.toBeNull();
+  });
+
+  it("refuses to walk over lava", () => {
+    const target = pickWalkDirection(floorAt("lava", 9), { x: 0, y: 65, z: 0 });
+    expect(target).toBeNull();
+  });
+
   it("isPassable accepts air, cave_air and plants", () => {
-    expect(isPassable(air)).toBe(true);
-    expect(isPassable(caveAir)).toBe(true);
-    expect(isPassable(grass)).toBe(true);
-    expect(isPassable(flower)).toBe(true);
+    expect(isPassable({ name: "air", id: 0, boundingBox: "empty" })).toBe(true);
+    expect(isPassable({ name: "cave_air", id: 163, boundingBox: "empty" })).toBe(true);
+    expect(isPassable({ name: "short_grass", id: 1000, boundingBox: "empty" })).toBe(true);
+    expect(isPassable({ name: "poppy", id: 1001, boundingBox: "empty" })).toBe(true);
   });
 
   it("isPassable rejects anything solid", () => {
-    expect(isPassable(stone)).toBe(false);
+    expect(isPassable({ name: "stone", id: 1, boundingBox: "block" })).toBe(false);
     expect(isPassable({ name: "oak_log", id: 5, boundingBox: "block" })).toBe(false);
   });
 });
