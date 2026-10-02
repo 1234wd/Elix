@@ -72,10 +72,9 @@ export function registerStubs(program: Command): void {
       // Signal handlers go up before connecting, so Ctrl+C during ping/login is clean (A15).
       lifecycle.handleSignals();
 
-      // B7/B9: build the brain and the in-game chat bridge. Model discovery runs
-      // once here and is cached for 6 h, so joining does not wait on /models
-      // every time. A missing key is not an error — that provider is simply
-      // absent and the router falls through to the next one.
+      // B7/B9: build the brain and the in-game chat bridge. A missing key is
+      // not an error — that provider is simply absent and the router falls
+      // through to the next one.
       const brainAbort = new AbortController();
       let chatBridge: ChatBridge | undefined;
       let brain: BrainHandle | undefined;
@@ -92,14 +91,43 @@ export function registerStubs(program: Command): void {
           log,
           signal: brainAbort.signal,
         });
-        // Log the role -> model resolution once at startup (B2).
-        const resolutions = await brain.router.resolveRoles(brainAbort.signal);
-        for (const r of resolutions) {
-          log.info(
-            { role: r.role, model: r.chosen ? `${r.chosen.provider}/${r.chosen.model}` : "builtin" },
-            "role resolved",
-          );
-        }
+
+        // A1: the brain's SQLite store must live as long as the PROCESS.
+        //
+        // It used to be closed in a `finally` right after `await runBot(...)`,
+        // but runBot returns as soon as the bot is created — seconds after
+        // launch, not when Elix leaves. Every later router call then threw
+        // "database is not open" and every in-game reply failed.
+        //
+        // Lifecycle cleanups run in reverse registration order, so registering
+        // this BEFORE runBot's own cleanup makes the store close LAST, after
+        // the goodbye message has been sent.
+        lifecycle.onCleanup(() => {
+          brainAbort.abort();
+          brain?.close();
+        });
+
+        // A2: model discovery runs in the BACKGROUND. Startup used to await
+        // resolveRoles() here, so a hung /models could stop Elix joining the
+        // server at all. resolveRoles() inside complete() still resolves on
+        // first use, with a 5 s timeout.
+        brain.router.warmModelCache(brainAbort.signal);
+        void brain.router.resolveRoles(brainAbort.signal).then(
+          (resolutions) => {
+            for (const r of resolutions) {
+              log.info(
+                {
+                  role: r.role,
+                  model: r.chosen ? `${r.chosen.provider}/${r.chosen.model}` : "builtin",
+                },
+                "role resolved",
+              );
+            }
+          },
+          () => {
+            /* logged inside the router; never blocks startup */
+          },
+        );
       } catch (err) {
         // A brain failure must never stop Elix from playing (vision rule 3).
         log.warn(
@@ -125,10 +153,15 @@ export function registerStubs(program: Command): void {
           registerCleanup: (fn) => void lifecycle.onCleanup(fn),
           ...(chatBridge ? { chatBridge } : {}),
         });
+        // runBot has resolved but Elix is STILL PLAYING. Nothing may close the
+        // brain here — the lifecycle cleanup registered above owns that.
+        await lifecycle.waitForShutdown();
       } catch (err) {
         log.error({ err: (err as Error).message }, "failed to start");
         exitCleanly(1);
       } finally {
+        // Safety net for a failure before the cleanup could register.
+        brainAbort.abort();
         brain?.close();
       }
     });

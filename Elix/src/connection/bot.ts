@@ -226,6 +226,25 @@ export function isGreetingFor(message: string, username: string): boolean {
   return GREETING.test(message) && NAME.test(message);
 }
 
+/**
+ * Is there anything after the greeting worth answering? (A6)
+ *
+ * "hi elix" is a greeting. "hi elix what's your favourite block" is a greeting
+ * AND a question, and the scripted "hi <name>!" reply threw the question away.
+ * So the scripted path only runs when the greeting is the entire message.
+ */
+export function hasFollowUp(message: string, username: string): boolean {
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Drop the name and the greeting words, then see if any words remain.
+  const stripped = message
+    .replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ")
+    .replace(/\b(hi|hello|hey|yo|sup|there|morning|evening|again)\b/gi, " ")
+    .replace(/[!,.?]+/g, " ")
+    .trim();
+  // Two or more words left, or a question mark, means there is more to say.
+  return /\?/.test(message) || stripped.split(/\s+/).filter(Boolean).length >= 2;
+}
+
 // A12: the old NON_GREETING_SUBSTRINGS list was exported from here and included
 // "hi" itself, which IS a greeting. The negative cases now live in the test file
 // where they are actually used.
@@ -627,9 +646,15 @@ export class BotSession {
     bus.emit("bot:chat", { username, text: message });
     log.info({ username, message }, "chat message");
 
-    // B6: greetings are answered by scripted code and never spend quota. This
-    // is also the Phase 2 behaviour the owner already tested, so it stays first.
-    if (isGreetingFor(message, profile.username)) {
+    // B6: a bare greeting is answered by scripted code and never spends quota.
+    // This is also the Phase 2 behaviour the owner already tested, so it stays
+    // first — but only when the greeting is the WHOLE message.
+    //
+    // A6: "hi elix what's your favourite block" is a greeting with a real
+    // question attached. Answering that with "hi Steve!" threw the question
+    // away, so anything with more words goes to the bridge instead, and the
+    // LLM answers both parts.
+    if (isGreetingFor(message, profile.username) && !hasFollowUp(message, profile.username)) {
       // Small randomised delay so replies don't look robotic.
       this.setTimer(() => {
         if (this.shutdownRequested || this.ended) return;

@@ -27,6 +27,10 @@ export class Lifecycle {
   private shuttingDown = false;
   private signalsRegistered = false;
   private signalHandlers = new Map<NodeJS.Signals, () => void>();
+  /** A1: set once shutdown begins, and the promise waitForShutdown() hands out. */
+  private shutdownStarted = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private onShutdownBegin: (() => void) | null = null;
 
   constructor(log: Logger, opts: LifecycleOptions = {}) {
     this.log = log;
@@ -75,9 +79,33 @@ export class Lifecycle {
     this.signalsRegistered = false;
   }
 
+  /**
+   * Resolve once shutdown begins (A1).
+   *
+   * `elix start` must not return when the bot connects — that is when play
+   * begins, not when it ends. The action awaits this so the process stays
+   * alive, and so the `finally` block that closes the brain can only run after
+   * the cleanup registered with onCleanup has already run.
+   *
+   * Resolves on the FIRST shutdown only, so a second Ctrl+C (force exit 130)
+   * is unaffected.
+   */
+  waitForShutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    const p = new Promise<void>((resolve) => {
+      this.onShutdownBegin = resolve;
+    });
+    this.shutdownPromise = p;
+    return p;
+  }
+
   async shutdown(reason: string): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.shutdownStarted = true;
+    // Wake anything blocked in waitForShutdown() BEFORE the cleanups run, so
+    // it can observe ordering without racing the goodbye.
+    this.onShutdownBegin?.();
     this.log.info({ reason }, "shutting down");
     bus.emit("shutdown", reason);
 

@@ -21,7 +21,12 @@
  * reaches us, and strip it again defensively in reasoning.ts.
  */
 import { parseRateLimitHeaders, type RateLimitInfo } from "./ratelimit.js";
-import { stripReasoning, isReasoningModel, reasoningEffortFor } from "./reasoning.js";
+import {
+  stripReasoning,
+  isReasoningModel,
+  reasoningParams,
+  completionTokenLimit,
+} from "./reasoning.js";
 import type {
   CompletionRequest,
   FetchLike,
@@ -125,15 +130,20 @@ export class GroqProvider implements ProviderAdapter {
       model,
       messages,
       temperature: req.temperature ?? 0.9,
-      max_tokens: req.maxTokens ?? 300,
       stream,
     };
+    // A4: reasoning models need a completion budget large enough to think in.
+    // Groq's quick start uses `max_completion_tokens` for them, and reasoning
+    // tokens count against the limit, so a 120-token cap returns empty content.
+    const maxTokens = completionTokenLimit(model, req.maxTokens ?? 300);
     if (isReasoningModel(model)) {
-      // Ask for the cheapest reasoning that still answers, and never receive
-      // the chain of thought at all (B4).
-      body["reasoning_effort"] = reasoningEffortFor(model);
-      body["reasoning_format"] = "hidden";
+      body.max_completion_tokens = maxTokens;
+    } else {
+      body.max_tokens = maxTokens;
     }
+    // A4: gpt-oss rejects reasoning_format and wants include_reasoning:false.
+    // reasoningParams() picks exactly one of the mutually exclusive pair.
+    Object.assign(body, reasoningParams(model));
     return body;
   }
 

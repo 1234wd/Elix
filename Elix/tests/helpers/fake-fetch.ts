@@ -102,7 +102,23 @@ export function fakeFetch(routes: Route[] = []): FakeFetch {
         return Promise.reject(new Error(`fake fetch: hanging route for ${target} needs a signal`));
       }
       return new Promise<never>((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(abortError()), { once: true });
+        // A ref'd timer keeps the event loop alive while we wait.
+        //
+        // `AbortSignal.timeout()` is UNREF'd in Node, so in a test where the
+        // pending request is the only thing left, the loop drains, the deadline
+        // never fires, and node exits with "unsettled top-level await" instead
+        // of the timeout being exercised at all. In the real bot an open
+        // Minecraft socket always holds the loop, so this is a test-harness
+        // concern — but it must be held here or the timeout test proves nothing.
+        const keepAlive = setInterval(() => undefined, 1_000);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearInterval(keepAlive);
+            reject(abortError());
+          },
+          { once: true },
+        );
       });
     }
 

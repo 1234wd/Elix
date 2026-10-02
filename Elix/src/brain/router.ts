@@ -46,8 +46,30 @@ export const CIRCUIT_OPEN_MS = 60_000;
 /** Model discovery is cached for six hours (B2). */
 export const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 
-/** A provider disabled by 401/402/403 stays out until this long (one day). */
+/** A provider disabled by 401/403 stays out until this long (one day). */
 export const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** A2: /models must never hold up joining the server for long. */
+export const MODELS_TIMEOUT_MS = 5_000;
+
+/** A2: the embeddings endpoint. Phase 4 will reuse this. */
+export const EMBEDDINGS_TIMEOUT_MS = 10_000;
+
+/**
+ * Combine a caller's signal with a deadline (A2).
+ *
+ * `AbortSignal.any` fires when EITHER aborts, so a caller cancelling still
+ * works and a hung provider is cut off even when the caller never cancels.
+ * Without a caller signal we still return a real signal, so callers never have
+ * to branch.
+ */
+export function withTimeout(
+  caller: AbortSignal | undefined,
+  ms: number,
+): AbortSignal {
+  const deadline = AbortSignal.timeout(ms);
+  return caller ? AbortSignal.any([caller, deadline]) : deadline;
+}
 
 export interface Candidate {
   provider: ProviderName;
@@ -83,6 +105,13 @@ export interface RouterOptions {
   random?: () => number;
   fastMaxTokens?: number;
   smartMaxTokens?: number;
+  /** A2: per-request timeouts, from brain.timeoutsMs. */
+  fastTimeoutMs?: number;
+  smartTimeoutMs?: number;
+  /** A2: timeout for /models discovery. */
+  modelsTimeoutMs?: number;
+  /** A2: timeout for the embeddings endpoint. */
+  embeddingsTimeoutMs?: number;
   idleChatterBudgetPerHour?: number;
   /** Turn the cache off in tests that assert a network call happened. */
   cacheEnabled?: boolean;
@@ -102,8 +131,16 @@ export class BrainRouter {
   /** provider -> models disabled until, from 401/402/403 or HF credits. */
   private readonly disabledUntil = new Map<ProviderName, number>();
   private readonly disabledReason = new Map<ProviderName, string>();
-  /** provider+model -> remaining tokens from the last response. */
-  private readonly remainingTokens = new Map<string, number>();
+  /** provider+model -> models on a daily limit until (A7: per model, not per provider). */
+  private readonly modelDisabledUntil = new Map<string, number>();
+  private readonly modelDisabledReason = new Map<string, string>();
+  /**
+   * provider+model -> remaining tokens AND the time that reading expires (A8).
+   * Stored as a pair so a low reading cannot become a permanent lockout.
+   */
+  private readonly remainingTokens = new Map<string, { remaining: number; resetAt: number }>();
+  /** A1: log a broken usage store once, not once per chat message. */
+  private storeWarned = false;
 
   constructor(opts: RouterOptions) {
     this.opts = opts;
@@ -118,23 +155,32 @@ export class BrainRouter {
 
   private loadPersistedState(): void {
     const now = this.now();
-    for (const row of this.opts.store.allCooldowns()) {
-      if (row.until > now) {
-        // Re-seed into the in-memory map so the router does not re-hit /models
-        // and does not immediately try a still-limited model (B3).
-        this.opts.store.activeCooldowns(now);
-      }
-    }
-    for (const row of this.opts.store.activeCooldowns(now)) {
+    for (const row of this.safeRead<ReturnType<BrainStore["activeCooldowns"]>>(
+      [],
+      () => this.opts.store.activeCooldowns(now),
+    )) {
+      if (row.provider === "builtin") continue;
+      const key = `${row.provider}/${row.model}`;
       if (row.disabledForDay) {
-        this.disabledUntil.set(row.provider as ProviderName, row.until);
-        this.disabledReason.set(row.provider as ProviderName, row.reason);
+        // A7: a row that names a specific model stays scoped to that model.
+        // Only a provider-wide reason (auth, credit) disables everything.
+        if (row.reason.startsWith("daily limit")) {
+          this.modelDisabledUntil.set(key, row.until);
+          this.modelDisabledReason.set(key, row.reason);
+        } else {
+          this.disabledUntil.set(row.provider as ProviderName, row.until);
+          this.disabledReason.set(row.provider as ProviderName, row.reason);
+        }
       }
     }
   }
 
   private isCooling(provider: string, model: string, now: number): CooldownInfo | null {
-    for (const row of this.opts.store.activeCooldowns(now)) {
+    const rows = this.safeRead<ReturnType<BrainStore["activeCooldowns"]>>(
+      [],
+      () => this.opts.store.activeCooldowns(now),
+    );
+    for (const row of rows) {
       if (row.provider === provider && row.model === model) {
         return { until: row.until, reason: row.reason };
       }
@@ -154,7 +200,9 @@ export class BrainRouter {
 
   // -- model discovery (B2) ------------------------------------------------
 
-  /** Model ids for a provider, from cache or /models. */
+  /**
+   * Model ids for a provider, from cache or /models (A2: 5 s timeout).
+   */
   async modelsFor(provider: ProviderName, signal?: AbortSignal): Promise<string[]> {
     const now = this.now();
     const fetchedAt = this.modelListFetchedAt.get(provider);
@@ -163,7 +211,10 @@ export class BrainRouter {
       return inMemory;
     }
     // Try the persisted cache before hitting the network.
-    const cached = this.opts.store.getCachedModels(provider, MODEL_CACHE_MS, now);
+    const cached = this.safeRead<string[] | null>(
+      null,
+      () => this.opts.store.getCachedModels(provider, MODEL_CACHE_MS, now),
+    );
     if (cached) {
       this.modelLists.set(provider, cached);
       this.modelListFetchedAt.set(provider, now);
@@ -172,10 +223,12 @@ export class BrainRouter {
     const adapter = this.opts.providers[provider];
     if (!adapter) return [];
     try {
-      const models = await adapter.listModels(signal);
+      const models = await adapter.listModels(
+        withTimeout(signal, this.opts.modelsTimeoutMs ?? MODELS_TIMEOUT_MS),
+      );
       this.modelLists.set(provider, models);
       this.modelListFetchedAt.set(provider, now);
-      this.opts.store.cacheModels(provider, models, now);
+      this.safeStore("cacheModels", () => this.opts.store.cacheModels(provider, models, now));
       return models;
     } catch (err) {
       this.opts.log?.warn(
@@ -184,6 +237,25 @@ export class BrainRouter {
       );
       return [];
     }
+  }
+
+  /**
+   * A2: warm the model lists without blocking anything.
+   *
+   * Startup used to await resolveRoles() before joining, so a hung /models
+   * could stop Elix joining the server at all. This runs detached: the caller
+   * gets a promise it may ignore, and resolution inside complete() still awaits
+   * it (with the 5 s timeout) on first real use.
+   */
+  warmModelCache(signal?: AbortSignal): void {
+    void (async () => {
+      for (const provider of Object.keys(this.opts.providers) as ProviderName[]) {
+        if (signal?.aborted) return;
+        await this.modelsFor(provider, signal);
+      }
+    })().catch(() => {
+      /* discovery is best-effort; complete() re-requests with a timeout */
+    });
   }
 
   /** Resolve every role to the first model that is actually available. */
@@ -221,6 +293,13 @@ export class BrainRouter {
       }
       const disabledUntil = this.disabledUntil.get(entry.provider);
       if (disabledUntil !== undefined && disabledUntil > now) {
+        skipped.push({ candidate, reason: "disabled-for-day" });
+        continue;
+      }
+      // A7: a model on a daily limit is skipped, but its siblings are not.
+      const modelKey = `${entry.provider}/${entry.model}`;
+      const modelOff = this.modelDisabledUntil.get(modelKey);
+      if (modelOff !== undefined && modelOff > now) {
         skipped.push({ candidate, reason: "disabled-for-day" });
         continue;
       }
@@ -303,9 +382,26 @@ export class BrainRouter {
 
     const attempts: AttemptRecord[] = [];
     const trimmed = budgetMessages(req.messages, budget);
+    // A9: one abort row per cascade, not one per skipped candidate.
+    let recordedAbort = false;
 
     for (const candidate of resolution.available) {
       if (candidate.provider === "builtin") break; // handled by the fallback below
+
+      // A9: if shutdown lands mid-cascade, stop at once. Trying the next two
+      // providers would hold the process open for their timeouts too.
+      if (req.signal?.aborted) {
+        if (!recordedAbort) {
+          recordedAbort = true;
+          this.attempt(attempts, role, {
+            provider: candidate.provider,
+            model: candidate.model,
+            outcome: "abort",
+            latencyMs: 0,
+          });
+        }
+        return this.scriptedFallback(req.messages, role, "aborted mid-cascade", started);
+      }
 
       const adapter = this.opts.providers[candidate.provider];
       if (!adapter) continue;
@@ -343,9 +439,10 @@ export class BrainRouter {
       }
 
       // Proactive switching: skip before the 429 if the token budget is short.
-      const remaining = this.remainingTokens.get(`${candidate.provider}/${candidate.model}`);
+      // A8: the recorded budget is only trusted until its own reset time.
+      const budgetLeft = this.remainingFor(candidate);
       const promptTokens = estimateTokens(trimmed.messages.map((m) => m.content).join("\n"));
-      if (remaining !== undefined && remaining < promptTokens) {
+      if (budgetLeft !== undefined && budgetLeft.remaining < promptTokens) {
         this.attempt(attempts, role, {
           provider: candidate.provider,
           model: candidate.model,
@@ -357,15 +454,38 @@ export class BrainRouter {
       }
 
       const attemptStart = this.now();
+      // A2: every call gets a timeout as well as the caller's signal. Declared
+      // out here so the catch block can tell WHICH of the two fired.
+      const deadline = AbortSignal.timeout(this.timeoutFor(role));
+      const signal = req.signal ? AbortSignal.any([req.signal, deadline]) : deadline;
       try {
-        const res = await adapter.complete({ ...req, messages: trimmed.messages }, candidate.model);
+        const res = await adapter.complete({ ...req, messages: trimmed.messages, signal }, candidate.model);
         const latencyMs = this.now() - attemptStart;
 
-        // Record rate-limit headers for the next proactive decision (B3).
-        if (res.headers) this.recordRateLimit(candidate, parseRateLimitHeaders(res.headers));
+        // A4: an empty answer is a FAILED attempt, not a reply. A reasoning
+        // model that spent its whole budget thinking returns "" here, and
+        // returning that would be a silent no-reply in game.
+        if (res.text.trim().length === 0) {
+          this.attempt(attempts, role, {
+            provider: candidate.provider,
+            model: candidate.model,
+            outcome: "network",
+            latencyMs,
+            tokensIn: res.tokensIn,
+            tokensOut: res.tokensOut,
+            reasoningTokens: res.reasoningTokens,
+            error: "empty content after stripping reasoning",
+          });
+          continue;
+        }
+
+        // Record rate-limit headers for the next proactive decision (B3/A8).
+        if (res.headers) this.recordRateLimit(candidate, parseRateLimitHeaders(res.headers), this.now());
 
         circuit.failures = 0;
-        this.opts.store.clearCooldown(candidate.provider, candidate.model);
+        this.safeStore("clearCooldown", () =>
+          this.opts.store.clearCooldown(candidate.provider, candidate.model),
+        );
 
         this.attempt(attempts, role, {
           provider: candidate.provider,
@@ -393,8 +513,36 @@ export class BrainRouter {
         };
       } catch (err) {
         const latencyMs = this.now() - attemptStart;
-        this.handleFailure(candidate, err, circuit);
-        const outcome = this.classifyOutcome(candidate, err);
+        // A2/A9: WHO cancelled matters more than what the error is called.
+        //
+        // `AbortSignal.any()` collapses "the caller pressed Ctrl+C" and "our
+        // deadline fired" into the same AbortError, so classifying on the error
+        // name alone treated every timeout as a shutdown and stopped the
+        // cascade — the router returned a scripted line instead of trying the
+        // next model. Decide from the signals themselves.
+        const outcome: AttemptRecord["outcome"] = req.signal?.aborted
+          ? "abort"
+          : deadline.aborted
+            ? "timeout"
+            : this.classifyOutcome(candidate, err);
+        this.handleFailure(candidate, err, circuit, outcome);
+
+        if (outcome === "abort") {
+          // A9: the cascade is over. One abort row, then straight to the
+          // scripted line — no further candidates.
+          if (!recordedAbort) {
+            recordedAbort = true;
+            this.attempt(attempts, role, {
+              provider: candidate.provider,
+              model: candidate.model,
+              outcome: "abort",
+              latencyMs,
+              error: (err as Error).message.slice(0, 200),
+            });
+          }
+          return this.scriptedFallback(req.messages, role, "aborted mid-cascade", started);
+        }
+
         this.attempt(attempts, role, {
           provider: candidate.provider,
           model: candidate.model,
@@ -461,23 +609,97 @@ export class BrainRouter {
     record: AttemptRecord,
   ): void {
     attempts.push(record);
-    this.opts.store.recordUsage({
-      ts: this.now(),
-      provider: record.provider,
-      model: record.model,
-      role,
-      tokensIn: record.tokensIn ?? 0,
-      tokensOut: record.tokensOut ?? 0,
-      reasoningTokens: record.reasoningTokens ?? 0,
-      latencyMs: record.latencyMs,
-      outcome: record.skip ? skipOutcome(record.skip) : record.outcome,
-      ...(record.error ? { error: record.error } : {}),
+    this.safeStore("recordUsage", () =>
+      this.opts.store.recordUsage({
+        ts: this.now(),
+        provider: record.provider,
+        model: record.model,
+        role,
+        tokensIn: record.tokensIn ?? 0,
+        tokensOut: record.tokensOut ?? 0,
+        reasoningTokens: record.reasoningTokens ?? 0,
+        latencyMs: record.latencyMs,
+        outcome: record.skip ? skipOutcome(record.skip) : record.outcome,
+        ...(record.error ? { error: record.error } : {}),
+      }),
+    );
+  }
+
+  private recordRateLimit(
+    candidate: Candidate,
+    info: RateLimitInfo,
+    now: number,
+  ): void {
+    if (info.remainingTokens === undefined) return;
+    // A8: the reset time travels WITH the value. Without it a low reading is
+    // permanent: the model is skipped, so it never succeeds, so the value is
+    // never refreshed — a permanent lockout that only a restart clears.
+    const resetSec = info.resetTokensSec ?? info.resetRequestsSec;
+    this.remainingTokens.set(`${candidate.provider}/${candidate.model}`, {
+      remaining: info.remainingTokens,
+      // If no reset header came back, do not trust the value for long.
+      resetAt: resetSec === undefined ? now + 60_000 : now + resetSec * 1000,
     });
   }
 
-  private recordRateLimit(candidate: Candidate, info: RateLimitInfo): void {
-    if (info.remainingTokens !== undefined) {
-      this.remainingTokens.set(`${candidate.provider}/${candidate.model}`, info.remainingTokens);
+  /**
+   * The token budget still trusted for this model, or undefined once it has
+   * expired (A8).
+   */
+  private remainingFor(candidate: Candidate): { remaining: number; resetAt: number } | undefined {
+    const key = `${candidate.provider}/${candidate.model}`;
+    const entry = this.remainingTokens.get(key);
+    if (!entry) return undefined;
+    if (entry.resetAt <= this.now()) {
+      // Past its own reset window, so the stale number says nothing.
+      this.remainingTokens.delete(key);
+      return undefined;
+    }
+    return entry;
+  }
+
+  /** A2: the request timeout for a role, in ms. */
+  private timeoutFor(role: ModelRole): number {
+    return role === "smart" ? (this.opts.smartTimeoutMs ?? 20_000) : (this.opts.fastTimeoutMs ?? 6_000);
+  }
+
+  /**
+   * A1: usage recording must never break a reply.
+   *
+   * `elix start` used to close the store seconds after connecting, so every
+   * later recordUsage threw "database is not open" and every in-game reply died
+   * with "chat bridge failed". A store failure is now logged once and swallowed
+   * — losing a usage row is much better than losing the player's answer.
+   */
+  private safeStore<T>(what: string, fn: () => T): T | undefined {
+    try {
+      return fn();
+    } catch (err) {
+      if (!this.storeWarned) {
+        this.storeWarned = true;
+        this.opts.log?.error(
+          { err: (err as Error).message },
+          "usage store unavailable — continuing without recording (log once)",
+        );
+      }
+      void what;
+      return undefined;
+    }
+  }
+
+  /** A store READ, with the same never-throw contract. Returns `fallback` on error. */
+  private safeRead<T>(fallback: T, fn: () => T): T {
+    try {
+      return fn();
+    } catch (err) {
+      if (!this.storeWarned) {
+        this.storeWarned = true;
+        this.opts.log?.error(
+          { err: (err as Error).message },
+          "usage store unavailable — continuing without it (log once)",
+        );
+      }
+      return fallback;
     }
   }
 
@@ -498,55 +720,102 @@ export class BrainRouter {
    * React to a failure: cooldown for 429, day-disable for 401/402/403 and HF
    * credit errors, circuit-breaker counting for everything else (B3).
    */
-  private handleFailure(candidate: Candidate, err: unknown, circuit: CircuitState): void {
+  private handleFailure(
+    candidate: Candidate,
+    err: unknown,
+    circuit: CircuitState,
+    kind: AttemptRecord["outcome"],
+  ): void {
     const now = this.now();
     const e = err as { status?: number; name?: string; body?: string; hfCredits?: boolean; message?: string };
     const key = `${candidate.provider}/${candidate.model}`;
 
     if (e.status === 429) {
       const window = classifyLimitWindow(e.body ?? "", parseRateLimitHeadersFromError(e), now);
-      this.opts.store.setCooldown({
-        provider: candidate.provider,
-        model: candidate.model,
-        until: window.retryAt,
-        reason: window.kind === "day" ? `daily limit: ${window.reason}` : window.reason,
-        disabledForDay: window.kind === "day",
-      });
+      this.safeStore("setCooldown", () =>
+        this.opts.store.setCooldown({
+          provider: candidate.provider,
+          model: candidate.model,
+          until: window.retryAt,
+          reason: window.kind === "day" ? `daily limit: ${window.reason}` : window.reason,
+          disabledForDay: window.kind === "day",
+        }),
+      );
+      // A7: Groq's limits are PER MODEL. A daily limit on gpt-oss-20b must not
+      // take llama-3.1-8b-instant down with it, so a daily window cools only
+      // this model. Only 401/402/403 (below) disable the whole provider.
       if (window.kind === "day") {
-        // A daily exhaustion disables the whole provider, not just this model.
-        this.disabledUntil.set(candidate.provider, window.retryAt);
-        this.disabledReason.set(candidate.provider, "daily limit");
+        this.modelDisabledUntil.set(`${candidate.provider}/${candidate.model}`, window.retryAt);
+        this.modelDisabledReason.set(
+          `${candidate.provider}/${candidate.model}`,
+          "daily limit",
+        );
       }
-      this.opts.log?.warn({ provider: candidate.provider, model: candidate.model, ...window }, "rate limited");
+      this.opts.log?.warn(
+        { provider: candidate.provider, model: candidate.model, ...window },
+        "rate limited",
+      );
       return;
     }
 
-    if (e.status === 401 || e.status === 402 || e.status === 403 || e.hfCredits === true) {
+    if (e.status === 401 || e.status === 403) {
+      // A7: auth failures really are provider-wide — the key is wrong, so
+      // every model on that provider is unusable.
       const until = now + DAY_MS;
-      const reason =
-        e.hfCredits === true || isCreditOrQuotaError(e.body ?? "")
-          ? "out of credit/quota"
-          : `auth ${e.status}`;
+      const reason = `auth ${e.status}`;
       this.disabledUntil.set(candidate.provider, until);
       this.disabledReason.set(candidate.provider, reason);
-      this.opts.store.setCooldown({
-        provider: candidate.provider,
-        model: candidate.model,
-        until,
-        reason,
-        disabledForDay: true,
-      });
+      this.safeStore("setCooldown", () =>
+        this.opts.store.setCooldown({
+          provider: candidate.provider,
+          model: candidate.model,
+          until,
+          reason,
+          disabledForDay: true,
+        }),
+      );
       this.opts.log?.warn(
-        { provider: candidate.provider, model: candidate.model, reason, until: new Date(until).toISOString() },
+        { provider: candidate.provider, reason, until: new Date(until).toISOString() },
         "provider disabled for the day",
       );
       return;
     }
 
-    // A shutdown abort is not a provider failure, so it must not trip the
-    // breaker — otherwise Ctrl+C during a request would mute the provider.
-    const e0 = err as { name?: string };
-    if (e0.name === "AbortError") return;
+    // 402, or a Hugging Face credits/quota error, also means "no money today" —
+    // provider-wide, because the account, not the model, is out.
+    if (e.status === 402 || e.hfCredits === true) {
+      const until = now + DAY_MS;
+      const reason =
+        e.hfCredits === true || isCreditOrQuotaError(e.body ?? "")
+          ? "out of credit/quota"
+          : `payment required ${e.status}`;
+      this.disabledUntil.set(candidate.provider, until);
+      this.disabledReason.set(candidate.provider, reason);
+      this.safeStore("setCooldown", () =>
+        this.opts.store.setCooldown({
+          provider: candidate.provider,
+          model: candidate.model,
+          until,
+          reason,
+          disabledForDay: true,
+        }),
+      );
+      this.opts.log?.warn(
+        { provider: candidate.provider, reason, until: new Date(until).toISOString() },
+        "provider disabled for the day",
+      );
+      return;
+    }
+
+    // A2/A9: a TIMEOUT is a real failure and counts toward the breaker, so a
+    // provider that hangs gets muted. A caller ABORT is shutdown, not the
+    // provider's fault, so it must not.
+    //
+    // The decided `kind` is used rather than the error's own name, because
+    // `AbortSignal.any()` reports a deadline and a Ctrl+C identically as an
+    // AbortError. Inspecting the name here swallowed every timeout, so a
+    // hanging provider never tripped the breaker.
+    if (kind === "abort") return;
 
     // Network / 5xx / timeout: trip the circuit after three in a row.
     circuit.failures += 1;
@@ -573,9 +842,26 @@ export class BrainRouter {
     return out;
   }
 
+  /** Models on a daily limit (A7) — narrower than disabledProviders(). */
+  disabledModels(): Array<{ provider: ProviderName; model: string; until: number; reason: string }> {
+    const now = this.now();
+    const out: Array<{ provider: ProviderName; model: string; until: number; reason: string }> = [];
+    for (const [key, until] of this.modelDisabledUntil) {
+      if (until <= now) continue;
+      const slash = key.indexOf("/");
+      out.push({
+        provider: key.slice(0, slash) as ProviderName,
+        model: key.slice(slash + 1),
+        until,
+        reason: this.modelDisabledReason.get(key) ?? "unknown",
+      });
+    }
+    return out;
+  }
+
   /** Active cooldowns, soonest first — for `elix usage`. */
   activeCooldowns(): Array<{ provider: string; model: string; until: number; reason: string }> {
-    return this.opts.store.activeCooldowns(this.now());
+    return this.safeRead([], () => this.opts.store.activeCooldowns(this.now()));
   }
 }
 

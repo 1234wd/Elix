@@ -1,11 +1,24 @@
 /**
- * Strip reasoning traces from a chat response (B4).
+ * Reasoning models (A4).
  *
- * `openai/gpt-oss-20b` and `-120b` are reasoning models. Their API can return
- * the chain of thought either as a separate `reasoning` field or inline in
- * `content` wrapped in think tags. None of that may ever reach game chat — the
- * player would see the model's scratchpad, which is both confusing and a leak of
- * the system prompt's influence.
+ * Verified against Groq's live docs on 2026-10-02
+ * (https://console.groq.com/docs/reasoning):
+ *
+ *   "With openai/gpt-oss-20b and openai/gpt-oss-120b, the reasoning_format
+ *    parameter is not supported. By default, these models will include
+ *    reasoning content in the reasoning field of the assistant response. You
+ *    can also control whether reasoning is included in the response by setting
+ *    the include_reasoning parameter."
+ *
+ *   "The include_reasoning parameter cannot be used together with
+ *    reasoning_format. These parameters are mutually exclusive."
+ *
+ *   reasoning_effort for GPT-OSS : low | medium | high   (20B and 120B only)
+ *   reasoning_effort for Qwen3.8: none | default | low | medium | high
+ *   reasoning_format             : parsed | raw | hidden
+ *
+ * So the two families need DIFFERENT parameters. Sending reasoning_format to a
+ * gpt-oss model is the bug this file exists to prevent.
  */
 
 export interface ReasoningSplit {
@@ -18,7 +31,7 @@ export interface ReasoningSplit {
 /** Tags that may wrap reasoning, longest/most specific first. */
 const REASONING_TAG_PAIRS: ReadonlyArray<readonly [RegExp, RegExp]> = [
   [/<think>/gi, /<\/think>/gi],
-  [/\[thinking\]/gi, /\[\/thinking\]/gi],
+  [/\[thinking\]/gi, [/\[\/thinking\]/gi] as unknown as RegExp],
   [/<\/?reasoning>/gi, /<\/?reasoning>/gi],
 ];
 
@@ -71,23 +84,86 @@ export function stripReasoning(raw: unknown): ReasoningSplit {
   return { content: text.trim(), reasoningChars };
 }
 
-/**
- * Reasoning-effort setting per model (B4).
- *
- * gpt-oss accepts `reasoning_effort: "low" | "medium" | "high"`. Chat replies
- * do not need deep reasoning, so we ask for the lowest that still works rather
- * than burning quota on a full derivation for "hi".
- */
-export function reasoningEffortFor(model: string): "low" | "medium" | "high" {
+/** Is this a reasoning model at all? Non-reasoning models get no extra params. */
+export function isReasoningModel(model: string): boolean {
   const m = model.toLowerCase();
-  if (m.includes("gpt-oss-120b")) return "low";
-  if (m.includes("gpt-oss-20b")) return "low";
-  // Non-reasoning models: the parameter is ignored, but harmless to omit.
+  return (
+    m.includes("gpt-oss") ||
+    m.includes("qwen3.8") ||
+    m.includes("qwen3-") ||
+    m.includes("deepseek-r") ||
+    m.includes("qwq") ||
+    m.includes("minimax-m")
+  );
+}
+
+/**
+ * Does this model accept `reasoning_format`?
+ *
+ * gpt-oss does NOT — sending it is the A4 bug. Everything else in Groq's
+ * supported reasoning list does.
+ */
+export function supportsReasoningFormat(model: string): boolean {
+  return !model.toLowerCase().includes("gpt-oss");
+}
+
+/**
+ * Lowest effort that still answers. Deep reasoning is wasted on chat.
+ *
+ * Takes the model so a future family with a different cheapest value can be
+ * added without changing the callers; both documented families take "low".
+ */
+export function reasoningEffortFor(_model: string): "low" | "medium" | "high" {
   return "low";
 }
 
-/** Is this a reasoning model at all? */
-export function isReasoningModel(model: string): boolean {
-  const m = model.toLowerCase();
-  return m.includes("gpt-oss") || m.includes("deepseek-r") || m.includes("qwq");
+/**
+ * The reasoning parameters to put in the request body.
+ *
+ * Exactly one of the two mutually exclusive mechanisms, chosen per model.
+ */
+export function reasoningParams(model: string): Record<string, unknown> {
+  if (!isReasoningModel(model)) return {};
+  if (supportsReasoningFormat(model)) {
+    return { reasoning_effort: reasoningEffortFor(model), reasoning_format: "hidden" };
+  }
+  // gpt-oss: reasoning_format is unsupported and would be rejected.
+  return { reasoning_effort: reasoningEffortFor(model), include_reasoning: false };
+}
+
+/**
+ * Minimum completion tokens a reasoning model needs before it will emit any
+ * visible content (A4).
+ *
+ * Reasoning tokens are counted against the completion limit, so a 120-token
+ * ceiling lets a reasoning model spend its entire budget thinking and return
+ * empty content. Groq's own quick start uses max_completion_tokens: 1024.
+ */
+export const REASONING_MIN_COMPLETION_TOKENS = 512;
+
+/** Clamp a requested max-tokens up to the floor a reasoning model needs. */
+export function completionTokenLimit(model: string, requested: number): number {
+  if (!isReasoningModel(model)) return requested;
+  return Math.max(requested, REASONING_MIN_COMPLETION_TOKENS);
+}
+
+/**
+ * Keep a chat reply short without relying on the model to comply (A4).
+ *
+ * Two sentences or ~200 characters, whichever comes first, cut on sentence
+ * boundaries so it never ends mid-word. Used only for in-game chat, where a
+ * wall of text in the chat box is unreadable.
+ */
+export function trimChatReply(text: string, maxChars = 200): string {
+  let t = text.trim();
+  if (t.length === 0) return t;
+  if (t.length > maxChars) {
+    const cut = t.slice(0, maxChars);
+    const lastStop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+    t = lastStop > 0 ? cut.slice(0, lastStop + 1) : cut.trimEnd();
+  }
+  // Cap the sentence count too.
+  const parts = t.split(/(?<=[.!?])\s+/);
+  if (parts.length > 2) t = parts.slice(0, 2).join(" ").trim();
+  return t;
 }

@@ -99,9 +99,10 @@ describe("B9 — persona-lite system prompt", () => {
     expect(PERSONA_LITE).toMatch(/never romantic or sexual/i);
   });
 
-  it("forbids guilt-tripping and manufactured urgency", () => {
-    expect(PERSONA_LITE).toMatch(/guilt-trip/i);
-    expect(PERSONA_LITE).toMatch(/urgency/i);
+  it("forbids pressure, guilt-tripping and manufactured urgency", () => {
+    expect(PERSONA_LITE).toMatch(/guilty for leaving/i);
+    expect(PERSONA_LITE).toMatch(/pressure anyone to stay/i);
+    expect(PERSONA_LITE).toMatch(/fake urgency/i);
   });
 
   it("tells the model to admit ignorance rather than invent answers", () => {
@@ -286,9 +287,13 @@ describe("B9 — the chat bridge", () => {
     await bridge.handle("Steve", "elix what's your favourite block", new RecordingSay() as unknown as SayQueue);
     const body = JSON.parse(f.callsTo("api.groq.com/openai/v1/chat")[0]!.body) as {
       model: string;
-      max_tokens: number;
+      max_tokens?: number;
+      max_completion_tokens?: number;
     };
     expect(body.model).toBe(GROQ_MODEL);
-    expect(body.max_tokens).toBeLessThanOrEqual(200);
+    // gpt-oss is a reasoning model, so the budget is max_completion_tokens and
+    // is raised to the floor that leaves room for an actual answer (A4).
+    const budget = body.max_completion_tokens ?? body.max_tokens;
+    expect(budget).toBeGreaterThanOrEqual(512);
   });
 });

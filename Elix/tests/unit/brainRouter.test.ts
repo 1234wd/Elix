@@ -321,7 +321,7 @@ describe("B3 — daily limit vs per-minute limit", () => {
     expect(h.router.disabledProviders()).toHaveLength(0);
   });
 
-  it("disables the whole provider for the day when the body names a daily quota", async () => {
+  it("disables only the offending model when the body names a daily quota (A7)", async () => {
     const h = harness({
       routes: groqHfRoutes(
         errorReply(429, "Rate limit reached: 1000 requests per day exceeded"),
@@ -330,19 +330,27 @@ describe("B3 — daily limit vs per-minute limit", () => {
     });
     const res = await ask(h, "hi");
     expect(res.provider).toBe("hf");
-    const disabled = h.router.disabledProviders();
-    expect(disabled).toHaveLength(1);
-    expect(disabled[0]!.provider).toBe("groq");
-    expect(disabled[0]!.reason).toMatch(/daily limit/);
+    // A7: Groq's limits are per model, so the whole provider is NOT disabled.
+    expect(h.router.disabledProviders()).toEqual([]);
+    const off = h.router.disabledModels();
+    expect(off).toHaveLength(1);
+    expect(off[0]).toMatchObject({ provider: "groq", model: GROQ_MODEL });
+    expect(off[0]!.reason).toMatch(/daily limit/);
     // A daily allowance resets at the next UTC midnight, not in 24 h.
     const midnight = new Date(h.clock.now());
     midnight.setUTCHours(24, 0, 0, 0);
-    expect(disabled[0]!.until).toBe(midnight.getTime());
+    expect(off[0]!.until).toBe(midnight.getTime());
   });
 });
 
 describe("B3 — 401/402/403 disable the provider for the day", () => {
-  for (const status of [401, 402, 403] as const) {
+  // 401/403 are auth failures; 402 is a payment/credit problem. All three are
+  // provider-wide, because the ACCOUNT is the problem, not the model (A7).
+  for (const [status, reason] of [
+    [401, "auth 401"],
+    [402, "payment required 402"],
+    [403, "auth 403"],
+  ] as const) {
     it(`disables groq for the day on a ${status} and skips it without a request`, async () => {
       const h = harness({
         routes: groqHfRoutes(errorReply(status, `status ${status}`), okCompletion("hf answers")),
@@ -350,7 +358,7 @@ describe("B3 — 401/402/403 disable the provider for the day", () => {
       const res = await ask(h, "hi");
       expect(res.provider).toBe("hf");
       expect(h.router.disabledProviders()).toEqual([
-        expect.objectContaining({ provider: "groq", reason: `auth ${status}` }),
+        expect.objectContaining({ provider: "groq", reason }),
       ]);
 
       const before = h.fetch.callsTo("api.groq.com").length;
@@ -458,13 +466,17 @@ describe("B7 — timeout and abort", () => {
 });
 
 describe("B4 — reasoning models", () => {
-  it("sends the lowest reasoning effort and asks for hidden reasoning", async () => {
+  it("sends include_reasoning:false for gpt-oss, never reasoning_format (A4)", async () => {
     const h = harness();
     await ask(h, "what is two plus two");
     const call = h.fetch.callsTo("api.groq.com/openai/v1/chat/completions")[0]!;
     const body = JSON.parse(call.body) as Record<string, unknown>;
     expect(body.reasoning_effort).toBe("low");
-    expect(body.reasoning_format).toBe("hidden");
+    // Groq's docs: reasoning_format is NOT supported for gpt-oss.
+    expect(body.include_reasoning).toBe(false);
+    expect(body.reasoning_format).toBeUndefined();
+    // Reasoning tokens count against max_completion_tokens, not max_tokens.
+    expect(body.max_completion_tokens).toBeGreaterThanOrEqual(512);
   });
 
   it("never returns reasoning text to the caller, only the final answer", async () => {

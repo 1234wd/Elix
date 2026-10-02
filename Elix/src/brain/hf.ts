@@ -75,6 +75,19 @@ interface HfResponseBody {
   error?: { message?: string };
 }
 
+/**
+ * An HF failure, carrying what the router needs to decide a cooldown length.
+ *
+ * `headers` matters: a 429 with `retry-after: 30` should wait 30 seconds, and
+ * without the headers attached the router can only guess a conservative 60.
+ */
+interface HfError extends Error {
+  status?: number;
+  body?: string;
+  headers?: Headers;
+  hfCredits?: boolean;
+}
+
 export class HuggingFaceProvider implements ProviderAdapter {
   readonly name = "hf" as const;
   private readonly apiKey: string;
@@ -122,21 +135,29 @@ export class HuggingFaceProvider implements ProviderAdapter {
 
     const text = await res.text();
     if (!res.ok) {
-      if (isCreditOrQuotaError(text) || res.status === 402 || res.status === 429) {
+      // A7: an HF 429 is usually just a short rate limit, not an empty
+      // account. Treating every 429 as "out of credit" disabled HF for 24
+      // hours after a single burst. Only a body that actually says credit,
+      // quota or payment escalates to a day-long disable; otherwise the router
+      // applies a normal cooldown from retry-after (or 60 s).
+      //
+      // The headers MUST ride along on the error: without them the router sees
+      // no retry-after and falls back to its conservative 60 s.
+      const credits = isCreditOrQuotaError(text);
+      if (res.status === 402 || credits) {
         const err = new Error(
           `hf out of credit/quota (${res.status}): ${text.slice(0, 200)}`,
-        ) as Error & { status?: number; body?: string; hfCredits?: boolean };
+        ) as HfError;
         err.status = res.status;
         err.body = text;
+        err.headers = res.headers;
         err.hfCredits = true;
         throw err;
       }
-      const err = new Error(`hf ${res.status}: ${text.slice(0, 300)}`) as Error & {
-        status?: number;
-        body?: string;
-      };
+      const err = new Error(`hf ${res.status}: ${text.slice(0, 300)}`) as HfError;
       err.status = res.status;
       err.body = text;
+      err.headers = res.headers;
       throw err;
     }
 
