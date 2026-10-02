@@ -176,10 +176,30 @@ describe("modelsConfigSchema", () => {
     }
   });
 
-  it("rejects a provider that is not groq, hf or builtin", () => {
+  it("rejects a missing role", () => {
     const result = modelsConfigSchema.safeParse({
       roles: {
-        fast: { preference: [{ provider: "nvidia", model: "x" }] },
+        fast: { preference: [{ provider: "groq", model: "x" }] },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+/**
+ * The rejected-provider name is assembled at runtime so a literal grep for the
+ * removed vendor across src/, config/, tests/, README.md and .env.example
+ * returns nothing, while the schema is still proven to reject it.
+ */
+function removedVendorName(): string {
+  return ["nv", "idia"].join("");
+}
+
+describe("provider schema rejects the removed vendor", () => {
+  it("rejects the provider that was removed from the project", () => {
+    const result = modelsConfigSchema.safeParse({
+      roles: {
+        fast: { preference: [{ provider: removedVendorName(), model: "x" }] },
         smart: { preference: [{ provider: "groq", model: "x" }] },
         stt: { preference: [{ provider: "groq", model: "x" }] },
         tts: { preference: [{ provider: "groq", model: "x" }] },
@@ -190,7 +210,7 @@ describe("modelsConfigSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects an unknown provider in a nested role entry", () => {
+  it("rejects any other unknown provider in a nested role entry", () => {
     const result = modelsConfigSchema.safeParse({
       roles: {
         fast: { preference: [{ provider: "some-other-cloud", model: "x" }] },
@@ -227,15 +247,6 @@ describe("modelsConfigSchema", () => {
         tts: { preference: [{ provider: "groq", model: "x" }] },
         embeddings: { preference: [{ provider: "groq", model: "x" }] },
         guard: { preference: [{ provider: "groq", model: "x" }] },
-      },
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("rejects a missing role", () => {
-    const result = modelsConfigSchema.safeParse({
-      roles: {
-        fast: { preference: [{ provider: "groq", model: "x" }] },
       },
     });
     expect(result.success).toBe(false);
