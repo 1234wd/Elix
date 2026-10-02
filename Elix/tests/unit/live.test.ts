@@ -9,14 +9,28 @@
  *   ELIX_LIVE=1 pnpm test tests/unit/live.test.ts
  */
 import { describe, expect, it } from "vitest";
+import { config as loadDotenv } from "dotenv";
+import { resolve } from "node:path";
 import { GroqProvider, GROQ_BASE } from "../../src/brain/groq.js";
 import { HuggingFaceProvider, HF_CHAT_URL, hfEmbeddingsUrl } from "../../src/brain/hf.js";
 import { stripReasoning } from "../../src/brain/reasoning.js";
 import { parseRateLimitHeaders } from "../../src/brain/ratelimit.js";
 
+// The keys live in the project's .env, not in the shell that runs vitest, so
+// load it here exactly as src/cli/index.ts does. Without this the test reports
+// "GROQ_API_KEY must be set" on a machine where the key is sitting in .env.
+loadDotenv({ path: resolve(process.cwd(), ".env"), quiet: true });
+
 const LIVE = process.env["ELIX_LIVE"] === "1";
 const GROQ_KEY = process.env["GROQ_API_KEY"]?.trim();
 const HF_KEY = process.env["HF_TOKEN"]?.trim();
+
+// Report only whether a key is present. Never print any part of one.
+console.log(
+  `[live] ELIX_LIVE=${process.env["ELIX_LIVE"] ?? "(unset)"} ` +
+    `GROQ_API_KEY ${GROQ_KEY ? "present" : "absent"} / ` +
+    `HF_TOKEN ${HF_KEY ? "present" : "absent"}`,
+);
 
 describe.skipIf(!LIVE)("LIVE — real provider calls (ELIX_LIVE=1)", () => {
   it(
