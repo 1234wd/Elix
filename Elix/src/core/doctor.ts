@@ -27,6 +27,8 @@ export interface DoctorOptions {
   ping?: (host: string, port: number) => Promise<{ version: string; protocol: number; software: string; motd: string; players: { online: number; max: number } }>;
   /** Override live API call (tests). */
   liveApiCall?: (provider: string, apiKey: string, baseUrl: string) => Promise<boolean>;
+  /** Override the Hugging Face embeddings probe (tests). */
+  embeddingsCall?: (model: string, token: string) => Promise<boolean>;
 }
 
 const MIN_NODE_MAJOR = 22;
@@ -75,13 +77,18 @@ export async function checkFfmpeg(
   }
 }
 
+/**
+ * The cloud providers Elix can use: Groq and Hugging Face.
+ *
+ * `builtin` needs no key — it is Elix's own scripted fallback code.
+ */
+export const PROVIDER_KEYS: ReadonlyArray<readonly [env: string, label: string, baseUrl: string]> = [
+  ["GROQ_API_KEY", "Groq", "https://api.groq.com/openai/v1"],
+  ["HF_TOKEN", "Hugging Face", "https://router.huggingface.co/v1"],
+];
+
 export function checkApiKeys(env: NodeJS.ProcessEnv = process.env): CheckResult {
-  const keys: Array<[string, string]> = [
-    ["GROQ_API_KEY", "Groq"],
-    ["NVIDIA_API_KEY", "NVIDIA NIM"],
-    ["HF_TOKEN", "Hugging Face"],
-  ];
-  const present = keys.filter(([k]) => !!env[k]);
+  const present = PROVIDER_KEYS.filter(([k]) => !!env[k]);
   if (present.length === 0) {
     return {
       name: "api-keys",
@@ -98,7 +105,7 @@ export function checkApiKeys(env: NodeJS.ProcessEnv = process.env): CheckResult 
 
 /** Make one cheap live API call to verify the key works. */
 async function testLiveApiCall(
-  provider: string,
+  _provider: string,
   apiKey: string,
   baseUrl: string,
 ): Promise<boolean> {
@@ -113,21 +120,69 @@ async function testLiveApiCall(
   }
 }
 
+/**
+ * Hugging Face embeddings are NOT on the /v1 chat route.
+ *
+ * The router exposes feature extraction on a separate pipeline endpoint, so
+ * `elix doctor` probes it directly. If it fails, Phase 4 memory still works via
+ * FTS5 keyword search and embeds lazily afterwards.
+ */
+export const HF_EMBEDDING_ENDPOINT =
+  "https://router.huggingface.co/hf-inference/models/{model}/pipeline/feature-extraction";
+
+async function defaultHfEmbeddingCall(model: string, token: string): Promise<boolean> {
+  try {
+    const url = HF_EMBEDDING_ENDPOINT.replace("{model}", encodeURIComponent(model));
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ inputs: "elix doctor warmup" }),
+      signal: AbortSignal.timeout(8000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Async version actually used by the runner. */
+export async function checkHfEmbeddingsAsync(
+  env: NodeJS.ProcessEnv = process.env,
+  call: (model: string, token: string) => Promise<boolean> = defaultHfEmbeddingCall,
+  model = "BAAI/bge-small-en-v1.5",
+): Promise<CheckResult> {
+  const token = env["HF_TOKEN"];
+  if (!token) {
+    return {
+      name: "hf-embeddings",
+      status: "warn",
+      note: "no HF_TOKEN — memory vectors unavailable, retrieval falls back to FTS5 keyword search",
+    };
+  }
+  const ok = await call(model, token);
+  return {
+    name: "hf-embeddings",
+    status: ok ? "ok" : "warn",
+    note: ok
+      ? `${model} feature-extraction reachable`
+      : `${model} feature-extraction FAILED — memory will use FTS5 keyword search and embed later`,
+  };
+}
+
 export async function checkLiveApiKeys(
   env: NodeJS.ProcessEnv = process.env,
   call: (provider: string, apiKey: string, baseUrl: string) => Promise<boolean> = testLiveApiCall,
 ): Promise<CheckResult> {
-  const providers: Array<[string, string, string]> = [
-    ["groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1"],
-    ["nvidia", "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1"],
-    ["hf", "HF_TOKEN", "https://router.huggingface.co/v1"],
-  ];
   const results: string[] = [];
-  for (const [name, envKey, baseUrl] of providers) {
+  for (const [envKey, label, baseUrl] of PROVIDER_KEYS) {
     const key = env[envKey];
     if (!key) continue;
-    const ok = await call(name, key, baseUrl);
-    results.push(`${name}: ${ok ? "ok" : "FAIL"}`);
+    const ok = await call(label, key, baseUrl);
+    // Lowercase the label so output is stable regardless of display casing.
+    results.push(`${label.toLowerCase()}: ${ok ? "ok" : "FAIL"}`);
   }
   if (results.length === 0) {
     return { name: "api-live", status: "warn", note: "no keys to test" };
@@ -173,17 +228,21 @@ export async function checkServer(
   try {
     const r = await ping(host, port);
     const base = `${host}:${port} — ${r.software} "${r.version}" (protocol ${r.protocol}), ${r.players.online}/${r.players.max} players`;
-    if (r.motd.length > 0) {
-      return { name: "server", status: "ok", note: `${base} — motd: ${r.motd}` };
-    }
-    if (expected !== 0 && r.protocol !== expected) {
-      return {
-        name: "server",
-        status: "warn",
-        note: `${base} — protocol mismatch: expected ${expected} for ${targetVersion}, server reports ${r.protocol}`,
-      };
-    }
-    return { name: "server", status: "ok", note: base };
+
+    // A5: the mismatch must be computed BEFORE the MOTD is appended. Returning
+    // early on a non-empty MOTD meant a real server (which always has one) could
+    // never report a protocol mismatch.
+    const mismatch =
+      expected !== 0 && r.protocol !== expected
+        ? ` — protocol mismatch: expected ${expected} for ${targetVersion}, server reports ${r.protocol}`
+        : "";
+    const motd = r.motd.length > 0 ? ` — motd: ${r.motd}` : "";
+
+    return {
+      name: "server",
+      status: mismatch.length > 0 ? "warn" : "ok",
+      note: `${base}${mismatch}${motd}`,
+    };
   } catch (err) {
     return {
       name: "server",
@@ -211,6 +270,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<CheckResult[]> {
     checkFfmpeg(exec),
     Promise.resolve(checkApiKeys(env)),
     checkLiveApiKeys(env, liveCall),
+    checkHfEmbeddingsAsync(env, opts.embeddingsCall),
     checkServer(profile.host, profile.port, ping, profile.version),
   ]);
 }

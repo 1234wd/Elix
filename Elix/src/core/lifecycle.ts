@@ -1,5 +1,6 @@
 import type { Logger } from "./logger.js";
 import { bus } from "./events.js";
+import { exitCleanly } from "./exit.js";
 
 /**
  * Graceful shutdown: runs cleanup callbacks in reverse registration order,
@@ -7,7 +8,8 @@ import { bus } from "./events.js";
  *
  * Vision rule 10: Ctrl+C → "gtg, cya" → memory consolidation → DB closed →
  * no orphan node processes. So cleanups are awaited, a second Ctrl+C force-exits
- * with 130, and the whole thing has a hard 10 s ceiling.
+ * with 130, and the whole thing has a hard ceiling. Lifecycle is the ONLY place
+ * that owns an exit — BotSession.shutdown resolves or rejects and never exits.
  */
 
 export interface LifecycleOptions {
@@ -28,7 +30,9 @@ export class Lifecycle {
 
   constructor(log: Logger, opts: LifecycleOptions = {}) {
     this.log = log;
-    this.exitFn = opts.exitFn ?? ((code) => process.exit(code));
+    // exitCleanly drains the logger first, so a shutdown never crashes with
+    // UV_HANDLE_CLOSING the way a bare process.exit() did (A2).
+    this.exitFn = opts.exitFn ?? exitCleanly;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
   }
 
@@ -77,7 +81,8 @@ export class Lifecycle {
     this.log.info({ reason }, "shutting down");
     bus.emit("shutdown", reason);
 
-    // Hard ceiling: if a cleanup hangs, we still exit (A15).
+    // Hard ceiling: if a cleanup hangs, we still exit. This is the single
+    // timeout that matters — BotSession has none (A9).
     const hardTimeout = setTimeout(() => {
       this.log.warn({ timeoutMs: this.timeoutMs }, "shutdown hard timeout — forcing exit");
       this.exitFn(1);

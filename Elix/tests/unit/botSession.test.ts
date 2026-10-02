@@ -7,6 +7,9 @@ import {
   permanentMessage,
   pickWalkDirection,
   isStandable,
+  isSafeFloor,
+  isPassable,
+  HAZARD_BLOCKS,
   toVec3,
   requirePathfinder,
   type BlockLike,
@@ -435,9 +438,107 @@ describe("A7 — mineflayer-pathfinder is loaded as CommonJS", () => {
   });
 });
 
+describe("A10 — floor and clearance use the bounding box, not the name", () => {
+  const air = { name: "air", id: 0, boundingBox: "empty" };
+  const caveAir = { name: "cave_air", id: 163, boundingBox: "empty" };
+  const stone = { name: "stone", id: 1, boundingBox: "block" };
+  const grass = { name: "short_grass", id: 1000, boundingBox: "empty" };
+  const lava = { name: "lava", id: 9, boundingBox: "liquid" };
+  const water = { name: "water", id: 8, boundingBox: "liquid" };
+  const fire = { name: "fire", id: 81, boundingBox: "empty" };
+  const magma = { name: "magma_block", id: 262, boundingBox: "block" };
+  const sulfur = { name: "sulfur", id: 9000, boundingBox: "block" };
+  const flower = { name: "poppy", id: 1001, boundingBox: "empty" };
+
+  /** A flat world with a custom block at one position. */
+  function world(floorBlock: BlockLike | null, feetBlock: BlockLike | null = air, headBlock: BlockLike | null = air) {
+    return (p: Vec3Like): BlockLike | null => {
+      if (p.y < 65) return floorBlock;
+      if (p.y === 65) return feetBlock;
+      return headBlock;
+    };
+  }
+
+  it("rejects a lava floor", () => {
+    expect(isStandable(world(lava), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects a water floor", () => {
+    expect(isStandable(world(water), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects a magma_block floor", () => {
+    expect(isStandable(world(magma), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects a sulfur floor (26.2 hazard)", () => {
+    expect(isStandable(world(sulfur), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects no floor at all", () => {
+    expect(isStandable(world(null), 0, 65, 0)).toBe(false);
+  });
+
+  it("accepts cave_air at the feet", () => {
+    // The old check required the name to be exactly "air".
+    expect(isStandable(world(stone, caveAir), 0, 65, 0)).toBe(true);
+  });
+
+  it("accepts short_grass at the feet", () => {
+    expect(isStandable(world(stone, grass), 0, 65, 0)).toBe(true);
+  });
+
+  it("accepts a flower at the feet", () => {
+    expect(isStandable(world(stone, flower), 0, 65, 0)).toBe(true);
+  });
+
+  it("accepts cave_air at the head", () => {
+    expect(isStandable(world(stone, air, caveAir), 0, 65, 0)).toBe(true);
+  });
+
+  it("rejects fire at the feet", () => {
+    expect(isStandable(world(stone, fire), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects water at the feet", () => {
+    expect(isStandable(world(stone, water), 0, 65, 0)).toBe(false);
+  });
+
+  it("rejects a solid block at the head", () => {
+    expect(isStandable(world(stone, air, stone), 0, 65, 0)).toBe(false);
+  });
+
+  it("treats a block with no boundingBox as solid ground", () => {
+    // Unknown blocks report no shape; refusing to walk on them is the safe
+    // choice, and we still must not dig.
+    const unknown = { name: "mystery_block", id: 31337 };
+    expect(isSafeFloor(unknown)).toBe(true);
+  });
+
+  it("isSafeFloor and isPassable both refuse every hazard", () => {
+    // Whether or not the block is solid, a hazard is never somewhere we walk.
+    for (const name of HAZARD_BLOCKS) {
+      expect(isSafeFloor({ name, id: 1, boundingBox: "block" }), `floor ${name}`).toBe(false);
+      expect(isPassable({ name, id: 1, boundingBox: "empty" }), `clearance ${name}`).toBe(false);
+    }
+  });
+
+  it("isPassable accepts air, cave_air and plants", () => {
+    expect(isPassable(air)).toBe(true);
+    expect(isPassable(caveAir)).toBe(true);
+    expect(isPassable(grass)).toBe(true);
+    expect(isPassable(flower)).toBe(true);
+  });
+
+  it("isPassable rejects anything solid", () => {
+    expect(isPassable(stone)).toBe(false);
+    expect(isPassable({ name: "oak_log", id: 5, boundingBox: "block" })).toBe(false);
+  });
+});
+
 describe("A7 — safe walk target selection", () => {
-  const air = { name: "air", id: 0 };
-  const stone = { name: "stone", id: 1 };
+  const air = { name: "air", id: 0, boundingBox: "empty" };
+  const stone = { name: "stone", id: 1, boundingBox: "block" };
 
   it("queries the world with real Vec3 objects, not plain {x,y,z}", async () => {
     // Regression: prismarine-world's getBlock() calls pos.floored(), so passing

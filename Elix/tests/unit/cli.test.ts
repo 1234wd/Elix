@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -16,13 +16,11 @@ const execFileAsync = promisify(execFile);
  * root (not the cwd), and honour --profile / --username / --version / --player.
  */
 const DIST = resolve(PROJECT_ROOT, "dist", "cli", "index.js");
-const hasBuild = { value: false };
-
-async function buildOnce(): Promise<void> {
-  if (hasBuild.value) return;
-  await execFileAsync("pnpm.cmd", ["build"], { cwd: PROJECT_ROOT, shell: true });
-  hasBuild.value = true;
-}
+// A6: the build happens once in tests/global-setup.ts, so every test file can
+// rely on dist/ without each one shelling out to pnpm.
+const PNPM = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+void PNPM;
+void execFileAsync;
 
 /** Run the built CLI from an unrelated folder. */
 async function runCli(args: string[], cwd: string) {
@@ -37,7 +35,6 @@ describe("A9 — the built CLI works from any folder", () => {
   let tmp: string;
 
   beforeEach(async () => {
-    await buildOnce();
     tmp = await mkdtemp(join(tmpdir(), "elix-cli-"));
   });
 
@@ -59,7 +56,7 @@ describe("A9 — the built CLI works from any folder", () => {
     expect(stdout).toContain("forget");
   });
 
-  it("doctor lists all six checks from another folder", async () => {
+  it("doctor lists all seven checks from another folder", async () => {
     const { stdout } = await runCli(["doctor", "--json"], tmp);
     const results = JSON.parse(stdout) as Array<{ name: string }>;
     expect(results.map((r) => r.name)).toEqual([
@@ -68,6 +65,7 @@ describe("A9 — the built CLI works from any folder", () => {
       "ffmpeg",
       "api-keys",
       "api-live",
+      "hf-embeddings",
       "server",
     ]);
   });
@@ -84,7 +82,6 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
   let tmp: string;
 
   beforeEach(async () => {
-    await buildOnce();
     tmp = await mkdtemp(join(tmpdir(), "elix-dotenv-"));
   });
 
@@ -112,7 +109,7 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
 
   it("does not pick up a .env from the current folder", async () => {
     // A .env in cwd must NOT be read — the path is resolved from PROJECT_ROOT.
-    await writeFile(join(tmp, ".env"), "NVIDIA_API_KEY=cwd_key\n", "utf8");
+    await writeFile(join(tmp, ".env"), "HF_TOKEN=cwd_key\n", "utf8");
     const { stdout } = await runCli(["doctor", "--json"], tmp);
     const results = JSON.parse(stdout) as Array<{ name: string; note: string }>;
     const keys = results.find((r) => r.name === "api-keys");
@@ -283,10 +280,13 @@ describe("A18 — data/overrides is trackable, the db is not", () => {
 
   it("the data directory exists so overrides/ can be committed", async () => {
     const { stat } = await import("node:fs/promises");
-    const st = await stat(join(PROJECT_ROOT, "data")).catch(() => null);
-    expect(st, "data/ must exist").not.toBeNull();
-    await mkdir(join(PROJECT_ROOT, "data", "overrides"), { recursive: true });
-    const stOverrides = await stat(join(PROJECT_ROOT, "data", "overrides"));
-    expect(stOverrides.isDirectory()).toBe(true);
+    // A6: git cannot track an empty folder, so data/overrides/.gitkeep is
+    // committed. Assert on that file, not on the directory, so a fresh clone
+    // really is covered.
+    const gitkeep = join(PROJECT_ROOT, "data", "overrides", ".gitkeep");
+    const st = await stat(gitkeep).catch(() => null);
+    expect(st, "data/overrides/.gitkeep must be committed").not.toBeNull();
+    const stDir = await stat(join(PROJECT_ROOT, "data", "overrides"));
+    expect(stDir.isDirectory()).toBe(true);
   });
 });

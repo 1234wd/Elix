@@ -10,6 +10,7 @@ import { resolveTargetVersion, expectedProtocol, hasDataFor } from "./version.js
 import { blockName } from "./safeWorld.js";
 import { bus } from "../core/events.js";
 import { SayQueue } from "../social/say.js";
+import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
 // CommonJS, so `require` is the reliable way to read their real export shape.
@@ -45,6 +46,12 @@ export interface BotLike {
 export interface BlockLike {
   name?: string;
   id: number;
+  /**
+   * prismarine-block's shape class: "block", "empty", "entity", "liquid", or
+   * undefined for an unrecognised block. A10 needs this to tell solid ground
+   * from cave_air, short_grass and other non-blocking blocks by name.
+   */
+  boundingBox?: string;
 }
 
 export interface Vec3Like {
@@ -102,18 +109,55 @@ export interface SessionDeps {
 let liveBot: BotLike | null = null;
 let liveShutdownRequested = false;
 
-const loggedCrashes = new Set<string>();
+/** Crash guards are process-wide; installing twice would double-handle events. */
+let crashGuardsInstalled = false;
 
-function reportCrash(kind: string, detail: string): void {
-  if (loggedCrashes.has(detail)) return;
-  loggedCrashes.add(detail);
-  console.error(`[${kind}] ${detail}`);
-}
+/** Uncaught exceptions inside this window: above this we shut down (A7). */
+const CRASH_BURST_LIMIT = 5;
+const CRASH_BURST_WINDOW_MS = 60_000;
 
-/** Install the uncaughtException/unhandledRejection guards. Idempotent. */
-export function installCrashGuards(): void {
+/**
+ * Keep Elix alive through data surprises, but not forever.
+ *
+ * A7: the previous version swallowed every uncaught exception indefinitely,
+ * deduped by message so repeats vanished, and logged no stack. A genuinely
+ * corrupted process cannot recover, so a burst of crashes now triggers a
+ * graceful shutdown with exit 1 instead of limping on.
+ */
+export function installCrashGuards(log?: Logger): void {
+  if (crashGuardsInstalled) return;
+  crashGuardsInstalled = true;
+
+  const crashTimes: number[] = [];
+  let crashCount = 0;
+
+  const noteCrash = (kind: string, detail: string, stack: string | undefined) => {
+    crashCount++;
+    const now = Date.now();
+    crashTimes.push(now);
+    while (crashTimes.length > 0 && now - crashTimes[0]! > CRASH_BURST_WINDOW_MS) {
+      crashTimes.shift();
+    }
+    // Stack every time: the same message with a different stack is new
+    // information, and a repeating bug is exactly what we need to see.
+    if (log) {
+      log.error({ kind, err: detail, stack, crashesInWindow: crashTimes.length }, "uncaught error");
+    } else {
+      console.error(`[${kind}] ${detail}${stack ? `\n${stack}` : ""}`);
+    }
+    if (crashTimes.length > CRASH_BURST_LIMIT) {
+      if (log) {
+        log.error(
+          { crashes: crashCount, windowMs: CRASH_BURST_WINDOW_MS },
+          "too many uncaught errors — shutting down",
+        );
+      }
+      exitCleanly(1);
+    }
+  };
+
   process.on("uncaughtException", (err: Error) => {
-    reportCrash("uncaughtException", err?.message ?? String(err));
+    noteCrash("uncaughtException", err?.message ?? String(err), err?.stack);
     // A broken bot can't recover in place — end it so the normal reconnect runs.
     if (liveBot && !liveShutdownRequested) {
       try {
@@ -123,9 +167,14 @@ export function installCrashGuards(): void {
       }
     }
   });
+
   process.on("unhandledRejection", (reason: unknown) => {
-    const err = reason as { message?: string } | undefined;
-    reportCrash("unhandledRejection", err?.message ?? String(reason));
+    const err = reason as { message?: string; stack?: string } | undefined;
+    noteCrash(
+      "unhandledRejection",
+      err?.message ?? String(reason),
+      err?.stack,
+    );
   });
 }
 
@@ -153,8 +202,9 @@ export function isGreetingFor(message: string, username: string): boolean {
   return GREETING.test(message) && NAME.test(message);
 }
 
-/** Words that must never trigger the greeting matcher even though they contain "hi". */
-export const NON_GREETING_SUBSTRINGS = ["this", "ship", "chill", "which", "while", "him", "hi"] as const;
+// A12: the old NON_GREETING_SUBSTRINGS list was exported from here and included
+// "hi" itself, which IS a greeting. The negative cases now live in the test file
+// where they are actually used.
 
 // ---------------------------------------------------------------------------
 // Safe walk (A7) — never digs, never places, never pillars
@@ -176,6 +226,32 @@ export interface WalkOutcome {
 }
 
 /**
+ * Blocks that must never be walked onto or through (A10).
+ *
+ * The 26.2 sulfur hazards come from the master brief: sulfur caves are the main
+ * late-game danger, so sulfur and cinnabar-adjacent blocks are treated as lethal
+ * even where the block itself is not obviously on fire.
+ */
+export const HAZARD_BLOCKS: ReadonlySet<string> = new Set([
+  "lava",
+  "flowing_lava",
+  "magma_block",
+  "fire",
+  "soul_fire",
+  "campfire",
+  "soul_campfire",
+  "powder_snow",
+  "sweet_berry_bush",
+  "wither_rose",
+  "sulfur",
+  "flowing_sulfur",
+  "sulfur_spike",
+  "sulfur_vent",
+  "cinnabar",
+  "cinnabar_block",
+]);
+
+/**
  * Build a real Vec3 for world queries.
  *
  * prismarine-world's getBlock() calls `pos.floored()`, so a plain {x,y,z} object
@@ -185,7 +261,35 @@ export function toVec3(p: Vec3Like): Vec3Like {
   return new Vec3(p.x, p.y, p.z);
 }
 
-/** Is this spot standable without digging? Solid floor, air at body and head. */
+/** A10: is this block safe to stand on? Needs a full solid box and no hazard. */
+export function isSafeFloor(block: BlockLike | null): boolean {
+  if (!block) return false;
+  const name = blockName(block);
+  if (name === "air" || name === "cave_air") return false;
+  if (HAZARD_BLOCKS.has(name)) return false;
+  // A hazard is only safe to stand on if it is genuinely solid; lava is not.
+  const shape = block.boundingBox;
+  return shape === "block" || shape === undefined;
+}
+
+/** A10: is this block clear to walk through? Empty box, not a liquid. */
+export function isPassable(block: BlockLike | null): boolean {
+  if (!block) return false;
+  // Every hazard is refused at body height too, whatever its bounding box.
+  if (HAZARD_BLOCKS.has(blockName(block))) return false;
+  const shape = block.boundingBox;
+  // "empty" covers air, cave_air, short_grass, flowers, torches and signs —
+  // all passable despite having names that are not "air".
+  return shape === "empty" || shape === undefined;
+}
+
+/**
+ * Is this spot standable without digging?
+ *
+ * A10: the old version required the floor to be "not air", which counted lava
+ * and water as a floor, and required the feet and head to be exactly "air",
+ * which rejected cave_air, short_grass and flowers. Now the boundingBox decides.
+ */
 export function isStandable(
   blockAt: (p: Vec3Like) => BlockLike | null,
   x: number,
@@ -198,10 +302,7 @@ export function isStandable(
   const floor = blockAt(toVec3({ x: bx, y: by - 1, z: bz }));
   const feet = blockAt(toVec3({ x: bx, y: by, z: bz }));
   const head = blockAt(toVec3({ x: bx, y: by + 1, z: bz }));
-  if (!floor || !feet || !head) return false;
-  // blockName returns "unknown_solid" for IDs missing from the registry, which
-  // is treated as solid — safe to walk on, safe not to dig.
-  return blockName(floor) !== "air" && blockName(feet) === "air" && blockName(head) === "air";
+  return isSafeFloor(floor) && isPassable(feet) && isPassable(head);
 }
 
 /** Pick the first direction with a solid floor and air at head height. */
@@ -227,12 +328,15 @@ export function pickWalkDirection(
  * `const { goals } = await import(...)` yields undefined — which is what broke
  * the live walk with "Cannot read properties of undefined (reading 'GoalNear')".
  */
-export function requirePathfinder(): {
-  pathfinder: unknown;
+export interface PathfinderModule {
+  /** mineflayer plugin; the type lives in mineflayer-pathfinder's .d.ts. */
+  pathfinder: (bot: unknown) => void;
   Movements: new (bot: unknown) => Record<string, unknown>;
   goals: { GoalNear: new (x: number, y: number, z: number, range: number) => unknown };
-} {
-  return require("mineflayer-pathfinder");
+}
+
+export function requirePathfinder(): PathfinderModule {
+  return require("mineflayer-pathfinder") as PathfinderModule;
 }
 
 /**
@@ -569,8 +673,9 @@ export class BotSession {
     this.exitCode = 2;
     this.deps.onPermanentDisconnect?.({ ...info, username });
     if (this.deps.exitOnPermanent !== false) {
-      // Give the console.error a tick to flush, then exit non-zero.
-      setTimeout(() => process.exit(2), 50).unref?.();
+      // exitCleanly sets process.exitCode and drains the loop, so the console
+      // line above is never truncated by a racing worker thread (A2).
+      exitCleanly(2);
     }
   }
 
@@ -628,16 +733,23 @@ export class BotSession {
     }
 
     const bot = this.bot;
-    if (!bot?.entity) {
-      log.info("bot not in-game — skipping goodbye");
+    // A8: an ended bot still has `entity`, so checking entity alone was not
+    // enough — it made us chat into a closed socket and then wait for an
+    // `end` that had already fired.
+    if (!bot || this.ended) {
+      log.info("bot not connected — skipping goodbye");
+      this.say?.close();
       liveBot = null;
+      this.bot = null;
       return;
     }
-
-    const hardTimeout = setTimeout(() => {
-      log.warn("shutdown hard timeout (10s) — forcing exit");
-      process.exit(0);
-    }, 10_000);
+    if (!bot.entity) {
+      log.info("bot not in-game — skipping goodbye");
+      this.say?.close();
+      liveBot = null;
+      this.bot = null;
+      return;
+    }
 
     try {
       // Goodbye goes through the queue (rate limit) but skips the typing delay.
@@ -671,7 +783,8 @@ export class BotSession {
         }
       });
     } finally {
-      clearTimeout(hardTimeout);
+      // No hard timeout here (A9): Lifecycle owns the 10 s ceiling and the exit
+      // code. This method only resolves or rejects.
       this.say?.close();
       liveBot = null;
       this.bot = null;
@@ -737,7 +850,10 @@ function lookAround(bot: BotLike, log: Logger): void {
 function makeBotFactory(profile: ServerProfile & { name: string; username: string }): BotFactory {
   return async () => {
     const { createBot } = await import("mineflayer");
-    const { pathfinder } = await import("mineflayer-pathfinder");
+    // A12: load pathfinder the same way everywhere. `await import()` on this CJS
+    // package puts its exports on `.default`, so destructuring `pathfinder`
+    // straight off the namespace could give undefined.
+    const { pathfinder } = requirePathfinder();
     const bot = createBot({
       username: profile.username,
       host: profile.host,
@@ -764,7 +880,7 @@ function makeBotFactory(profile: ServerProfile & { name: string; username: strin
  */
 export async function runBot(opts: BotOptions): Promise<() => Promise<void>> {
   const { config, profile, log } = opts;
-  installCrashGuards();
+  installCrashGuards(log);
 
   // The version is a config value (A11): CLI > profile > bot.
   const version = resolveTargetVersion(config, profile);

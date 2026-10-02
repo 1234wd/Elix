@@ -6,6 +6,9 @@ import {
   checkLiveApiKeys,
   checkServer,
   checkVersionData,
+  checkHfEmbeddingsAsync,
+  HF_EMBEDDING_ENDPOINT,
+  PROVIDER_KEYS,
   runDoctor,
   renderDoctor,
   type CheckResult,
@@ -145,7 +148,7 @@ describe("checkServer", () => {
 });
 
 describe("runDoctor", () => {
-  it("runs all six checks with injected mocks", async () => {
+  it("runs all seven checks with injected mocks", async () => {
     const fakeExec = async () => {
       throw new Error("not found");
     };
@@ -157,21 +160,67 @@ describe("runDoctor", () => {
       players: { online: 0, max: 20 },
     });
     const fakeLive = async () => true;
+    const fakeEmbed = async () => true;
     const results = await runDoctor({
       config,
       env: { GROQ_API_KEY: "x" },
       execFile: fakeExec as never,
       ping: fakePing,
       liveApiCall: fakeLive,
+      embeddingsCall: fakeEmbed,
     });
-    expect(results).toHaveLength(6);
+    expect(results).toHaveLength(7);
     const names = results.map((r) => r.name);
     expect(names).toContain("node");
     expect(names).toContain("version-data");
     expect(names).toContain("ffmpeg");
     expect(names).toContain("api-keys");
     expect(names).toContain("api-live");
+    expect(names).toContain("hf-embeddings");
     expect(names).toContain("server");
+  });
+});
+
+describe("checkHfEmbeddingsAsync", () => {
+  it("warns when there is no HF token", async () => {
+    const r = await checkHfEmbeddingsAsync({}, async () => true);
+    expect(r.status).toBe("warn");
+    expect(r.note).toContain("no HF_TOKEN");
+    expect(r.note).toContain("FTS5");
+  });
+
+  it("passes when the feature-extraction endpoint responds", async () => {
+    const r = await checkHfEmbeddingsAsync({ HF_TOKEN: "t" }, async () => true);
+    expect(r.status).toBe("ok");
+    expect(r.note).toContain("bge-small");
+  });
+
+  it("warns and names the FTS5 fallback when the probe fails", async () => {
+    const r = await checkHfEmbeddingsAsync({ HF_TOKEN: "t" }, async () => false);
+    expect(r.status).toBe("warn");
+    expect(r.note).toContain("FAILED");
+    expect(r.note).toContain("FTS5");
+  });
+
+  it("uses the separate pipeline route, not /v1", () => {
+    // HF embeddings are NOT on the chat completions route.
+    expect(HF_EMBEDDING_ENDPOINT).toContain("/hf-inference/models/");
+    expect(HF_EMBEDDING_ENDPOINT).toContain("/pipeline/feature-extraction");
+  });
+});
+
+describe("provider list — Groq and Hugging Face only", () => {
+  it("checks exactly two cloud providers", () => {
+    expect(PROVIDER_KEYS.map(([env]) => env)).toEqual(["GROQ_API_KEY", "HF_TOKEN"]);
+  });
+
+  it("never probes a provider without a key", async () => {
+    const seen: string[] = [];
+    await checkLiveApiKeys({ GROQ_API_KEY: "x" }, async (provider) => {
+      seen.push(provider);
+      return true;
+    });
+    expect(seen).toEqual(["Groq"]);
   });
 });
 

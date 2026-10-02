@@ -3,6 +3,7 @@ import type { ElixConfig } from "../core/config.js";
 import { getActiveProfile } from "../core/config.js";
 import { runBot } from "../connection/bot.js";
 import { Lifecycle } from "../core/lifecycle.js";
+import { exitCleanly } from "../core/exit.js";
 import type { Logger } from "../core/logger.js";
 
 /**
@@ -48,7 +49,8 @@ export function registerStubs(program: Command): void {
         console.error(
           `username "${profile.username}" is not valid — Minecraft requires 3-16 characters from A-Z, a-z, 0-9 and _`,
         );
-        process.exit(1);
+        exitCleanly(1);
+        return;
       }
 
       // Vision rule 8: only join servers the user explicitly allowlisted.
@@ -59,7 +61,8 @@ export function registerStubs(program: Command): void {
         console.error(
           `server ${profile.host} is not in the allowlist — add it to config/elix.yaml bot.serverAllowlist`,
         );
-        process.exit(1);
+        exitCleanly(1);
+        return;
       }
 
       const lifecycle = new Lifecycle(log);
@@ -72,7 +75,7 @@ export function registerStubs(program: Command): void {
         await runBot({ config, profile, log, registerCleanup: (fn) => void lifecycle.onCleanup(fn) });
       } catch (err) {
         log.error({ err: (err as Error).message }, "failed to start");
-        process.exit(1);
+        exitCleanly(1);
       }
     });
 
@@ -84,7 +87,8 @@ export function registerStubs(program: Command): void {
       const profile = getActiveProfile(config);
       console.log("Elix status");
       console.log(`  username:       ${config.bot.username}`);
-      console.log(`  target version: ${config.bot.version}`);
+      // A4: print the version actually resolved for THIS profile, not bot.version.
+      console.log(`  target version: ${profile.version}`);
       console.log(`  profile:        ${profile.name} (${profile.host}:${profile.port})`);
       console.log(`  voice:          ${config.voice.enabled ? "on" : "off (text-only)"}`);
       console.log(`  content level:  ${config.safety.contentLevel}`);

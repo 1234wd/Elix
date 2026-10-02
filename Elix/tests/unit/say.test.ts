@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { SayQueue, SAY_DEFAULTS, type SayOptions } from "../../src/social/say.js";
+import {
+  SayQueue,
+  SAY_DEFAULTS,
+  MAX_QUEUE_LENGTH,
+  type SayOptions,
+} from "../../src/social/say.js";
 
 /**
  * A14: outbound chat must be rate limited, must have a typing delay so it
@@ -161,6 +166,79 @@ describe("SayQueue — dedup", () => {
     await h.queue.flush();
     expect(h.sent).toEqual(["gm", "gm!"]);
     expect(h.dropped).toEqual([]);
+  });
+});
+
+describe("A11 — the dedup map does not leak", () => {
+  it("prunes entries older than the dedup window on every say()", () => {
+    const h = harness({ typingMsPerChar: 0 });
+    // Without pruning this grows once per distinct message for the whole
+    // session — a 6-hour run leaked thousands of entries.
+    for (let i = 0; i < 50; i++) {
+      h.queue.say(`message number ${i}`);
+      h.advance(100);
+    }
+    // 20 messages in the last 10 s window are still tracked.
+    expect(h.queue.dedupSize).toBeGreaterThan(0);
+
+    // Move well past the window; the next say() must sweep the old entries.
+    h.advance(SAY_DEFAULTS.dedupWindowMs * 2);
+    h.queue.say("fresh message");
+    // Only the fresh message and anything inside the window remain.
+    expect(h.queue.dedupSize).toBeLessThanOrEqual(2);
+  });
+
+  it("keeps at most one full window's worth of entries", () => {
+    const h = harness({ typingMsPerChar: 0, dedupWindowMs: 1000 });
+    for (let i = 0; i < 200; i++) {
+      h.queue.say(`msg ${i}`);
+      h.advance(10);
+    }
+    // 1000 ms window / 10 ms per message = ~100 messages could be live.
+    expect(h.queue.dedupSize).toBeLessThanOrEqual(120);
+  });
+});
+
+describe("A11 — the outbound queue is capped", () => {
+  it("drops the oldest non-priority message when full", async () => {
+    const h = harness({ typingMsPerChar: 0, maxPerWindow: 1000 });
+    const total = MAX_QUEUE_LENGTH + 4;
+    for (let i = 0; i < total; i++) h.queue.say(`m${i}`, true);
+
+    // The first message is picked up immediately by the drain loop, so only the
+    // rest compete for space. The queue never exceeds the cap.
+    const queued = h.queue.pending;
+    expect(queued).toBeLessThanOrEqual(MAX_QUEUE_LENGTH);
+
+    await h.queue.flush();
+    // 9 messages offered, 1 went out immediately, 3 more were discarded to stay
+    // within the cap — so only a handful are ever sent.
+    expect(h.queue.dropped).toBe(total - 1 - queued);
+    expect(h.queue.dropped).toBeGreaterThan(0);
+    expect(h.sent).toContain(`m${total - 1}`);
+    expect(h.sent.length).toBeLessThan(total);
+  });
+
+  it("never drops a priority message (the goodbye)", async () => {
+    const h = harness({ typingMsPerChar: 0, maxPerWindow: 1000 });
+    h.queue.say("gtg, cya", true, true);
+    for (let i = 0; i < MAX_QUEUE_LENGTH + 5; i++) h.queue.say(`filler ${i}`, true);
+    await h.queue.flush();
+    expect(h.sent).toContain("gtg, cya");
+  });
+
+  it("reports dropped-queue-full when only priority items remain", () => {
+    const h = harness({ typingMsPerChar: 0, maxPerWindow: 1000 });
+    // The drain loop takes the first one immediately, so queue MAX to fill it.
+    for (let i = 0; i <= MAX_QUEUE_LENGTH; i++) h.queue.say(`p${i}`, true, true);
+    expect(h.queue.pending).toBe(MAX_QUEUE_LENGTH);
+    // A non-priority message cannot displace a priority one.
+    expect(h.queue.say("ordinary", true)).toBe("dropped-queue-full");
+  });
+
+  it("the cap is small enough that the backlog cannot run to minutes", () => {
+    // At 1 message per 2 s, 5 queued items is at most ~10 s of backlog.
+    expect(MAX_QUEUE_LENGTH * 2000).toBeLessThanOrEqual(10_000);
   });
 });
 

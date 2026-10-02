@@ -45,17 +45,34 @@ export const SAY_DEFAULTS: SayDefaults = {
 };
 
 /** Result of enqueueing a message. */
-export type SayResult = "queued" | "dropped-duplicate";
+export type SayResult = "queued" | "dropped-duplicate" | "dropped-queue-full";
+
+interface QueuedMessage {
+  text: string;
+  skipTypingDelay: boolean;
+  /** Priority items (the goodbye) survive the queue cap. */
+  priority: boolean;
+}
+
+/**
+ * Hard cap on the outbound queue (A11).
+ *
+ * The rate limit means 1 message per 2 s, so an unbounded backlog would be
+ * minutes of stale replies. When full, the oldest non-priority item is dropped —
+ * priority items (the shutdown goodbye) are never discarded.
+ */
+export const MAX_QUEUE_LENGTH = 5;
 
 export class SayQueue {
   private readonly opts: Required<Omit<SayOptions, "onDrop">> & Pick<SayOptions, "onDrop">;
-  private readonly queue: Array<{ text: string; skipTypingDelay: boolean }> = [];
+  private readonly queue: Array<QueuedMessage> = [];
   /** Timestamps of recent sends, used for the sliding rate-limit window. */
   private recentSends: number[] = [];
   private readonly dedup = new Map<string, number>();
   private draining = false;
   private idle: Promise<void> = Promise.resolve();
   private closed = false;
+  private droppedByCap = 0;
 
   constructor(opts: SayOptions = {}) {
     const now = opts.now ?? Date.now;
@@ -80,10 +97,15 @@ export class SayQueue {
   /**
    * Enqueue an outbound message.
    * `skipTypingDelay` still respects the rate limit and dedup window.
+   * `priority` items are never dropped by the queue cap.
    */
-  say(text: string, skipTypingDelay = false): SayResult {
+  say(text: string, skipTypingDelay = false, priority = false): SayResult {
     if (this.closed) return "dropped-duplicate";
     const now = this.opts.now();
+
+    // A11: prune the dedup map. Without this it grew for the whole session —
+    // a 6-hour run leaked one entry per distinct message ever sent.
+    this.pruneDedup(now);
 
     const lastSent = this.dedup.get(text);
     if (lastSent !== undefined && now - lastSent < this.opts.dedupWindowMs) {
@@ -93,9 +115,32 @@ export class SayQueue {
     // Reserve the dedup slot now so two identical calls in a row don't both queue.
     this.dedup.set(text, now);
 
-    this.queue.push({ text, skipTypingDelay });
+    // A11: cap the backlog. Drop the oldest non-priority item so fresh messages
+    // (which are more relevant) are not stuck behind minutes of stale replies.
+    if (this.queue.length >= MAX_QUEUE_LENGTH) {
+      const victim = this.queue.findIndex((m) => !m.priority);
+      if (victim >= 0) {
+        const [removed] = this.queue.splice(victim, 1);
+        this.droppedByCap++;
+        this.opts.onDrop?.(removed!.text);
+      } else if (!priority) {
+        // Every queued item is priority — refuse this one instead.
+        this.droppedByCap++;
+        this.opts.onDrop?.(text);
+        return "dropped-queue-full";
+      }
+    }
+
+    this.queue.push({ text, skipTypingDelay, priority });
     this.startDraining();
     return "queued";
+  }
+
+  /** Drop dedup entries older than the dedup window. */
+  private pruneDedup(now: number): void {
+    for (const [key, at] of this.dedup) {
+      if (now - at >= this.opts.dedupWindowMs) this.dedup.delete(key);
+    }
   }
 
   private startDraining(): void {
@@ -166,36 +211,19 @@ export class SayQueue {
   get pending(): number {
     return this.queue.length;
   }
-}
 
-// ---------------------------------------------------------------------------
-// Process-wide singleton used by bot.ts
-// ---------------------------------------------------------------------------
-
-let singleton: SayQueue | null = null;
-
-/** Create/configure the shared queue. Called once from bot.ts with config values. */
-export function initSayQueue(opts: SayOptions): SayQueue {
-  singleton = new SayQueue(opts);
-  return singleton;
-}
-
-/** Enqueue on the shared queue. No-op (with a warning) if not initialised yet. */
-export function say(text: string, skipTypingDelay = false): SayResult {
-  if (!singleton) {
-    console.error("[say] queue not initialised — message dropped:", text);
-    return "dropped-duplicate";
+  /** Test helper: how many messages the queue cap has discarded (A11). */
+  get dropped(): number {
+    return this.droppedByCap;
   }
-  return singleton.say(text, skipTypingDelay);
+
+  /** Test helper: size of the dedup map, to prove it does not leak (A11). */
+  get dedupSize(): number {
+    return this.dedup.size;
+  }
 }
 
-/** Wait for the shared queue to drain (used before quitting so "gtg, cya" lands). */
-export async function flushSayQueue(): Promise<void> {
-  await singleton?.flush();
-}
-
-/** Close the shared queue. */
-export function closeSayQueue(): void {
-  singleton?.close();
-  singleton = null;
-}
+// A12: the process-wide singleton (initSayQueue / say / flushSayQueue /
+// closeSayQueue) was removed. It carried module-level mutable state that made
+// the queue untestable and forced an indirection through botRegistry.ts to break
+// an import cycle. BotSession owns one SayQueue per session instead.

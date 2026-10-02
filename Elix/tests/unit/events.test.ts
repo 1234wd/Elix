@@ -151,6 +151,7 @@ describe("Lifecycle", () => {
   it("a second signal force-exits with 130 (A15)", async () => {
     const exitFn = vi.fn();
     const lc = new Lifecycle(fakeLogger, { exitFn });
+    // Lifecycle is the only component that owns an exit (A9).
     lc.handleSignals();
     // A cleanup that defers keeps the first shutdown in flight long enough for
     // the second Ctrl+C to land.

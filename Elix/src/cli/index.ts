@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { config as loadDotenv } from "dotenv";
 import { resolve } from "node:path";
 import { loadElixConfig, ConfigError, PROJECT_ROOT } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
+import { exitCleanly } from "../core/exit.js";
 import { bus } from "../core/events.js";
 import { registerDoctor } from "./doctor.js";
 import { registerStubs } from "./stubs.js";
+import { registerDebug } from "./debug.js";
 
 // Load .env before anything else so API keys are available from any folder (A5).
 loadDotenv({ path: resolve(PROJECT_ROOT, ".env"), quiet: true });
@@ -29,15 +31,19 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   program.hook("preAction", async (_program, actionCommand) => {
     if (!configCommands.includes(actionCommand.name())) return;
     try {
-      const config = await loadElixConfig();
-      actionCommand.setOptionValue("elixConfig", config);
+      // ELIX_CONFIG lets the runtime tests point at a bad config on purpose.
+      const override = process.env["ELIX_CONFIG"];
+      const config = await loadElixConfig(override);
       const log = createLogger(config);
+      actionCommand.setOptionValue("elixConfig", config);
       actionCommand.setOptionValue("elixLogger", log);
       bus.emit("config:loaded", config);
     } catch (err) {
       if (err instanceof ConfigError) {
         console.error(`Config error: ${err.message}`);
-        process.exit(1);
+        exitCleanly(1);
+        // Stop commander from running the action with an undefined config.
+        throw new CommanderError(1, "config error", "elix");
       }
       throw err;
     }
@@ -45,6 +51,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   registerDoctor(program);
   registerStubs(program);
+  registerDebug(program);
 
   await program.parseAsync(argv);
   return 0;
@@ -74,10 +81,16 @@ export function isDirectRun(argv1: string | undefined = process.argv[1]): boolea
 export async function run(): Promise<void> {
   try {
     const code = await main();
-    if (code !== 0) process.exit(code);
+    if (code !== 0) exitCleanly(code);
   } catch (err) {
+    // A CommanderError is how we stop parsing deliberately (e.g. a config
+    // error). Its exitCode is already the intended one.
+    if (err instanceof CommanderError) {
+      if (err.exitCode !== 0) exitCleanly(err.exitCode);
+      return;
+    }
     console.error(err instanceof Error ? err.message : err);
-    process.exit(1);
+    exitCleanly(1);
   }
 }
 

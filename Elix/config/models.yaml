@@ -1,56 +1,66 @@
 # Model roles and provider preference lists.
-# On startup Elix calls each provider's /models and picks the first available
-# match from each role's preference list. IDs are never hard-coded in source.
 #
-# Cloud AI only — no local models. If all providers are down or out of quota,
-# Elix uses scripted in-character lines and keeps playing on reflex/skill code.
+# On startup Elix calls each provider's /models endpoint and picks the first
+# available match from each role's preference list. These are PREFERENCE LISTS,
+# not hard-coded IDs — if a model disappears, the next entry is used.
+#
+# Cloud AI only. Two providers: Groq (fast, generous free tier) and Hugging Face.
+# The `builtin` provider is Elix's own scripted fallback code, not a model.
+#
+# If every cloud provider is down or out of quota, Elix says "brb, lag" and
+# keeps playing on reflex + skill code. Nothing is ever silent.
 
 roles:
-  fast:
-    # Chat, reactions, social layer.
+  fast: # chat, reactions, social layer
     preference:
       - { provider: groq, model: "openai/gpt-oss-20b" }
-      - { provider: nvidia, model: "meta/llama-3.3-70b-instruct" }
+      - { provider: groq, model: "llama-3.1-8b-instant" }
       - { provider: hf, model: "meta-llama/Llama-3.3-70B-Instruct" }
-  smart:
-    # Planning, hard questions, memory consolidation.
+  smart: # planning, hard questions, memory consolidation, reflection
     preference:
       - { provider: groq, model: "openai/gpt-oss-120b" }
       - { provider: groq, model: "qwen/qwen3.8-27b" }
-      - { provider: nvidia, model: "deepseek-ai/DeepSeek-V3" }
+      - { provider: groq, model: "llama-3.3-70b-versatile" }
       - { provider: hf, model: "deepseek-ai/DeepSeek-V3" }
-  stt:
-    # Speech-to-text (voice).
+  stt: # voice -> text
     preference:
       - { provider: groq, model: "whisper-large-v3-turbo" }
       - { provider: groq, model: "whisper-large-v3" }
-      - { provider: nvidia, model: "nvidia/parakeet-tdt-0.6b-v2" }
-  tts:
-    # Text-to-speech (voice).
+      - { provider: hf, model: "openai/whisper-large-v3" }
+  tts: # text -> voice (Orpheus understands emotion tags like [cheerful])
     preference:
-      - { provider: nvidia, model: "nvidia/magpie-tts" }
-      - { provider: groq, model: "orpheus-3b-0.1-ft" }
-  embeddings:
-    # Memory vector embeddings.
+      - { provider: groq, model: "canopylabs/orpheus-v1-english" }
+      - { provider: builtin, model: "text-only" }
+  embeddings: # memory vectors. Groq has no embeddings endpoint, so HF leads.
     preference:
-      - { provider: nvidia, model: "nvidia/nv-embedqa-e5-v5" }
       - { provider: hf, model: "BAAI/bge-small-en-v1.5" }
-  guard:
-    # Prompt-injection / safety filter.
+      - { provider: builtin, model: "fts5-keyword-only" }
+  guard: # prompt-injection filter
     preference:
       - { provider: groq, model: "openai/gpt-oss-safeguard-20b" }
+      - { provider: groq, model: "meta-llama/llama-prompt-guard-2-86m" }
       - { provider: builtin, model: "keyword-regex" }
 
 providers:
   groq:
     baseUrl: https://api.groq.com/openai/v1
     env: GROQ_API_KEY
-  nvidia:
-    baseUrl: https://integrate.api.nvidia.com/v1
-    env: NVIDIA_API_KEY
   hf:
     baseUrl: https://router.huggingface.co/v1
     env: HF_TOKEN
   builtin:
     baseUrl: null
     env: null
+
+# --- Notes -------------------------------------------------------------------
+#
+# Hugging Face embeddings are NOT on the /v1 chat route. The feature-extraction
+# endpoint is separate and must be verified before memory depends on it:
+#   POST https://router.huggingface.co/hf-inference/models/{model}/pipeline/feature-extraction
+# `elix doctor` probes it. Free HF credit is very small (about $0.10/month), so
+# in Phase 4 every memory is embedded EXACTLY ONCE and the vector is stored
+# forever. Never re-embed. If embedding fails, the memory is still saved and is
+# embedded later; retrieval falls back to FTS5 keyword search in the meantime.
+#
+# The `builtin` provider is Elix's own code: scripted in-character chat lines and
+# an FTS5-only retrieval path. It is not a downloaded model.

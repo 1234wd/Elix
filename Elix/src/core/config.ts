@@ -26,7 +26,12 @@ const serverSchema = z.object({
 const profileSchema = z.object({
   host: z.string().min(1),
   port: z.number().int().min(1).max(65535).default(25565),
-  version: z.string().min(1).default("26.2"),
+  /**
+   * Deliberately optional with NO default (A4). With `.default("26.2")` every
+   * profile had a version, so `bot.version` was dead config — setting it to
+   * 26.3 still resolved to 26.2. Precedence is now CLI > profile > bot.version.
+   */
+  version: z.string().min(1).optional(),
   description: z.string().optional(),
 });
 
@@ -73,7 +78,13 @@ export type ServerProfile = z.infer<typeof profileSchema>;
 // models.yaml schema
 // ---------------------------------------------------------------------------
 
-const providerNameSchema = z.enum(["groq", "nvidia", "hf", "builtin"]);
+/**
+ * Cloud providers only. Two of them: Groq and Hugging Face.
+ *
+ * `builtin` is Elix's own scripted fallback code — scripted chat lines and an
+ * FTS5-only retrieval path. It is NOT a downloaded model, and it needs no key.
+ */
+const providerNameSchema = z.enum(["groq", "hf", "builtin"]);
 
 const modelRefSchema = z.object({
   provider: providerNameSchema,
@@ -178,7 +189,13 @@ export function resolveFromRoot(p: string): string {
   return resolve(PROJECT_ROOT, p);
 }
 
-/** Get the active server profile. Falls back to a synthetic profile from CLI overrides. */
+/**
+ * Get the active server profile.
+ *
+ * A3: a named profile that does not exist must NOT silently fall back to `main`
+ * — that connected the user to the wrong server while printing the name they
+ * asked for. Only an absent profile name (the default case) uses `main`.
+ */
 export function getActiveProfile(
   config: ElixConfig,
   overrides?: {
@@ -188,17 +205,25 @@ export function getActiveProfile(
     username?: string;
     profile?: string;
   },
-): ServerProfile & { name: string; username: string } {
-  const name = overrides?.profile ?? (overrides?.host ? "(cli)" : (config.server.profile ?? "main"));
-  const profile = config.profiles[name] ?? config.profiles["main"];
+): ServerProfile & { name: string; username: string; version: string } {
+  const named = overrides?.profile ?? (overrides?.host ? undefined : (config.server.profile ?? "main"));
+  const available = Object.keys(config.profiles);
+  const name = named ?? "main";
+
+  const profile = config.profiles[name];
   if (!profile) {
-    throw new ConfigError(`No server profile "${name}" found in config/elix.yaml`);
+    const list = available.length > 0 ? available.join(", ") : "(none configured)";
+    throw new ConfigError(`No server profile "${name}". Available: ${list}`);
   }
+
+  // CLI > profile > bot.version (A4).
+  const version = overrides?.version?.trim() || profile.version || config.bot.version;
+
   return {
     name,
     host: overrides?.host ?? profile.host,
     port: overrides?.port ?? profile.port,
-    version: overrides?.version ?? profile.version,
+    version,
     description: profile.description,
     username: overrides?.username ?? config.bot.username,
   };
