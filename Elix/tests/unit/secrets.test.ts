@@ -228,11 +228,14 @@ describe("A9 — no credential is committed", () => {
     // untracked, so the index-driven scan above cannot see it, and a failed
     // assertion message is exactly the kind of thing that ends up in it.
     const viteDir = join(process.cwd(), "node_modules", ".vite", "vitest");
-    expect(existsSync(viteDir), "vitest's cache dir exists after a run").toBe(true);
+    // No cache dir is a legitimate state, not a failure: vitest writes its results
+    // cache lazily, so on a machine that has never run the suite there is nothing
+    // there. Asserting it exists made this test fail on a fresh clone — which is
+    // exactly what the fresh-clone gate is for.
+    if (!existsSync(viteDir)) return;
     const files = walk(viteDir);
-    expect(files.length, "vitest output files found").toBeGreaterThan(0);
     const { offenders, scanned } = scanUntracked(files);
-    expect(scanned, "vitest output files scanned").toBeGreaterThan(0);
+    expect(scanned, "vitest output files scanned").toBe(files.length);
     // A failing assertion prints the value it compared, so a key compared
     // anywhere in the suite would land in these files.
     expect(offenders, `credentials in vitest output:\n${offenders.join("\n")}`).toEqual([]);
