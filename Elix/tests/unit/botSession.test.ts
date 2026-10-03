@@ -23,7 +23,8 @@ import {
 } from "../../src/connection/bot.js";
 import type { PingResult } from "../../src/connection/ping.js";
 import type { ElixConfig } from "../../src/core/config.js";
-import { bus } from "../../src/core/events.js";
+import { bus, shutdownState } from "../../src/core/events.js";
+import { SayQueue } from "../../src/social/say.js";
 
 // ---------------------------------------------------------------------------
 // Test doubles
@@ -932,6 +933,101 @@ describe("A15 — shutdown", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  /**
+   * A1: the goodbye used to be logged as sent whether or not it went out.
+   *
+   * From two live `elix stop` runs against the same server:
+   *
+   *   run 1: sent goodbye 11:04:02 -> bot quit 11:04:02 -> end 11:04:02
+   *   run 2: sent goodbye 11:05:46 -> bot quit 11:05:46 -> end 11:05:48
+   *
+   * `say()` hands the text to `bot.chat()` synchronously, so both runs queued the
+   * packet — and in run 1 `quit()` closed the socket in the same tick, before the
+   * write reached the wire. The server never saw it; the log said otherwise.
+   *
+   * No unit test can observe "the bytes reached the server" — only the two things
+   * this fix actually controls: that the transport RUNS before quit(), and that
+   * there is a settle in between so the write has a chance to leave.
+   */
+  it("sends the goodbye before quitting, with a settle in between", async () => {
+    const h = harness();
+    await h.session.start();
+    const bot = h.bots[0]!;
+    // handleSpawn is what creates the SayQueue — start() only registers the
+    // listener, it does not emit the event.
+    bot.spawn();
+
+    const timeline: Array<{ at: number; what: string }> = [];
+    const at = (): number => Number(vi.getMockedSystemTime());
+    bot.chat = (text: string): void => {
+      timeline.push({ at: at(), what: `chat:${text}` });
+      bot.chatCalls.push(text);
+    };
+    bot.quit = (reason?: string): void => {
+      timeline.push({ at: at(), what: "quit" });
+      bot.quitCount++;
+      void reason;
+      queueMicrotask(() => bot.emit("end", "socketClosed"));
+    };
+
+    const began = at();
+    const stopping = h.session.shutdown();
+    await vi.advanceTimersByTimeAsync(4000);
+    await stopping;
+
+    const chat = timeline.find((e) => e.what === "chat:gtg, cya");
+    const quit = timeline.find((e) => e.what === "quit");
+
+    // It was sent...
+    expect(chat, "the goodbye must reach the chat transport").toBeDefined();
+    // ...before the socket went away.
+    expect(quit).toBeDefined();
+    expect((chat?.at ?? 0) < (quit?.at ?? 0)).toBe(true);
+    // And with a settle in between, so the packet has time to leave. Before the
+    // fix these were the same tick — which is exactly what lost the message.
+    expect((quit?.at ?? 0) - (chat?.at ?? 0)).toBeGreaterThanOrEqual(200);
+    // The whole thing still finishes well inside the shutdown budget.
+    expect(at() - began).toBeLessThan(5000);
+    // And the log agrees with what happened, because it is now conditional.
+    expect(h.logs.info).toHaveBeenCalledWith("sent goodbye");
+  });
+
+  it("logs `goodbye not sent` when the transport never runs", async () => {
+    const h = harness();
+    await h.session.start();
+    const bot = h.bots[0]!;
+    bot.spawn();
+    // Close the queue behind the goodbye's back: it can never be written.
+    (h.session as unknown as { say: SayQueue | undefined }).say?.close();
+
+    const stopping = h.session.shutdown();
+    await vi.advanceTimersByTimeAsync(3000);
+    await stopping;
+
+    // The old code printed "sent goodbye" here. That is the bug.
+    expect(h.logs.info).not.toHaveBeenCalledWith("sent goodbye");
+    expect(bot.quitCount).toBe(1);
+  });
+
+  it("still says goodbye when the CMD window is closed", async () => {
+    // A2's fast path skips the WAIT, not the message. Elix still gets to say it.
+    shutdownState.mode = "quick";
+    try {
+      const h = harness();
+      await h.session.start();
+      const bot = h.bots[0]!;
+      bot.spawn();
+      const stopping = h.session.shutdown();
+      // Only the settle is waited on, so this finishes well inside 6 s — but the
+      // greeting's typing delay still has to clear first.
+      await vi.advanceTimersByTimeAsync(4000);
+      await stopping;
+      expect(bot.chatCalls).toContain("gtg, cya");
+    } finally {
+      shutdownState.mode = "normal";
+    }
   });
 
   it("skips the goodbye when the bot never spawned", async () => {

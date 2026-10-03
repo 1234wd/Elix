@@ -47,11 +47,25 @@ export const SAY_DEFAULTS: SayDefaults = {
 /** Result of enqueueing a message. */
 export type SayResult = "queued" | "dropped-duplicate" | "dropped-queue-full";
 
+/**
+ * Outcome of a FINAL message — the goodbye, the last thing Elix ever says.
+ *
+ * `written` means the transport was called, i.e. `bot.chat(text)` ran. It does
+ * NOT mean the packet reached the server; nothing here can know that. It does
+ * mean the message was not silently swallowed by a queue, a dedup window or a
+ * timeout — which is what the old code logged unconditionally.
+ */
+export type FinalSayResult = "written" | "cancelled" | "dropped-duplicate";
+
 interface QueuedMessage {
   text: string;
   skipTypingDelay: boolean;
   /** Priority items (the goodbye) survive the queue cap. */
   priority: boolean;
+  /** A final message ignores the sliding rate window — see sayFinal(). */
+  bypassRateLimit: boolean;
+  /** Final messages only: settled once the transport has been called. */
+  settle?: (result: FinalSayResult) => void;
 }
 
 /**
@@ -131,9 +145,70 @@ export class SayQueue {
       }
     }
 
-    this.queue.push({ text, skipTypingDelay, priority });
+    this.queue.push({ text, skipTypingDelay, priority, bypassRateLimit: false });
     this.startDraining();
     return "queued";
+  }
+
+  /**
+   * The LAST message of the process: the goodbye.
+   *
+   * Three differences from say(), all because there is nothing after this:
+   *
+   *  - it BYPASSES the sliding rate window. Being throttled at the one moment a
+   *    player is watching for a reply is the worst possible time to be throttled,
+   *    and there is no second message for the limit to protect.
+   *  - it skips the typing delay, because a goodbye that types itself out slowly
+   *    while the player watches is worse than one that just appears.
+   *  - it is priority, so the queue cap can never discard it.
+   *
+   * And it REPORTS. The returned promise settles `written` once the transport
+   * has actually been called, `cancelled` if the queue closed first, or
+   * `dropped-duplicate` if the dedup window caught it. The caller logs what
+   * actually happened rather than assuming it did.
+   */
+  sayFinal(text: string): Promise<FinalSayResult> {
+    if (this.closed) return Promise.resolve("cancelled");
+    const now = this.opts.now();
+    this.pruneDedup(now);
+
+    const lastSent = this.dedup.get(text);
+    if (lastSent !== undefined && now - lastSent < this.opts.dedupWindowMs) {
+      this.opts.onDrop?.(text);
+      return Promise.resolve("dropped-duplicate");
+    }
+    this.dedup.set(text, now);
+
+    return new Promise<FinalSayResult>((resolve) => {
+      let settled = false;
+      const settle = (r: FinalSayResult): void => {
+        if (settled) return;
+        settled = true;
+        resolve(r);
+      };
+
+      // The cap drops the oldest NON-priority item, so a final message is never
+      // the victim. If the queue is somehow all-priority and already full, this
+      // one still goes in: it is the last thing Elix will ever say.
+      if (this.queue.length >= MAX_QUEUE_LENGTH) {
+        const victim = this.queue.findIndex((m) => !m.priority);
+        if (victim >= 0) {
+          const [removed] = this.queue.splice(victim, 1);
+          this.droppedByCap++;
+          this.opts.onDrop?.(removed!.text);
+          removed!.settle?.("cancelled");
+        }
+      }
+
+      this.queue.push({
+        text,
+        skipTypingDelay: true,
+        priority: true,
+        bypassRateLimit: true,
+        settle,
+      });
+      this.startDraining();
+    });
   }
 
   /** Drop dedup entries older than the dedup window. */
@@ -157,9 +232,11 @@ export class SayQueue {
     while (this.queue.length > 0 && !this.closed) {
       const item = this.queue.shift()!;
 
-      // Wait out the sliding rate-limit window.
-      const wait = this.timeUntilAllowed();
-      if (wait > 0) await this.opts.sleep(wait);
+      // Wait out the sliding rate-limit window. A final message skips it.
+      if (!item.bypassRateLimit) {
+        const wait = this.timeUntilAllowed();
+        if (wait > 0) await this.opts.sleep(wait);
+      }
 
       // Typing delay so the message doesn't appear instantly.
       if (!item.skipTypingDelay) {
@@ -167,9 +244,20 @@ export class SayQueue {
         if (typingMs > 0) await this.opts.sleep(typingMs);
       }
 
-      if (this.closed) return;
+      if (this.closed) {
+        item.settle?.("cancelled");
+        return;
+      }
       const send = this.onSend;
-      if (send) send(item.text);
+      if (send) {
+        send(item.text);
+        // Settled AFTER the transport ran, and only then. This is the whole
+        // point: the caller can now log what happened, not what it hoped.
+        item.settle?.("written");
+      } else {
+        // No transport means no bot, so nothing could have been sent.
+        item.settle?.("cancelled");
+      }
       const now = this.opts.now();
       this.recentSends.push(now);
       this.recentSends = this.recentSends.filter((t) => now - t < this.opts.rateWindowMs);
@@ -193,9 +281,16 @@ export class SayQueue {
     }
   }
 
-  /** Stop sending and discard anything pending. */
+  /**
+   * Stop sending and discard anything pending.
+   *
+   * Anything still queued is settled as `cancelled`. A final message whose
+   * promise never settles would leave the shutdown awaiting forever, which is
+   * worse than reporting that the goodbye did not make it.
+   */
   close(): void {
     this.closed = true;
+    for (const m of this.queue) m.settle?.("cancelled");
     this.queue.length = 0;
     this.dedup.clear();
   }

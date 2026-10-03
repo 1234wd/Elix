@@ -939,20 +939,52 @@ export class BotSession {
     }
 
     try {
-      // A2: on the window-closed path there is no time to WAIT for a goodbye —
-      // but there is still time to SEND one, and leaving without saying anything
-      // is the part players notice. So it is queued and the flush is skipped;
-      // mineflayer flushes on its own socket tick, and the alternative is being
-      // killed mid-word by Windows.
+      // A1: the goodbye is the last message Elix will ever send, and it used to be
+      // logged as sent whether or not it actually went out.
+      //
+      // THE CAUSE, from two live `elix stop` runs against the same server:
+      //
+      //   run 1: sent goodbye 11:04:02 -> bot quit 11:04:02 -> end 11:04:02
+      //   run 2: sent goodbye 11:05:46 -> bot quit 11:05:46 -> end 11:05:48
+      //
+      // `say()` hands the text to `bot.chat()` synchronously — with the typing delay
+      // skipped and no rate wait outstanding, there is no await before the transport
+      // runs, which is why `sent goodbye` and `bot quit` are in the same second in BOTH
+      // runs. So the packet was queued for the socket in run 1 too, and then `quit()`
+      // tore the connection down in the same tick, before the write reached the wire.
+      // In run 2 the server took 2 s to send `end`, and that delay is the only reason
+      // the goodbye arrived. It was never a flush race or the rate window: those would
+      // have made `bot quit` land a second or more after `sent goodbye`, and it did not.
+      //
+      // The fix is the SETTLE below — a short wait after the write, before quit(), so
+      // the packet has actually left — plus honest logging.
       if (this.say) {
-        this.say.say("gtg, cya", true);
+        const written = this.say.sayFinal("gtg, cya");
+
         if (shutdownState.mode === "quick") {
+          // A2: the window closed, so there is no time to wait for a flush. Queue it
+          // and give it the settle only — still enough for the packet to go out.
+          await Promise.race([written, delay(GOODBYE_FLUSH_MS)]);
+          await delay(GOODBYE_SETTLE_MS);
           log.info("goodbye queued — not waiting for it (window closed)");
         } else {
-          // Goodbye goes through the queue (rate limit) but skips the typing delay.
-          // Bounded so a 2 s rate-limit window can't eat the whole budget.
-          await Promise.race([this.say.flush(), delay(1500)]);
-          log.info("sent goodbye");
+          const outcome = await Promise.race([
+            written,
+            delay(GOODBYE_FLUSH_MS).then(() => "timeout" as const),
+          ]);
+          if (outcome === "written") {
+            // The transport ran. Give the write a moment to reach the wire before
+            // quit() tears the connection down — this is the whole fix.
+            await delay(GOODBYE_SETTLE_MS);
+            log.info("sent goodbye");
+          } else if (outcome === "timeout") {
+            log.warn(
+              { flushMs: GOODBYE_FLUSH_MS },
+              "goodbye not sent (flush timed out — the transport never ran)",
+            );
+          } else {
+            log.warn({ outcome }, "goodbye not sent");
+          }
         }
       }
 
@@ -1018,6 +1050,25 @@ export function permanentMessage(kind: DisconnectKind, username: string, fallbac
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/**
+ * A1: how long to wait for the goodbye's transport to actually run.
+ *
+ * Generous, because it is only ever reached when something is wrong — a missing
+ * transport, or a closed queue — and a slow path is better than a silent one.
+ */
+const GOODBYE_FLUSH_MS = 2000;
+
+/**
+ * A1: how long to let the chat packet reach the wire before quitting.
+ *
+ * `bot.chat()` writes to the socket; `bot.quit()` closes it. Calling them in the
+ * same tick is a race the server usually wins, which is exactly how a goodbye
+ * went missing while the log cheerfully said it had been sent. 250 ms is short
+ * enough to be invisible to a player waiting on exit and long enough for a local
+ * socket write plus a TCP segment to complete.
+ */
+const GOODBYE_SETTLE_MS = 250;
 
 /** Look around naturally — smooth yaw sweep (A14: eased head movement). */
 function lookAround(bot: BotLike, log: Logger): void {

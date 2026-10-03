@@ -213,6 +213,32 @@ Honest status, per phase. Anything not listed here does not exist yet.
 **Still not built:** the emotion engine and the full social layer (Phase 5), voice
 (Phase 9), self-driven goals (Phase 7).
 
+### Phase 9 notes — Simple Voice Chat
+
+**Confirmed present on the target server.** The server console logs
+`[voicechat] Disconnecting client Elix`, so Simple Voice Chat is installed
+alongside Fabric and EasyWhitelist. No voice code exists yet.
+
+**Its version is NOT readable from anything Elix can currently see.** Measured
+against the live server: the vanilla status response exposes exactly three
+top-level keys — `description`, `players`, `version` — and reports
+`serverBrand: "Vanilla"`. There is no `forgeData`, no `modinfo`, no `mods` and
+no `plugins` key, so a Fabric mod list is not published on `/status` at all:
+
+```
+software   : Vanilla
+version    : 26.2
+protocol   : 776
+raw keys   : description, players, version
+mod list present on /status: false
+```
+
+So Phase 9 cannot discover SVC, or its version, from the handshake or the ping.
+Discovery will need a different route — most likely SVC's own UDP port (24454 by
+default) or its plugin channel — which is a Phase 9 task, not a doctor check.
+Until then the honest answer to "what voice stack does this server run?" is
+"Simple Voice Chat, version unknown".
+
 ### C1 — how it maps onto the code
 
 | Rule | Where |
