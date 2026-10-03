@@ -52,6 +52,16 @@ export interface MemoryShutdownDeps {
   onProgress?: (line: string) => void;
   budgetMs?: number;
   consolidationBudgetMs?: number;
+  /**
+   * A2: the CMD window was closed, so Windows gives us about 10 s.
+   *
+   * Consolidation is a `smart` call and the embedding drain is a 10 s HF call —
+   * neither fits. Both are deferred to the next start or the next night, which
+   * the A2 watermark makes safe: nothing is lost, it is simply summarised later.
+   * The backup is a local file write and is the one thing that must happen now,
+   * because a killed process cannot write it afterwards.
+   */
+  quick?: boolean;
   /** Overridable for tests. */
   now?: () => number;
   /** Overridable for tests. */
@@ -59,7 +69,14 @@ export interface MemoryShutdownDeps {
 }
 
 export interface ShutdownReport {
-  consolidation: "ok" | "skipped-no-key" | "skipped-timeout" | "skipped-error" | "no-episodes";
+  consolidation:
+    | "ok"
+    | "skipped-no-key"
+    | "skipped-timeout"
+    | "skipped-error"
+    | "no-episodes"
+    /** A2: the window closed. Deferred to the next start or night. */
+    | "skipped-quick";
   consolidationResult?: ConsolidationResult;
   /** True when the backup file exists afterwards. This must always be true. */
   backup: BackupResult;
@@ -127,7 +144,12 @@ export async function runMemoryShutdown(deps: MemoryShutdownDeps): Promise<Shutd
   };
 
   // -- 1. consolidation: nice to have, hard 8 s budget ----------------------
-  if (!deps.hasModel || !deps.router) {
+  if (deps.quick) {
+    // A2: no time for a model call. Skipped BEFORE the progress line, so
+    // "saving memories…" keeps meaning "a call is running".
+    report.consolidation = "skipped-quick";
+    deps.log.info("window closed — consolidation deferred to the next start");
+  } else if (!deps.hasModel || !deps.router) {
     deps.log.info({ reason: "no provider key" }, "shutdown consolidation skipped");
   } else {
     progress("saving memories…");
@@ -194,7 +216,10 @@ export async function runMemoryShutdown(deps: MemoryShutdownDeps): Promise<Shutd
 
   // -- 3. embedding: only with budget to spare ------------------------------
   const remaining = deadline - now();
-  if (remaining <= EMBED_MIN_REMAINING_MS) {
+  if (deps.quick) {
+    // A2: one HF call is 10 s and the whole budget is 6 s. Not a close call.
+    report.embed = "skipped-no-budget";
+  } else if (remaining <= EMBED_MIN_REMAINING_MS) {
     report.embed = "skipped-no-budget";
     report.ranOutOfBudget = true;
     deps.log.info(

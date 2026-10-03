@@ -5,7 +5,8 @@ import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config
 import { currentBot, runBot } from "../connection/bot.js";
 import { Lifecycle } from "../core/lifecycle.js";
 import { exitCleanly } from "../core/exit.js";
-import { bus } from "../core/events.js";
+import { startControlServer, type ControlServer } from "../core/controlChannel.js";
+import { bus, shutdownState } from "../core/events.js";
 import { buildBrain, type BrainHandle } from "../brain/index.js";
 import { ChatBridge, type MemoryHook } from "../brain/bridge.js";
 import { MemoryStore, defaultMemoryPath } from "../memory/store.js";
@@ -206,9 +207,45 @@ export function registerStubs(program: Command): void {
         return;
       }
 
-      const lifecycle = new Lifecycle(log);
+      // A1: the control server is created up front and handed the exit code, so
+      // `elix stop` can report the real number instead of guessing. It is built
+      // BEFORE handleSignals because a second Elix on the same project must be
+      // refused before it can touch the database.
+      let control: ControlServer | undefined;
+      const lifecycle = new Lifecycle(log, {
+        onExit: async (code) => {
+          // The code goes out FIRST, then the channel closes. Closing first would
+          // destroy the socket unread and the waiting `elix stop` would time out
+          // on a shutdown that had actually succeeded.
+          await control?.announceExit(code).catch(() => undefined);
+          await control?.close().catch(() => undefined);
+        },
+      });
+
       // Signal handlers go up before connecting, so Ctrl+C during ping/login is clean (A15).
       lifecycle.handleSignals();
+
+      try {
+        control = await startControlServer({
+          projectRoot: PROJECT_ROOT,
+          log,
+          // A1: the SAME path as Ctrl+C. Same goodbyes, same consolidation, same
+          // backup, same `saving memories…`, same exit code 0.
+          onStop: () => void lifecycle.shutdown("stop", 0),
+        });
+        log.info({ path: control.path }, "control channel listening (elix stop)");
+      } catch (err) {
+        // A second Elix on this project is a real problem, not a warning: two
+        // processes writing one SQLite database is how memories get lost.
+        console.error((err as Error).message);
+        exitCleanly(1);
+        return;
+      }
+
+      // A1: `saving memories…` and the exit code come from the memory cleanup
+      // below; the control server is closed by onExit so a stopping Elix stops
+      // answering immediately rather than after the database is closed.
+      void 0;
 
       // A2: a permanent disconnect and a crash burst both shut down through the
       // Lifecycle with a specific exit code, so every registered cleanup runs —
@@ -347,6 +384,9 @@ export function registerStubs(program: Command): void {
             log,
             // A1: the user can see WHY the process is still running.
             onProgress: (line) => console.log(line),
+            // A2: the window was closed, so there is no time for a model call.
+            // The backup and the close still happen.
+            quick: shutdownState.mode === "quick",
           });
         });
 

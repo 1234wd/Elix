@@ -8,7 +8,7 @@ import { describeReason, type DescribedReason } from "./kickReason.js";
 import { ReconnectScheduler } from "./scheduler.js";
 import { resolveTargetVersion, expectedProtocol, hasDataFor } from "./version.js";
 import { blockName } from "./safeWorld.js";
-import { bus } from "../core/events.js";
+import { bus, shutdownState } from "../core/events.js";
 import { SayQueue } from "../social/say.js";
 import { exitCleanly } from "../core/exit.js";
 
@@ -939,36 +939,56 @@ export class BotSession {
     }
 
     try {
-      // Goodbye goes through the queue (rate limit) but skips the typing delay.
-      // Bounded so a 2 s rate-limit window can't eat the whole budget.
+      // A2: on the window-closed path there is no time to WAIT for a goodbye —
+      // but there is still time to SEND one, and leaving without saying anything
+      // is the part players notice. So it is queued and the flush is skipped;
+      // mineflayer flushes on its own socket tick, and the alternative is being
+      // killed mid-word by Windows.
       if (this.say) {
         this.say.say("gtg, cya", true);
-        await Promise.race([this.say.flush(), delay(1500)]);
-        log.info("sent goodbye");
+        if (shutdownState.mode === "quick") {
+          log.info("goodbye queued — not waiting for it (window closed)");
+        } else {
+          // Goodbye goes through the queue (rate limit) but skips the typing delay.
+          // Bounded so a 2 s rate-limit window can't eat the whole budget.
+          await Promise.race([this.say.flush(), delay(1500)]);
+          log.info("sent goodbye");
+        }
       }
 
       // Register `end` BEFORE calling quit (A15), and quit synchronously —
       // mineflayer's quit() is synchronous and the client emits 'end' itself.
-      await new Promise<void>((done) => {
-        const onEnd = () => {
-          clearTimeout(endTimer);
-          log.info("bot ended");
-          done();
-        };
-        const endTimer = setTimeout(() => {
-          log.warn("end event timeout — giving up on a clean quit");
-          done();
-        }, 3000);
-        bot.once("end", onEnd as never);
+      if (shutdownState.mode === "quick") {
+        // A2: do not sit here waiting for `end`; quit and move on so the backup
+        // gets its slice of the 6 s budget.
         try {
           bot.quit("shutdown");
           log.info("bot quit");
         } catch (err) {
-          clearTimeout(endTimer);
           log.warn({ err: (err as Error).message }, "quit failed — skipping clean disconnect");
-          done();
         }
-      });
+      } else {
+        await new Promise<void>((done) => {
+          const onEnd = () => {
+            clearTimeout(endTimer);
+            log.info("bot ended");
+            done();
+          };
+          const endTimer = setTimeout(() => {
+            log.warn("end event timeout — giving up on a clean quit");
+            done();
+          }, 3000);
+          bot.once("end", onEnd as never);
+          try {
+            bot.quit("shutdown");
+            log.info("bot quit");
+          } catch (err) {
+            clearTimeout(endTimer);
+            log.warn({ err: (err as Error).message }, "quit failed — skipping clean disconnect");
+            done();
+          }
+        });
+      }
     } finally {
       // No hard timeout here (A9): Lifecycle owns the 10 s ceiling and the exit
       // code. This method only resolves or rejects.

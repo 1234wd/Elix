@@ -37,6 +37,24 @@ export interface ElixEvents {
   "shutdown": (reason: string) => void;
 }
 
+/**
+ * A2: how much time the shutdown has been given.
+ *
+ * - `normal` — a human pressed Ctrl+C (or SIGTERM, or `elix stop`). There is
+ *   time for a goodbye, a consolidation pass, a backup and an embedding drain.
+ * - `quick`  — the CMD window was closed. Node reports that as SIGHUP and Windows
+ *   kills the process about 10 seconds later, so there is no time for any of
+ *   that. Only the things that cannot be deferred get done.
+ *
+ * This lives on the bus rather than being threaded through every shutdown call
+ * because the two consumers that need it — BotSession's goodbye and the memory
+ * sequence — are registered as opaque cleanup callbacks and cannot be handed a
+ * parameter without changing the shape of every registration.
+ */
+export type ShutdownMode = "normal" | "quick";
+
+export const shutdownState: { mode: ShutdownMode } = { mode: "normal" };
+
 type Handler<T> = T extends (...args: infer A) => void ? (...args: A) => void : never;
 
 class TypedBus {

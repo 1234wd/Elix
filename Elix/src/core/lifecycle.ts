@@ -1,5 +1,5 @@
 import type { Logger } from "./logger.js";
-import { bus } from "./events.js";
+import { bus, shutdownState, type ShutdownMode } from "./events.js";
 import { exitCleanly } from "./exit.js";
 
 /**
@@ -26,16 +26,50 @@ export interface LifecycleOptions {
   timeoutMs?: number;
   /** Overridable for tests. */
   exitFn?: (code: number) => void;
+  /**
+   * A2: called with the exit code IMMEDIATELY before the process exits.
+   *
+   * It may be async, and it is awaited, because `elix stop` has to report the
+   * real exit code over the control channel and that write has to land before
+   * the process disappears. Awaiting it after `exitFn` would be too late:
+   * `exitCleanly` actually exits, so nothing after it runs.
+   */
+  onExit?: (code: number) => void | Promise<void>;
 }
 
 /** The default ceiling. Generous enough to hold the whole shutdown sequence. */
 export const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+/**
+ * A2: the ceiling for the window-closed path.
+ *
+ * Windows gives a process roughly 10 seconds after the console window is
+ * closed before it kills it, so the fast path is budgeted at 6 s — enough to
+ * write a backup and close the database, with margin for a slow disk.
+ */
+export const QUICK_SHUTDOWN_TIMEOUT_MS = 6_000;
+
+/**
+ * A2: signals that get the FULL shutdown.
+ *
+ * SIGBREAK is Windows' Ctrl+Break — the console equivalent of Ctrl+C — and it
+ * used to be unhandled, so a user pressing it got Node's default behaviour
+ * (terminate, no cleanups, no backup). SIGHUP is deliberately NOT here: on
+ * Windows it means the window was closed, which gets the fast path instead.
+ */
+export const NORMAL_SIGNALS = ["SIGINT", "SIGTERM", "SIGBREAK"] as const;
 
 export class Lifecycle {
   private readonly cleanups: Array<() => Promise<void> | void> = [];
   private readonly log: Logger;
   private readonly exitFn: (code: number) => void;
   private readonly timeoutMs: number;
+  /** A2: read by whatever asked for the shutdown. */
+  private readonly onExit: ((code: number) => void | Promise<void>) | undefined;
+  /** A2: the ceiling this particular shutdown is working to. */
+  private timeoutMsFor(mode: ShutdownMode): number {
+    return mode === "quick" ? QUICK_SHUTDOWN_TIMEOUT_MS : this.timeoutMs;
+  }
   private shuttingDown = false;
   private signalsRegistered = false;
   private signalHandlers = new Map<NodeJS.Signals, () => void>();
@@ -51,6 +85,7 @@ export class Lifecycle {
     // UV_HANDLE_CLOSING the way a bare process.exit() did (A2).
     this.exitFn = opts.exitFn ?? exitCleanly;
     this.timeoutMs = opts.timeoutMs ?? SHUTDOWN_TIMEOUT_MS;
+    this.onExit = opts.onExit;
   }
 
   /** Register a cleanup callback. Returns an unregister function. */
@@ -71,7 +106,7 @@ export class Lifecycle {
   handleSignals(): void {
     if (this.signalsRegistered) return;
     this.signalsRegistered = true;
-    for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    for (const sig of NORMAL_SIGNALS) {
       const handler = () => {
         if (this.shuttingDown) {
           this.log.warn({ sig }, "second signal — force exiting with 130");
@@ -83,6 +118,18 @@ export class Lifecycle {
       this.signalHandlers.set(sig, handler);
       process.on(sig, handler);
     }
+    // A2: SIGHUP is what Node reports when the CMD window is CLOSED, and it
+    // gets the fast path. See QUICK_SHUTDOWN_TIMEOUT_MS for the 6 s budget.
+    const hup = () => {
+      if (this.shuttingDown) {
+        this.log.warn("second signal — force exiting with 130");
+        this.exitFn(130);
+        return;
+      }
+      void this.shutdown("signal SIGHUP", 0, "quick");
+    };
+    this.signalHandlers.set("SIGHUP", hup);
+    process.on("SIGHUP", hup);
   }
 
   /** Remove signal handlers (tests, or after shutdown completes). */
@@ -124,19 +171,24 @@ export class Lifecycle {
    * ran and the database was never closed cleanly. It now comes through here
    * with code 2. A second Ctrl+C still force-exits 130 regardless.
    */
-  async shutdown(reason: string, exitCode = 0): Promise<void> {
+  async shutdown(reason: string, exitCode = 0, mode: ShutdownMode = "normal"): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.shutdownStarted = true;
-    this.log.info({ reason, exitCode }, "shutting down");
+    // A2: published before anything else, because the cleanup callbacks read it
+    // to decide whether they have time for a goodbye and a consolidation pass.
+    shutdownState.mode = mode;
+    const ceiling = this.timeoutMsFor(mode);
+    if (mode === "quick") this.log.info("window closed — quick save");
+    this.log.info({ reason, exitCode, mode }, "shutting down");
     bus.emit("shutdown", reason);
 
     // Hard ceiling: if a cleanup hangs, we still exit. This is the single
     // timeout that matters — BotSession has none (A9).
     const hardTimeout = setTimeout(() => {
-      this.log.warn({ timeoutMs: this.timeoutMs }, "shutdown hard timeout — forcing exit");
+      this.log.warn({ timeoutMs: ceiling }, "shutdown hard timeout — forcing exit");
       this.exitFn(1);
-    }, this.timeoutMs);
+    }, ceiling);
 
     try {
       // Copy before reversing — `reverse()` mutates in place (A15).
@@ -151,6 +203,13 @@ export class Lifecycle {
     } finally {
       clearTimeout(hardTimeout);
       this.removeSignals();
+      // A2: report the code BEFORE exiting. `elix stop` is blocked on this
+      // write, and exitCleanly ends the process, so it cannot come afterwards.
+      try {
+        await this.onExit?.(exitCode);
+      } catch (err) {
+        this.log.warn({ err: (err as Error).message }, "exit hook failed");
+      }
       this.exitFn(exitCode);
     }
 

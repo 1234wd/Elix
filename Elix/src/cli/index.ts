@@ -10,6 +10,7 @@ import { exitCleanly } from "../core/exit.js";
 import { bus } from "../core/events.js";
 import { registerDoctor } from "./doctor.js";
 import { registerStubs } from "./stubs.js";
+import { registerStop } from "./stop.js";
 import { registerDebug } from "./debug.js";
 import { registerBrain } from "./brain.js";
 import { registerMemoryCommands } from "./memory.js";
@@ -54,6 +55,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   registerDoctor(program);
   registerStubs(program);
+  registerStop(program);
   registerBrain(program);
   registerMemoryCommands(program);
   registerDebug(program);
