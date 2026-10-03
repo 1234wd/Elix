@@ -36,6 +36,9 @@ import type {
 
 export const GROQ_BASE = "https://api.groq.com/openai/v1";
 
+/** Used when a caller does not name a model. Same default as config/models.yaml. */
+export const DEFAULT_MODEL = "openai/gpt-oss-20b";
+
 export interface GroqOptions {
   apiKey: string;
   baseUrl?: string;
@@ -94,8 +97,15 @@ export class GroqProvider implements ProviderAdapter {
     return models;
   }
 
-  async complete(req: CompletionRequest, model: string): Promise<ProviderResponse> {
-    const body = this.buildBody(req, model, false);
+  async complete(req: CompletionRequest, model?: string): Promise<ProviderResponse> {
+    // A live call is not always given a model: the router resolves one from the
+    // preference list, but a direct `provider.complete(req)` — a live smoke test,
+    // a one-off script — may not, and `buildBody` then passed `undefined` into
+    // isReasoningModel(), which does `model.toLowerCase()` and threw
+    // "Cannot read properties of undefined". Fall back to the documented default
+    // rather than crashing.
+    const chosen = model ?? DEFAULT_MODEL;
+    const body = this.buildBody(req, chosen, false);
     const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
