@@ -82,61 +82,59 @@ describe("A9 — the built CLI works from any folder", () => {
 });
 
 /**
- * Run the built CLI with a `.env` at PROJECT_ROOT, then put the project back
+ * Run the built CLI with a .env at PROJECT_ROOT, then put the project back
  * exactly as it was.
  *
- * This used to write the fake key over `PROJECT_ROOT/.env` and then delete the
- * file. `created` was set to true unconditionally, so the "cleanup" ran even
- * when a real `.env` already existed — which means running the test suite
- * DESTROYED the developer's own keys. It did, once, to the machine this was
- * written on.
- *
- * Two independent guarantees now:
- *  1. the existing file is copied aside first, and restored byte-for-byte
- *  2. `.env` is only ever restored, never deleted, and a still-present original
- *     is verified after the test
+ * This used to write the fake key over PROJECT_ROOT/.env and then delete the
+ * file. The cleanup flag was set unconditionally, so it ran even when a real
+ * .env already existed - which means running the suite DESTROYED the keys on
+ * the machine this was written on.
  */
-async function withProjectEnv(contents: string): Promise<void> {
+async function withProjectEnv<T>(contents: string, fn: () => Promise<T>): Promise<T> {
   const envPath = join(PROJECT_ROOT, ".env");
   const backupPath = join(PROJECT_ROOT, ".env.test-backup");
-  const hadOriginal = existsSync(envPath);
-  let original: Buffer | null = null;
-  let restoreFailed: string | null = null;
-  if (hadOriginal) {
-    original = readFileSync(envPath);
-    writeFileSync(backupPath, original);
-  }
+  const original: Buffer | null = existsSync(envPath) ? readFileSync(envPath) : null;
+  if (original) writeFileSync(backupPath, original);
+
+  let result: T | undefined;
+  let restoreError: Error | null = null;
   try {
     writeFileSync(envPath, contents, "utf8");
-    await new Promise((r) => setTimeout(r, 0));
+    // The fake key must be on disk for the WHOLE of `fn`. A first version
+    // restored in the finally and ran the caller afterwards, so the child
+    // process always read the original (or no) .env: the test passed on a
+    // machine with real keys for entirely the wrong reason, and failed on a
+    // clean clone.
+    result = await fn();
   } finally {
-    if (hadOriginal && original) {
-      // Restore, never delete: if the original is unreadable we would be
-      // destroying the user's keys, so keep the backup on disk in that case.
-      try {
-        if (readFileSync(envPath).equals(original)) {
+    try {
+      if (original) {
+        // Restore, never delete: if the original were unreadable we would be
+        // destroying real keys, so the backup is kept on disk instead.
+        if (existsSync(envPath) && readFileSync(envPath).equals(original)) {
           rmSync(envPath);
           renameSync(backupPath, envPath);
         } else {
           writeFileSync(envPath, original);
           rmSync(backupPath, { force: true });
         }
-      } catch (err) {
-        // Leave .env.test-backup in place and shout about it. NOT a `throw` in
-        // a finally: a throw there replaces whatever error the test was already
-        // reporting, which is how a real failure gets hidden.
-        console.error(
-          `[TEST] could not restore ${envPath} (${(err as Error).message}); ` +
-            `the original is at ${backupPath}`,
-        );
-        restoreFailed = `${envPath} was not restored; see ${backupPath}`;
+      } else {
+        rmSync(envPath, { force: true });
       }
-    } else {
-      rmSync(envPath, { force: true });
+    } catch (err) {
+      // Recorded, never thrown from inside the finally: a throw there replaces
+      // whatever error the test was already reporting, hiding the real failure.
+      restoreError = err as Error;
+      console.error(
+        `[TEST] could not restore ${envPath} (${(err as Error).message}); ` +
+          `the original is at ${backupPath}`,
+      );
     }
   }
-  // Asserted AFTER the finally, so the original error is what fails first.
-  if (restoreFailed) throw new Error(restoreFailed);
+  if (restoreError) {
+    throw new Error(`failed to restore ${envPath}: ${restoreError.message}`);
+  }
+  return result as T;
 }
 
 describe("A5 — .env is loaded from the project root, not the cwd", () => {
@@ -151,10 +149,11 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
   });
 
   it("finds a key in a .env placed at PROJECT_ROOT even when run elsewhere", async () => {
-    // Never touches the developer's real .env: withProjectEnv copies it aside
-    // and puts it back byte-for-byte.
-    await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n");
-    const { stdout } = await runCli(["doctor", "--json"], tmp);
+    // Never touches the developer's real .env: withProjectEnv copies it aside and
+    // puts it back byte-for-byte AFTER the CLI has run.
+    const { stdout } = await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n", () =>
+      runCli(["doctor", "--json"], tmp),
+    );
     const results = JSON.parse(stdout) as Array<{ name: string; status: string; note: string }>;
     const keys = results.find((r) => r.name === "api-keys");
     // The fake key is present in the environment as far as doctor is concerned;
@@ -168,15 +167,22 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
     // the suite used to overwrite and then DELETE a real .env, which destroyed
     // the keys on the machine it was written on.
     const envPath = join(PROJECT_ROOT, ".env");
-    if (!existsSync(envPath)) {
-      // Nothing to protect on a machine with no .env. Assert that explicitly
-      // rather than passing vacuously.
+    const hadOne = existsSync(envPath);
+    const before = hadOne ? readFileSync(envPath) : null;
+    await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n", async () => {
+      // While the fake is in place, the CLI must see the FAKE key. This is the
+      // half that used to be missing, which let the test pass for the wrong
+      // reason on a machine that had real keys.
+      const { stdout } = await runCli(["doctor", "--json"], tmp);
+      const results = JSON.parse(stdout) as Array<{ name: string; note: string }>;
+      expect(results.find((r) => r.name === "api-keys")?.note).toContain("Groq");
+    });
+    if (hadOne && before) {
+      expect(readFileSync(envPath).equals(before)).toBe(true);
+    } else {
+      // Nothing to protect: the fake must be gone again.
       expect(existsSync(envPath)).toBe(false);
-      return;
     }
-    const before = readFileSync(envPath);
-    await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n");
-    expect(readFileSync(envPath).equals(before)).toBe(true);
     // No backup left lying around either.
     expect(existsSync(join(PROJECT_ROOT, ".env.test-backup"))).toBe(false);
   });
