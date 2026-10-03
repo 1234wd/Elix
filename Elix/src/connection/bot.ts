@@ -25,10 +25,12 @@ export interface BotLike {
   username: string;
   entity?: { position: Vec3Like; yaw: number };
   health?: number;
-  time?: { isDay: boolean };
+  time?: { isDay: boolean; timeOfDay?: number };
   game?: { dimension?: string; serverBrand?: string };
   player?: { ping?: number };
-  _client?: { on(event: string, fn: () => void): void };
+  _client?: {
+    on(event: string, fn: (...args: unknown[]) => void): void;
+  };
   /** Handlers here are cast per event, so the signature stays loose. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on(event: string, fn: (...args: any[]) => void): unknown;
@@ -131,6 +133,8 @@ export interface ChatBridgeLike {
     message: string,
     sayQueue?: SayQueue,
   ): Promise<{ replied: boolean; reason: string; text?: string; usedProvider?: string }>;
+  /** A6: record one of Elix's own scripted lines as an episode. */
+  recordScripted?(text: string, player: string | null): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +567,36 @@ export class BotSession {
     bot.on("kicked", ((raw: unknown) => this.handleKicked(raw)) as never);
     bot.on("end", ((reason: string) => this.handleEnd(reason)) as never);
 
+    // A6: "never forgets" used to mean only chat addressed to Elix. Joins,
+    // leaves and deaths are the events that actually tell a relationship story,
+    // so they go on the bus like everything else.
+    //
+    // mineflayer surfaces these as raw packets on the client, so they are
+    // registered on `_client` rather than on the bot. Each is wrapped because the
+    // listener shape is cast per event elsewhere in this file.
+    const self = profile.username;
+    const usernameOf = (packet: unknown): string | null => {
+      const p = packet as { username?: unknown; player?: { username?: unknown } } | null;
+      const name = p?.username ?? p?.player?.username;
+      if (typeof name !== "string" || name.length === 0 || name === self) return null;
+      return name;
+    };
+    bot._client?.on("playerJoined", (...args: unknown[]) => {
+      const name = usernameOf(args[0]);
+      if (name) bus.emit("bot:playerJoined", { username: name });
+    });
+    bot._client?.on("playerLeft", (...args: unknown[]) => {
+      const name = usernameOf(args[0]);
+      if (name) bus.emit("bot:playerLeft", { username: name });
+    });
+    bot.on("death", (() => {
+      const pos = bot.entity?.position;
+      bus.emit("bot:died", {
+        ...(pos ? { position: { x: pos.x, y: pos.y, z: pos.z } } : {}),
+        ...(bot.game?.dimension ? { dimension: bot.game.dimension } : {}),
+      });
+    }) as never);
+
     log.info(
       { host: profile.host, port: profile.port, username: profile.username },
       "bot instance created",
@@ -674,10 +708,15 @@ export class BotSession {
     // away, so anything with more words goes to the bridge instead, and the
     // LLM answers both parts.
     if (isGreetingFor(message, profile.username) && !hasFollowUp(message, profile.username)) {
+      const greeting = `hi ${username}!`;
       // Small randomised delay so replies don't look robotic.
       this.setTimer(() => {
         if (this.shutdownRequested || this.ended) return;
-        this.say?.say(`hi ${username}!`);
+        this.say?.say(greeting);
+        // A6: a scripted greeting is still something Elix said. Recording only
+        // what the LLM replied to meant the whole scripted half of his
+        // personality left no history at all.
+        this.deps.chatBridge?.recordScripted?.(greeting, username);
         log.info({ username }, "replied to greeting");
       }, 1000 + Math.floor(Math.random() * 1500));
       return;
@@ -1137,6 +1176,17 @@ async function pingWithBackoff(
       }
     }
   }
+}
+
+/**
+ * The live bot, or null when Elix is not connected.
+ *
+ * A2 needs this for one thing only: mineflayer's in-game clock, which the
+ * nightly scheduler reads to decide when it is night. Exported as a real API
+ * rather than reusing the test hook, because it is no longer test-only.
+ */
+export function currentBot(): BotLike | null {
+  return liveBot;
 }
 
 /** Test hook: read the current session's bot (used to spy on chat). */

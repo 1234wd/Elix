@@ -35,6 +35,8 @@ type Db = InstanceType<typeof DatabaseSync>;
 export type Speaker = "player" | "elix";
 
 export type EpisodeKind =
+  /** A line Elix heard but was not part of (A6). Quiet by design. */
+  | "ambient"
   | "chat"
   | "death"
   | "build"
@@ -246,11 +248,14 @@ export interface MemoryStoreOptions {
 export class MemoryStore {
   private readonly db: Db;
   private vecLoaded = false;
+  /** Where this database lives. Backups, the CLI and the scheduler all need it. */
+  readonly path: string;
   readonly dimensions: number;
   readonly embeddingModel: string;
 
   constructor(opts: MemoryStoreOptions) {
     mkdirSync(dirname(opts.path), { recursive: true });
+    this.path = opts.path;
     this.dimensions = opts.dimensions ?? 384;
     this.embeddingModel = opts.embeddingModel ?? "BAAI/bge-small-en-v1.5";
     this.db = new DatabaseSync(opts.path, { allowExtension: true });
@@ -527,8 +532,13 @@ export class MemoryStore {
   bumpRelation(
     player: string,
     deltas: { familiarity?: number; affection?: number; trust?: number },
+    now: number = Date.now(),
   ): void {
-    this.touchPerson(player, Date.now());
+    // `now` is a parameter, not Date.now() inline. With a fake clock in tests —
+    // and the recorder uses one — the previous version stamped `last_seen` with
+    // real time, so a join recorded at t=1000 came back with last_seen set to
+    // "now" instead.
+    this.touchPerson(player, now);
     this.db
       .prepare(
         `UPDATE people SET

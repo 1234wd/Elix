@@ -13,11 +13,23 @@ import { exitCleanly } from "./exit.js";
  */
 
 export interface LifecycleOptions {
-  /** Hard ceiling for the entire shutdown (default 10 s). */
+  /**
+   * Hard ceiling for the entire shutdown (default 30 s).
+   *
+   * A1: this was 10 s, which was shorter than the work itself. Shutdown does a
+   * goodbye (1.5-4.5 s), a consolidation pass (its own 8 s budget) and an
+   * embedding drain (10 s HF calls), so a slow provider used to trip the ceiling
+   * and the process was killed BEFORE the backup was written and before the
+   * database was closed — exactly the failure the backup exists to prevent. The
+   * ceiling now has to exceed the sum of the work it is a backstop for.
+   */
   timeoutMs?: number;
   /** Overridable for tests. */
   exitFn?: (code: number) => void;
 }
+
+/** The default ceiling. Generous enough to hold the whole shutdown sequence. */
+export const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 export class Lifecycle {
   private readonly cleanups: Array<() => Promise<void> | void> = [];
@@ -38,7 +50,7 @@ export class Lifecycle {
     // exitCleanly drains the logger first, so a shutdown never crashes with
     // UV_HANDLE_CLOSING the way a bare process.exit() did (A2).
     this.exitFn = opts.exitFn ?? exitCleanly;
-    this.timeoutMs = opts.timeoutMs ?? 10_000;
+    this.timeoutMs = opts.timeoutMs ?? SHUTDOWN_TIMEOUT_MS;
   }
 
   /** Register a cleanup callback. Returns an unregister function. */

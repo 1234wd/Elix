@@ -48,6 +48,15 @@ export interface RetrievalOptions {
   recencyHalfLifeHours?: number;
   /** Restrict to one player, or null for everyone. */
   player?: string | null;
+  /**
+   * A4: episode ids to leave out of the candidate set.
+   *
+   * Elix asks "what's my favourite block", that exact line is recorded, and
+   * retrieval then hands his own question back to him inside the memory block.
+   * Excluding the ids written this turn makes that impossible regardless of
+   * the order the record and the read happen in.
+   */
+  excludeEpisodeIds?: readonly number[];
 }
 
 interface Candidate {
@@ -106,6 +115,8 @@ export class Memory {
     const now = opts.now ?? Date.now();
     const affinity = opts.affinity ?? 0.2;
     const halfLife = opts.recencyHalfLifeHours ?? 72;
+    // A4: this turn's own episodes must never come back as "earlier moments".
+    const excluded = new Set(opts.excludeEpisodeIds ?? []);
 
     // FTS5 is the floor: it works with no vectors, no network, no credit.
     const ftsRows = this.store.raw()
@@ -121,6 +132,7 @@ export class Memory {
     const byId = new Map<number, Candidate>();
     for (const row of ftsRows) {
       const episode = toEpisode(row);
+      if (excluded.has(episode.id)) continue;
       if (opts.player && episode.player !== opts.player) continue;
       byId.set(episode.id, { episode, bm25: Number(row.score), distance: null });
     }
@@ -143,6 +155,7 @@ export class Memory {
       for (const hit of knn) {
         usedVector = true;
         const id = Number(hit.rowid);
+        if (excluded.has(id)) continue;
         const existing = byId.get(id);
         if (existing) {
           existing.distance = hit.distance;

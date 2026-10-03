@@ -198,6 +198,26 @@ export class BrainRouter {
     return state;
   }
 
+  /**
+   * A3: is this provider worth spending a request on right now?
+   *
+   * The memory backfill and the query embedder both live outside the router, so
+   * they need to know whether HF is cooling down before they call it. Without
+   * this they spend a request every two minutes against a provider that is
+   * answering 429, which is how a backoff turns into a burn.
+   *
+   * An unknown provider counts as usable; only a known-disabled one is skipped.
+   */
+  isProviderUsable(provider: string, now = Date.now()): boolean {
+    const disabled = this.disabledUntil.get(provider as ProviderName);
+    if (disabled !== undefined && disabled > now) return false;
+    const cooldowns = this.safeRead<ReturnType<BrainStore["activeCooldowns"]>>(
+      [],
+      () => this.opts.store.activeCooldowns(now),
+    );
+    return !cooldowns.some((row) => row.provider === provider && row.until > now);
+  }
+
   // -- model discovery (B2) ------------------------------------------------
 
   /**

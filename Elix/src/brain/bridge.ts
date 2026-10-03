@@ -34,13 +34,33 @@ export interface MemoryHook {
     player?: string | null;
     kind?: string;
     meta?: string | null;
-  }): void;
-  /** The memory block for a prompt, quoted as data. Must never throw. */
-  context(player: string, query: string): string;
+  }): number | null;
+  /**
+   * The memory block for a prompt, quoted as data. Must never throw.
+   *
+   * A3: may be async, because it embeds the question first. The bridge awaits it
+   * on a path that is already awaiting the router, so no extra round trip is
+   * added to a reply — and a `string` return still works for tests.
+   */
+  context(player: string, query: string): string | Promise<string>;
   /** A stored preference, e.g. "block" -> "cherry planks". */
   preference(player: string, kind: string): string | null;
   /** Capture a preference from the player's own words. */
   capturePreference(player: string, text: string): string | null;
+}
+
+/**
+ * A6: the ambient line store.
+ *
+ * Declared structurally for the same reason as MemoryHook — src/brain must not
+ * import src/memory. Only the two methods the bridge actually uses.
+ */
+export interface AmbientRecorder {
+  record(
+    player: string | null,
+    text: string,
+    opts?: { kind?: string; ignoreCaps?: boolean },
+  ): number | null;
 }
 
 export interface ChatBridgeOptions {
@@ -50,6 +70,8 @@ export interface ChatBridgeOptions {
   personaLite?: string;
   /** D7: memory. Optional, so a bot with no database still talks. */
   memory?: MemoryHook;
+  /** A6: unaddressed lines go here, with the duplicate window and rate caps. */
+  recorder?: AmbientRecorder;
   /** Stop after this many replies — used by tests. */
   maxReplies?: number;
   /**
@@ -114,6 +136,16 @@ export class ChatBridge {
   }
 
   /**
+   * A6: attach the ambient recorder.
+   *
+   * Like the memory hook it is injected after construction, so src/brain never
+   * imports src/memory.
+   */
+  setRecorder(recorder: AmbientRecorder): void {
+    this.opts.recorder = recorder;
+  }
+
+  /**
    * Handle one inbound chat line. Returns why it did or did not reply, so the
    * decision is observable in tests and in logs.
    */
@@ -124,7 +156,30 @@ export class ChatBridge {
     if (this.opts.maxReplies !== undefined && this.replies >= this.opts.maxReplies) {
       return { replied: false, reason: "max-replies" };
     }
-    if (!isAddressedToElix(message, this.opts.username)) {
+
+    const addressed = isAddressedToElix(message, this.opts.username);
+
+    // A4: RETRIEVE FIRST, record second.
+    //
+    // The order was record-then-retrieve, so a player asking "what's my favourite
+    // block" had that exact question indexed and handed straight back inside the
+    // <remembered> block — Elix citing himself as evidence. Retrieval now happens
+    // before the write, and excludeEpisodeIds covers the race besides.
+    const memoryBlock = addressed ? await this.memoryContext(sender, message) : "";
+
+    // A6: record BEFORE deciding whether to answer.
+    //
+    // "Never forgets" used to mean only the lines Elix replied to. An unaddressed
+    // line is still something that happened, and it is the majority of a public
+    // server's chat. Kind is `ambient` so the scorer and the rate caps treat it as
+    // the low-value overheard line it is.
+    if (addressed) {
+      this.recordSilently(message, "player", sender, "chat");
+    } else {
+      this.recordAmbient(message, sender);
+    }
+
+    if (!addressed) {
       return { replied: false, reason: "not-addressed" };
     }
 
@@ -136,6 +191,8 @@ export class ChatBridge {
       const line = this.pick(BLOCKED_LINES, this.blockedRecent);
       this.opts.log?.warn({ sender, rule: safety.reason }, "blocked suspected prompt injection");
       this.replies += 1;
+      // A6: the scripted deflection is an episode too. Elix remembers deflecting.
+      this.recordSilently(line, "elix", sender, "chat");
       sayQueue?.say(line, false);
       return { replied: true, reason: "blocked-injection", text: line, usedProvider: "builtin" };
     }
@@ -145,11 +202,6 @@ export class ChatBridge {
     if (superseded) superseded.controller.abort();
     const controller = new AbortController();
     this.inFlight.set(sender, { message, controller });
-
-    // D7: remember what the player said, and pull in what we already know.
-    // Both are wrapped because a reply must never fail because of the database.
-    this.recordSilently(message, "player", sender);
-    const memoryBlock = this.memoryContext(sender, message);
 
     try {
       const result = await this.opts.router.complete({
@@ -191,6 +243,7 @@ export class ChatBridge {
         const line = this.pick(DEFLECTION_LINES, this.deflectRecent);
         this.opts.log?.error({ sender, rule: leak.rule }, "reply blocked by leak filter");
         this.replies += 1;
+        this.recordSilently(line, "elix", sender, "chat");
         sayQueue?.say(line, false);
         return { replied: true, reason: "blocked-leak", text: line, usedProvider: "builtin" };
       }
@@ -199,9 +252,9 @@ export class ChatBridge {
       // check, so a leak is detected in the FULL text, not the trimmed one.
       const text = trimChatReply(raw, this.opts.maxReplyChars ?? 200);
 
-      // D7: Elix's own line is an episode too, so he remembers what he said.
+      // D7/A6: Elix's own line is an episode too, so he remembers what he said.
       // Recorded AFTER the leak filter, so a deflected line is never stored.
-      this.recordSilently(text, "elix", sender);
+      this.recordSilently(text, "elix", sender, "chat");
 
       this.replies += 1;
       sayQueue?.say(text, false);
@@ -229,13 +282,14 @@ export class ChatBridge {
     text: string,
     speaker: "player" | "elix",
     player: string,
+    kind = "chat",
   ): void {
     if (!this.opts.memory) return;
     try {
-      this.opts.memory.record({ text, speaker, player, kind: "chat" });
-      if (speaker === "player") {
-        // D7: "my favourite block is X" is captured directly, so it works before
-        // any consolidation has run and survives a restart.
+      this.opts.memory.record({ text, speaker, player, kind });
+      if (speaker === "player" && kind === "chat") {
+        // D7/A5: "my favourite block is X" is captured directly, so it works
+        // before any consolidation has run and survives a restart.
         this.opts.memory.capturePreference(player, text);
       }
     } catch (err) {
@@ -243,11 +297,45 @@ export class ChatBridge {
     }
   }
 
+  /**
+   * A6: a line Elix heard but was not part of.
+   *
+   * Routed through the recorder so the duplicate window and the ambient rate caps
+   * apply. When no recorder is wired the line is simply not stored, which is the
+   * old behaviour rather than an error.
+   */
+  private recordAmbient(text: string, player: string): void {
+    try {
+      this.opts.recorder?.record(player, text, { kind: "ambient" });
+    } catch (err) {
+      this.opts.log?.debug({ err: (err as Error).message }, "ambient memory write failed");
+    }
+  }
+
+  /**
+   * Record one of Elix's own SCRIPTED lines (the greeting, a deflection).
+   *
+   * A scripted greeting is something he said, so it belongs in his history just
+   * as much as an LLM reply does.
+   */
+  recordScripted(text: string, player: string | null): void {
+    if (player) this.recordSilently(text, "elix", player, "chat");
+    else {
+      try {
+        this.opts.memory?.record({ text, speaker: "elix", player: null, kind: "chat" });
+      } catch {
+        /* a greeting is never worth an error */
+      }
+    }
+  }
+
   /** The memory block for this reply, or "" when memory is unavailable. */
-  private memoryContext(player: string, query: string): string {
+  private async memoryContext(player: string, query: string): Promise<string> {
     if (!this.opts.memory) return "";
     try {
-      return this.opts.memory.context(player, query);
+      // A3: the hook may embed the query. It is already bounded at 1.5 s and
+      // returns no vector on timeout, so awaiting it cannot stall a reply.
+      return await this.opts.memory.context(player, query);
     } catch (err) {
       this.opts.log?.debug({ err: (err as Error).message }, "memory read failed");
       return "";

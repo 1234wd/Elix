@@ -21,6 +21,9 @@ const KIND_SCORE: Record<EpisodeKind, number> = {
   chat: 4,
   emotion: 4,
   move: 2,
+  // A6: a line Elix overheard. It is the majority of a public server's chat and
+  // must not outrank a direct conversation just for being numerous.
+  ambient: 2,
 };
 
 /** A first meeting with a player is a `chat` episode, but it is not forgettable. */

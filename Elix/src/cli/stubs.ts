@@ -2,7 +2,7 @@ import type { Command } from "commander";
 import { join } from "node:path";
 import type { ElixConfig } from "../core/config.js";
 import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config.js";
-import { runBot } from "../connection/bot.js";
+import { currentBot, runBot } from "../connection/bot.js";
 import { Lifecycle } from "../core/lifecycle.js";
 import { exitCleanly } from "../core/exit.js";
 import { bus } from "../core/events.js";
@@ -11,31 +11,53 @@ import { ChatBridge, type MemoryHook } from "../brain/bridge.js";
 import { MemoryStore, defaultMemoryPath } from "../memory/store.js";
 import { MemoryEngine } from "../memory/engine.js";
 import { HuggingFaceProvider } from "../brain/hf.js";
-import { createBackup } from "../memory/backup.js";
-import { consolidate, SHUTDOWN_CALL_CAP } from "../memory/consolidation.js";
+import { WorldRecorder } from "../memory/recorder.js";
+import { QueryEmbedder } from "../memory/queryEmbed.js";
+import { NightlyScheduler } from "../memory/scheduler.js";
+import { runMemoryShutdown } from "../memory/shutdown.js";
 import type { Logger } from "../core/logger.js";
+
+/** The one embedding model. Fixed forever: dimensions cannot be mixed. */
+const EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5";
 
 /** Where backups live, alongside the database. */
 function backupDir(projectRoot: string): string {
   return join(projectRoot, "data", "backups");
 }
 
-function startOfDay(): number {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
+/**
+ * A1: is there any provider key at all?
+ *
+ * Consolidation is a model call. With no key there is nothing to call, and
+ * attempting it wastes the shutdown budget before discovering the model
+ * resolution failed.
+ */
+function hasModelKey(): boolean {
+  return Boolean(process.env["GROQ_API_KEY"]?.trim() || process.env["HF_TOKEN"]?.trim());
 }
 
 /**
- * Open the memory store and wrap it as the bridge's hook.
+ * Open the memory store and wire it into the bridge.
  *
  * Returns null when the database cannot be opened, because a bot that cannot
  * remember is still a bot that can talk (vision rule 3, "never silent").
+ *
+ * A3: this is where the query embedder is created. `context` used to be handed
+ * `null` for the query vector, so cosine was always 0 and live retrieval was
+ * FTS-only while HF credit was spent embedding every episode — the vectors were
+ * paid for and never read.
  */
 function openMemory(
   brain: BrainHandle | undefined,
   log: Logger,
-): { store: MemoryStore; engine: MemoryEngine; hook: MemoryHook; storePath: string } | null {
+): {
+  store: MemoryStore;
+  engine: MemoryEngine;
+  hook: MemoryHook;
+  recorder: WorldRecorder;
+  queryEmbedder: QueryEmbedder;
+  storePath: string;
+} | null {
   const storePath = defaultMemoryPath(PROJECT_ROOT);
   try {
     const store = new MemoryStore({ path: storePath });
@@ -44,27 +66,45 @@ function openMemory(
       log.info({ error: vec.error }, "vector search unavailable — FTS5 keyword search only");
     }
     const hfKey = process.env["HF_TOKEN"]?.trim();
+    const provider = hfKey ? new HuggingFaceProvider({ apiKey: hfKey }) : null;
+    // A cooldown is not "no key": skip the request, keep the memory.
+    const hfAvailable = (): boolean => {
+      if (!provider) return false;
+      return brain?.router?.isProviderUsable?.("hf") ?? true;
+    };
     const engine = new MemoryEngine({
       store,
-      embeddingProvider: hfKey ? new HuggingFaceProvider({ apiKey: hfKey }) : null,
-      embeddingModel: "BAAI/bge-small-en-v1.5",
+      embeddingProvider: provider,
+      embeddingModel: EMBEDDING_MODEL,
+      ...(provider ? { embedAvailable: hfAvailable } : {}),
     });
+    const queryEmbedder = new QueryEmbedder({
+      provider,
+      model: EMBEDDING_MODEL,
+      isAvailable: hfAvailable,
+      onError: (m) => log.debug({ err: m }, "query embedding failed — using FTS5"),
+    });
+    const recorder = new WorldRecorder({ store, log, selfName: "Elix" });
+
     const hook: MemoryHook = {
-      record: (input) => {
+      record: (input) =>
         engine.record({
           text: input.text,
           speaker: input.speaker,
           player: input.player ?? null,
           kind: (input.kind as never) ?? "chat",
           meta: input.meta ?? null,
-        });
+        }).id,
+      // A3: embed the question first, on a 1.5 s budget. A null vector is normal
+      // and simply means the search falls back to keywords.
+      context: async (player, query) => {
+        const vector = await queryEmbedder.embed(query);
+        return engine.context(player, query, vector);
       },
-      context: (player, query) => engine.context(player, query, null),
       preference: (player, kind) => engine.preference(player, kind),
       capturePreference: (player, text) => engine.capturePreference(player, text),
     };
-    void brain;
-    return { store, engine, hook, storePath };
+    return { store, engine, hook, recorder, queryEmbedder, storePath };
   } catch (err) {
     log.warn({ err: (err as Error).message }, "memory unavailable — Elix will not remember");
     return null;
@@ -218,40 +258,47 @@ export function registerStubs(program: Command): void {
       const memory = openMemory(brain, log);
       if (memory) {
         chatBridge?.setMemory(memory.hook);
+        chatBridge?.setRecorder(memory.recorder);
+        // A6: joins, leaves, deaths and kicks are recorded from the bus.
+        memory.recorder.attach();
+
+        // A2: the nightly sleep, the nightly backup and the periodic embedding
+        // drain. Before this, all three only ran at startup and on shutdown, so
+        // "nightly" was documentation with no code behind it.
+        const scheduler = new NightlyScheduler({
+          store: memory.store,
+          engine: memory.engine,
+          router: brain?.router ?? null,
+          storePath: memory.storePath,
+          backupDir: backupDir(PROJECT_ROOT),
+          hasModel: hasModelKey(),
+          log,
+          // mineflayer's in-game clock. 0 when unknown, which simply never
+          // triggers the night.
+          timeOfDay: () => currentBot()?.time?.timeOfDay ?? 0,
+        });
+        scheduler.start();
+
+        // A1: ONE cleanup that does the whole shutdown in the right order, with
+        // a budget on each step. Registered before runBot's cleanup so it runs
+        // AFTER the goodbye, and it closes the store itself so nothing races it.
         lifecycle.onCleanup(async () => {
-          // Cleanup order is REVERSED. The brain close was registered first, so
-          // it runs last; this runs before it, with the database still open.
-          const backup = createBackup({
-            dbPath: memory.storePath,
+          scheduler.stop();
+          memory.recorder.detachAll();
+          await runMemoryShutdown({
+            store: memory.store,
+            engine: memory.engine,
+            storePath: memory.storePath,
             backupDir: backupDir(PROJECT_ROOT),
+            router: brain?.router ?? null,
+            hasModel: hasModelKey(),
+            log,
+            // A1: the user can see WHY the process is still running.
+            onProgress: (line) => console.log(line),
           });
-          log.info(
-            { path: backup.path, bytes: backup.bytes, error: backup.error },
-            "shutdown backup written",
-          );
-          // Embed whatever is outstanding, best effort, bounded.
-          const backfill = await memory.engine.embedder.drain(2);
-          log.info(backfill, "embedding backfill");
-          memory.store.close();
         });
-        // Run consolidation on the way out, with its own single-call budget.
-        lifecycle.onCleanup(async () => {
-          try {
-            const result = await consolidate({
-              store: memory.store,
-              router: brain?.router as never,
-              since: startOfDay(),
-              callCap: SHUTDOWN_CALL_CAP,
-            });
-            log.info(
-              { status: result.status, facts: result.factsMade, calls: result.calls },
-              "shutdown consolidation",
-            );
-          } catch (err) {
-            log.warn({ err: (err as Error).message }, "shutdown consolidation failed");
-          }
-        });
-        // Background embedding, so a busy chat never waits on a provider.
+
+        // Background embedding at startup, so a busy chat never waits on a provider.
         void memory.engine.embedder.drain(2).then((r) => {
           if (r.embedded > 0) log.info(r, "embedded new memories");
         });

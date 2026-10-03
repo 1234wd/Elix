@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -81,6 +81,64 @@ describe("A9 — the built CLI works from any folder", () => {
   });
 });
 
+/**
+ * Run the built CLI with a `.env` at PROJECT_ROOT, then put the project back
+ * exactly as it was.
+ *
+ * This used to write the fake key over `PROJECT_ROOT/.env` and then delete the
+ * file. `created` was set to true unconditionally, so the "cleanup" ran even
+ * when a real `.env` already existed — which means running the test suite
+ * DESTROYED the developer's own keys. It did, once, to the machine this was
+ * written on.
+ *
+ * Two independent guarantees now:
+ *  1. the existing file is copied aside first, and restored byte-for-byte
+ *  2. `.env` is only ever restored, never deleted, and a still-present original
+ *     is verified after the test
+ */
+async function withProjectEnv(contents: string): Promise<void> {
+  const envPath = join(PROJECT_ROOT, ".env");
+  const backupPath = join(PROJECT_ROOT, ".env.test-backup");
+  const hadOriginal = existsSync(envPath);
+  let original: Buffer | null = null;
+  let restoreFailed: string | null = null;
+  if (hadOriginal) {
+    original = readFileSync(envPath);
+    writeFileSync(backupPath, original);
+  }
+  try {
+    writeFileSync(envPath, contents, "utf8");
+    await new Promise((r) => setTimeout(r, 0));
+  } finally {
+    if (hadOriginal && original) {
+      // Restore, never delete: if the original is unreadable we would be
+      // destroying the user's keys, so keep the backup on disk in that case.
+      try {
+        if (readFileSync(envPath).equals(original)) {
+          rmSync(envPath);
+          renameSync(backupPath, envPath);
+        } else {
+          writeFileSync(envPath, original);
+          rmSync(backupPath, { force: true });
+        }
+      } catch (err) {
+        // Leave .env.test-backup in place and shout about it. NOT a `throw` in
+        // a finally: a throw there replaces whatever error the test was already
+        // reporting, which is how a real failure gets hidden.
+        console.error(
+          `[TEST] could not restore ${envPath} (${(err as Error).message}); ` +
+            `the original is at ${backupPath}`,
+        );
+        restoreFailed = `${envPath} was not restored; see ${backupPath}`;
+      }
+    } else {
+      rmSync(envPath, { force: true });
+    }
+  }
+  // Asserted AFTER the finally, so the original error is what fails first.
+  if (restoreFailed) throw new Error(restoreFailed);
+}
+
 describe("A5 — .env is loaded from the project root, not the cwd", () => {
   let tmp: string;
 
@@ -93,34 +151,57 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
   });
 
   it("finds a key in a .env placed at PROJECT_ROOT even when run elsewhere", async () => {
+    // Never touches the developer's real .env: withProjectEnv copies it aside
+    // and puts it back byte-for-byte.
+    await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n");
+    const { stdout } = await runCli(["doctor", "--json"], tmp);
+    const results = JSON.parse(stdout) as Array<{ name: string; status: string; note: string }>;
+    const keys = results.find((r) => r.name === "api-keys");
+    // The fake key is present in the environment as far as doctor is concerned;
+    // the live call then correctly reports FAIL.
+    expect(keys?.status).toBe("ok");
+    expect(keys?.note).toContain("Groq");
+  });
+
+  it("leaves an existing PROJECT_ROOT .env byte-for-byte intact", async () => {
+    // The regression test for the destructive cleanup this replaced: running
+    // the suite used to overwrite and then DELETE a real .env, which destroyed
+    // the keys on the machine it was written on.
     const envPath = join(PROJECT_ROOT, ".env");
-    let created = false;
-    try {
-      await writeFile(envPath, "GROQ_API_KEY=elix_cli_test_key\n", "utf8");
-      created = true;
-      const { stdout } = await runCli(["doctor", "--json"], tmp);
-      const results = JSON.parse(stdout) as Array<{ name: string; status: string; note: string }>;
-      const keys = results.find((r) => r.name === "api-keys");
-      // The fake key is present in the environment as far as doctor is
-      // concerned; the live call then correctly reports FAIL.
-      expect(keys?.status).toBe("ok");
-      expect(keys?.note).toContain("Groq");
-    } finally {
-      if (created) await rm(envPath, { force: true });
+    if (!existsSync(envPath)) {
+      // Nothing to protect on a machine with no .env. Assert that explicitly
+      // rather than passing vacuously.
+      expect(existsSync(envPath)).toBe(false);
+      return;
     }
+    const before = readFileSync(envPath);
+    await withProjectEnv("GROQ_API_KEY=elix_cli_test_key\n");
+    expect(readFileSync(envPath).equals(before)).toBe(true);
+    // No backup left lying around either.
+    expect(existsSync(join(PROJECT_ROOT, ".env.test-backup"))).toBe(false);
   });
 
   it("does not pick up a .env from the current folder", async () => {
-    // A .env in cwd must NOT be read — the path is resolved from PROJECT_ROOT.
-    await writeFile(join(tmp, ".env"), "HF_TOKEN=cwd_key\n", "utf8");
+    // The intent is "a .env in cwd is IGNORED", not "no keys exist". The old
+    // assertion was `note` contains "no provider keys", which only held on a
+    // machine with no PROJECT_ROOT/.env — and stopped holding the moment real
+    // keys were present, for a reason that had nothing to do with cwd.
+    //
+    // So assert the thing that is actually true either way: the cwd key is never
+    // the key that is found.
+    const cwdKey = "cwd_only_key_9f3a2b1c8d";
+    await writeFile(join(tmp, ".env"), `HF_TOKEN=${cwdKey}\n`, "utf8");
     const { stdout } = await runCli(["doctor", "--json"], tmp);
+    expect(stdout, "the cwd key must never appear in doctor output").not.toContain(cwdKey);
     const results = JSON.parse(stdout) as Array<{ name: string; note: string; status: string }>;
     const keys = results.find((r) => r.name === "api-keys");
-    // The cwd key was ignored, so the note must report no usable key. Which of
-    // the two wordings it uses depends on whether PROJECT_ROOT/.env exists (A5
-    // distinguishes "no .env file" from "no keys in .env").
-    expect(keys?.note).toMatch(/no provider keys|no \.env file/);
-    expect(keys?.status).toBe("warn");
+    // Whatever the project root has, the cwd file changed nothing.
+    if (!existsSync(join(PROJECT_ROOT, ".env"))) {
+      expect(keys?.note).toMatch(/no provider keys|no \.env file/);
+      expect(keys?.status).toBe("warn");
+    } else {
+      expect(keys?.status).toBe("ok");
+    }
   });
 
   it("names the exact fix when .env is missing (A5)", async () => {

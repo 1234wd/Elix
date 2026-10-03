@@ -38,6 +38,12 @@ export interface EmbedderOptions {
   /** Above this many queued rows per pass, stop and let the next pass do more. */
   maxPerPass?: number;
   signal?: AbortSignal;
+  /**
+   * A1/A3: optional gate. Returning false means "do not spend a request right
+   * now" — used when the provider is in a rate-limit cooldown, so a backoff does
+   * not turn into a wasted call every two minutes.
+   */
+  isAvailable?: () => boolean;
 }
 
 export class Embedder {
@@ -53,6 +59,19 @@ export class Embedder {
   }
 
   /**
+   * Whether an embedding call could succeed right now.
+   *
+   * A1: the shutdown sequence checks this before spending its remaining budget
+   * on a drain that cannot make a single request. `isAvailable` lets the caller
+   * also report "provider is in a cooldown", which is a different thing from
+   * "no provider configured".
+   */
+  get canEmbed(): boolean {
+    if (!this.opts.provider) return false;
+    return this.opts.isAvailable ? this.opts.isAvailable() : true;
+  }
+
+  /**
    * Embed the next batch of un-embedded episodes.
    *
    * Never throws: a failed batch is a logged, retried-later condition, and the
@@ -60,8 +79,9 @@ export class Embedder {
    */
   async backfill(): Promise<BackfillResult> {
     const { store, provider, model } = this.opts;
-    if (!provider) {
-      // No HF key: retrieval is FTS5-only. Reported, not an error.
+    if (!provider || (this.opts.isAvailable && !this.opts.isAvailable())) {
+      // No HF key, or the provider is cooling down: retrieval is FTS5-only for
+      // now. Reported, not an error, and no request is spent.
       return { attempted: 0, embedded: 0, failed: 0, skipped: true };
     }
     if (this.running) {

@@ -22,6 +22,12 @@ export interface ElixEvents {
   }) => void;
   /** Any in-game chat message from another player (untrusted input). */
   "bot:chat": (msg: { username: string; text: string }) => void;
+  /** A6: another player entered the world. Drives `people.last_seen` and a first meeting. */
+  "bot:playerJoined": (msg: { username: string }) => void;
+  /** A6: another player left the world. */
+  "bot:playerLeft": (msg: { username: string }) => void;
+  /** A6: Elix died. A `death` episode is worth far more than a chat line. */
+  "bot:died": (info: { position?: { x: number; y: number; z: number }; dimension?: string }) => void;
   /** Server kicked us; the socket has not necessarily closed yet. */
   "bot:kicked": (info: { kind: DisconnectKind; text: string; translateKey?: string }) => void;
   /** Socket closed. `kind` is the classified reason; permanent ones don't retry. */
