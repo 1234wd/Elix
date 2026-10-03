@@ -79,6 +79,8 @@ export interface ConsolidationResult {
   diary: string | null;
   /** Set when the call cap was hit; the rest waits for the next night. */
   deferred: number;
+  /** A2: the highest episode id summarised, i.e. the new watermark. 0 if none. */
+  watermark: number;
   status: "ok" | "capped" | "invalid-json" | "no-episodes" | "no-model" | "error";
   error?: string;
 }
@@ -90,8 +92,20 @@ export interface ConsolidatorOptions {
   chunkSize?: number;
   /** Max calls, defaults to 5 (night) or 1 (shutdown). */
   callCap?: number;
-  /** Episodes newer than this are not yet consolidated. */
+  /**
+   * Episodes newer than this are not yet consolidated.
+   *
+   * A2: a SECOND lower bound. The real one is the watermark in `meta`, which
+   * records the highest episode id already summarised. `since` alone meant every
+   * run re-sent the same day's episodes: duplicate facts, repeated diary entries,
+   * and the same smart quota spent again.
+   */
   since: number;
+  /**
+   * A2: set false to ignore the watermark and re-consolidate from `since`. Only
+   * tests that deliberately re-run identical input need this.
+   */
+  useWatermark?: boolean;
   now?: number;
 }
 
@@ -107,7 +121,13 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
   const chunkSize = opts.chunkSize ?? CHUNK_SIZE;
   const callCap = opts.callCap ?? NIGHT_CALL_CAP;
 
-  const episodes = store.episodesSince(opts.since, 400);
+  // A2: only what has never been consolidated. Both bounds apply.
+  const useWatermark = opts.useWatermark ?? true;
+  const watermark = useWatermark ? store.consolidatedWatermark() : 0;
+  const candidates = useWatermark
+    ? store.episodesAfterId(watermark, 400)
+    : store.episodesSince(opts.since, 400);
+  const episodes = candidates.filter((e) => e.ts >= opts.since);
   if (episodes.length === 0) {
     return {
       ok: true,
@@ -117,6 +137,7 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
       factsMade: 0,
       diary: null,
       deferred: 0,
+      watermark,
       status: "no-episodes",
     };
   }
@@ -164,6 +185,9 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
       factsMade: 0,
       diary: null,
       deferred,
+      // A2: a failed run must NOT advance the watermark, or those episodes are
+      // never summarised again.
+      watermark,
       status: "invalid-json",
       error: "model did not return valid JSON after one retry",
     };
@@ -196,6 +220,7 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
         factsMade: 0,
         diary: null,
         deferred,
+        watermark,
         status: "invalid-json",
         error: "merge did not return valid JSON after one retry",
       };
@@ -241,6 +266,17 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
   const diary = merged?.diary?.trim() || null;
   if (diary) store.addSelf("diary", diary, now);
 
+  // A2: advance the watermark ONLY now, with every write committed, and only to
+  // the last episode that was actually SUMMARISED. A capped run stops here: the
+  // deferred chunks are still above the watermark, so the next night picks them
+  // up instead of them being silently skipped.
+  const summarisedIds: number[] = [];
+  for (let c = 0; c < usable.length; c++) {
+    for (const e of chunks[c]!) summarisedIds.push(e.id);
+  }
+  const newWatermark = summarisedIds.length > 0 ? Math.max(...summarisedIds) : watermark;
+  if (newWatermark > watermark) store.setConsolidatedWatermark(newWatermark);
+
   const status: ConsolidationResult["status"] = deferred > 0 ? "capped" : "ok";
   store.logConsolidation({
     ts: now,
@@ -258,6 +294,7 @@ export async function consolidate(opts: ConsolidatorOptions): Promise<Consolidat
     factsMade,
     diary,
     deferred,
+    watermark: newWatermark,
     status,
   };
 }

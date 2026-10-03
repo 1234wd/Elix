@@ -219,6 +219,42 @@ describe("A5 — .env is loaded from the project root, not the cwd", () => {
       expect(keys?.note).toContain("copy .env.example .env");
     }
   });
+
+  /**
+   * A4: a key-shaped value planted in .env must never reach the CLI's output.
+   *
+   * A key was once recovered from a vitest log, because a test asserted on the
+   * CONTENTS of .env and the failing assertion printed the value. This is the
+   * runtime half of that fix: it puts a realistic-shaped secret into .env, runs
+   * every command that reports on keys, and proves not one character of it comes
+   * back out on stdout or stderr.
+   *
+   * The planted value is assembled from fragments so this test file does not
+   * itself contain a match for the scanner in secrets.test.ts.
+   */
+  it("A4 — never prints a key-shaped value loaded from .env", async () => {
+    const planted = `${["gs", "k_"].join("")}AQ${"z7R4mX2pL9wK6nT3vB8yF".repeat(3)}`;
+    // Same shape as a real key, so any code path that echoes the value is caught
+    // by the same regex a real leak would trip.
+    expect(planted.length).toBeGreaterThan(40);
+
+    const { stdout, stderr } = await withProjectEnv(`GROQ_API_KEY=${planted}\n`, async () => {
+      // doctor is the command that reports on keys, and it has a --json form.
+      const a = await runCli(["doctor", "--json"], tmp);
+      const b = await runCli(["doctor"], tmp);
+      const c = await runCli(["status"], tmp);
+      return { ...a, stderr: a.stderr + b.stdout + b.stderr + c.stdout + c.stderr };
+    });
+
+    // The assertion below compares PRESENCE, never the value. That is the rule
+    // this whole file now follows, and it is the rule that stops a failure here
+    // from writing the secret into vitest's output directory.
+    expect(stdout.includes(planted), "stdout must not echo a key").toBe(false);
+    expect(stderr.includes(planted), "stderr must not echo a key").toBe(false);
+    // A partial prefix is just as dangerous in a log, so check the head too.
+    expect(stdout.includes(planted.slice(0, 20)), "stdout must not echo a key prefix").toBe(false);
+    expect(stderr.includes(planted.slice(0, 20)), "stderr must not echo a key prefix").toBe(false);
+  });
 });
 
 describe("A10 — CLI flags are accepted and wired through", () => {

@@ -356,7 +356,7 @@ describe("A2 — the nightly scheduler actually runs", () => {
     expect(chats()).toBeGreaterThan(0);
   });
 
-  it("runs at most once per in-game day", async () => {
+  it("runs at most once per in-game night, and again the NEXT night", async () => {
     const store = tempStore();
     store.addEpisode({ ts: clock, kind: "chat", player: "Ali", text: "we mined iron" });
     const { scheduler, chats } = sched(store);
@@ -369,10 +369,17 @@ describe("A2 — the nightly scheduler actually runs", () => {
       expect(r.consolidated).toBe(false);
     }
     expect(chats()).toBe(after);
-    // The next in-game day does sleep.
-    ticks += 2400 * 2;
-    const nextDay = await scheduler.tick();
-    expect(nextDay.consolidated).toBe(true);
+
+    // The old test advanced the clock by 4800 ticks and expected a sleep, which
+    // landed on 17900 — still night in real Minecraft. It passed BECAUSE of the
+    // bug: Math.floor(17900 / 2400) is 7, and 7 read as a new "day". The night
+    // runs 13000..23000, so the next sleep needs a real dawn in between.
+    ticks = 1000; // dawn: no sleep, and the night re-arms
+    expect((await scheduler.tick()).consolidated).toBe(false);
+
+    ticks = NIGHT_TICKS + 100; // the next night
+    const nextNight = await scheduler.tick();
+    expect(nextNight.consolidated).toBe(true);
   });
 
   it("sleeps after 60 real minutes even without a clock", async () => {

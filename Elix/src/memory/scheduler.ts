@@ -25,6 +25,69 @@ import type { BrainRouter } from "../brain/router.js";
 
 /** In-game tick count at which it is night. Vanilla: 13000. */
 export const NIGHT_TICKS = 13_000;
+
+/**
+ * A1: decides WHEN night falls, exactly once per night.
+ *
+ * THE BUG: the "day" was computed as `Math.floor(timeOfDay / 2400)`, but
+ * `timeOfDay` is 0..23999 and WRAPS, so it reads 5 during the early night, 6
+ * later, 7 later still. Every change looked like a new day, and the sleep fired
+ * FIVE times in one night: up to 25 smart calls and five backups, which under a
+ * 14-backup retention is under three days of history.
+ *
+ * mineflayer 4.39 does expose an absolute counter alongside it —
+ * `bot.time.day = Math.floor(bot.time.time / 24000)`, confirmed in
+ * `lib/plugins/time.js` — but it is missing on older servers and useless while
+ * the clock is unknown, so this uses EDGE DETECTION on `timeOfDay` and treats
+ * the absolute day as a corroborating signal rather than the primary one.
+ *
+ * Edge detection alone would never fire for a bot that JOINS at night, so a
+ * first observation already in darkness counts as an edge: that is what Elix's
+ * first tick after joining genuinely means.
+ */
+export class NightWatch {
+  private prev: number | null = null;
+  /** True once a sleep has happened for the night we are currently in. */
+  private sleptThisNight = false;
+  /** Has any daylight been seen since construction? */
+  private sawDay = false;
+
+  /**
+   * Feed the current `timeOfDay`. Returns true exactly once per night, on the
+   * tick where night begins.
+   */
+  update(timeOfDay: number): boolean {
+    const ticks = Number.isFinite(timeOfDay) ? timeOfDay : 0;
+    if (ticks < NIGHT_TICKS) {
+      // Daylight: the next night is allowed to fire again.
+      this.sawDay = true;
+      this.sleptThisNight = false;
+      this.prev = ticks;
+      return false;
+    }
+    const edge = this.prev === null ? !this.sawDay : this.prev < NIGHT_TICKS;
+    this.prev = ticks;
+    if (this.sleptThisNight || !edge) return false;
+    this.sleptThisNight = true;
+    return true;
+  }
+
+  /** Has the sleep already run for tonight? Blocks the real-time fallback. */
+  get alreadySlept(): boolean {
+    return this.sleptThisNight;
+  }
+
+  /** True when the clock has never been readable, so the timer must govern. */
+  get clockUnknown(): boolean {
+    return this.prev === null;
+  }
+
+  reset(): void {
+    this.prev = null;
+    this.sleptThisNight = false;
+    this.sawDay = false;
+  }
+}
 /** Fallback real-time interval, so a server with no time updates still sleeps. */
 export const REAL_MINUTES_MS = 60 * 60_000;
 /** How often the embedding drain runs. */
@@ -81,10 +144,11 @@ export class NightlyScheduler {
    * and "after 60 minutes" never meant anything.
    */
   private readonly startedAt: number;
+  /** A1: exactly one sleep per night. */
+  private readonly night = new NightWatch();
   private lastSleepAt: number | null = null;
   /** Seeded at construction so the first drain waits out the interval. */
   private lastEmbedAt: number | null;
-  private lastNightTick = -1;
   private running = false;
   private stopped = false;
 
@@ -139,14 +203,19 @@ export class NightlyScheduler {
    * clock, so crossing midnight twice in one session sleeps twice — which is
    * correct — while twenty wake-ups in one night sleep once.
    */
+  /**
+   * A1: exactly one sleep per in-game night, and the 60-minute fallback never
+   * adds a second one inside that same night.
+   */
   private shouldSleep(now: number): boolean {
-    const ticks = this.opts.timeOfDay?.() ?? 0;
+    // Consumes the edge if there is one, which is what makes it once-only.
+    if (this.night.update(this.opts.timeOfDay?.() ?? 0)) return true;
+    // The night is done. The real-time fallback must not fire again until
+    // daylight re-arms it, or one night would still get two sleeps.
+    if (this.night.alreadySlept) return false;
     // From the session start, so a fresh boot does not sleep on its first tick.
     const realElapsed = now - (this.lastSleepAt ?? this.startedAt);
-    if (realElapsed >= (this.opts.realIntervalMs ?? REAL_MINUTES_MS)) return true;
-    if (ticks < NIGHT_TICKS) return false;
-    const day = Math.floor(ticks / 2400);
-    return day !== this.lastNightTick;
+    return realElapsed >= (this.opts.realIntervalMs ?? REAL_MINUTES_MS);
   }
 
   private shouldEmbed(now: number): boolean {
@@ -176,8 +245,6 @@ export class NightlyScheduler {
       // -- sleep + backup ---------------------------------------------------
       if (this.shouldSleep(now)) {
         this.lastSleepAt = now;
-        const ticks = this.opts.timeOfDay?.() ?? 0;
-        if (ticks >= NIGHT_TICKS) this.lastNightTick = Math.floor(ticks / 2400);
 
         if (!this.opts.hasModel || !this.opts.router) {
           this.opts.log.info("sleep skipped — no provider key");
@@ -186,7 +253,9 @@ export class NightlyScheduler {
             const consolidated = await consolidate({
               store: this.opts.store,
               router: this.opts.router as BrainRouter,
-              since: now - (this.opts.realIntervalMs ?? REAL_MINUTES_MS) * 24,
+              // A2: the watermark is the real bound. A 24-hour window meant every
+              // night re-sent the same episodes.
+              since: 0,
               callCap: NIGHT_CALL_CAP,
               now,
             });

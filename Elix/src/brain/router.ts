@@ -43,6 +43,9 @@ import type { ModelRole, ModelsConfig, ProviderName } from "../core/config.js";
 export const CIRCUIT_FAILURES = 3;
 export const CIRCUIT_OPEN_MS = 60_000;
 
+/** A3: an availability probe is a network call, so it is cached briefly. */
+export const AVAILABILITY_TTL_MS = 10 * 60_000;
+
 /** Model discovery is cached for six hours (B2). */
 export const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 
@@ -115,6 +118,18 @@ export interface RouterOptions {
   idleChatterBudgetPerHour?: number;
   /** Turn the cache off in tests that assert a network call happened. */
   cacheEnabled?: boolean;
+  /**
+   * A3: per-model availability probes for models that do not live on the
+   * provider's /v1/chat/completions route.
+   *
+   * Keyed `provider/model`; the value is the probe. `BAAI/bge-small-en-v1.5` is the
+   * case that matters: HF's /v1/models does not list feature-extraction
+   * pipelines, so role resolution dropped the embeddings role to the scripted
+   * builtin even though the endpoint answered 200.
+   *
+   * The result is cached like the model list, because a probe is a network call.
+   */
+  availabilityChecks?: Record<string, () => Promise<boolean>>;
 }
 
 export class BrainRouter {
@@ -173,6 +188,43 @@ export class BrainRouter {
         }
       }
     }
+  }
+
+  /**
+   * A3: the most recent resolution per role.
+   *
+   * The CLI reads the `embeddings` resolution to learn which model the router
+   * actually accepts, instead of hard-coding one. Without this the role said
+   * `builtin` while the memory engine used HF, and the two disagreed.
+   */
+  private readonly resolved = new Map<ModelRole, RoleResolution>();
+
+  /** A3: `provider/model` -> the last probe result, with when it was taken. */
+  private readonly availability = new Map<string, { ok: boolean; at: number }>();
+
+  /**
+   * A3: ask the endpoint that will really be called whether this model works.
+   *
+   * A failed probe is remembered too, so a broken pipeline is not re-probed on
+   * every tick: the probe has a short TTL and a negative cache matching it.
+   */
+  private async probeAvailability(
+    key: string,
+    probe: () => Promise<boolean>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const now = Date.now();
+    const hit = this.availability.get(key);
+    if (hit && now - hit.at < AVAILABILITY_TTL_MS) return hit.ok;
+    void signal;
+    let ok = false;
+    try {
+      ok = await probe();
+    } catch {
+      ok = false;
+    }
+    this.availability.set(key, { ok, at: now });
+    return ok;
   }
 
   private isCooling(provider: string, model: string, now: number): CooldownInfo | null {
@@ -323,6 +375,26 @@ export class BrainRouter {
         skipped.push({ candidate, reason: "disabled-for-day" });
         continue;
       }
+      // A3: the `embeddings` role is not a CHAT model, so `/v1/models` cannot
+      // answer for it. Hugging Face's /v1/models lists chat/inference models and
+      // NOT the feature-extraction pipelines, so checking the id there rejected
+      // `BAAI/bge-small-en-v1.5` as "not-in-model-list" and silently fell through
+      // to the scripted builtin — while the memory engine used the very same
+      // model successfully. Two sources of truth that disagreed.
+      //
+      // So for a role whose endpoint is not /v1/chat/completions, availability is
+      // established by the endpoint that will actually be called.
+      const checkKey = `${entry.provider}/${entry.model}`;
+      const probe = this.opts.availabilityChecks?.[checkKey];
+      if (probe) {
+        const ok = await this.probeAvailability(checkKey, probe, signal);
+        if (!ok) {
+          skipped.push({ candidate, reason: "endpoint-unreachable" });
+          continue;
+        }
+        available.push(candidate);
+        continue;
+      }
       // Only accept ids the provider actually offers, when we know them.
       const models = await this.modelsFor(entry.provider, signal);
       if (models.length > 0 && !models.includes(entry.model)) {
@@ -332,7 +404,16 @@ export class BrainRouter {
       available.push(candidate);
     }
 
-    return { role, chosen: available[0] ?? null, available, skipped };
+    const resolution: RoleResolution = { role, chosen: available[0] ?? null, available, skipped };
+    this.resolved.set(role, resolution);
+    return resolution;
+  }
+
+  /**
+   * A3: the last resolution for a role, or null if it has not been resolved yet.
+   */
+  resolutionFor(role: ModelRole): RoleResolution | null {
+    return this.resolved.get(role) ?? null;
   }
 
   // -- the main path -------------------------------------------------------
@@ -904,6 +985,11 @@ function skipOutcome(skip: SkipReason): UsageOutcome {
     case "not-in-model-list":
     case "proactive-token-limit":
       return "fallback";
+    case "endpoint-unreachable":
+      // A3: the model's OWN endpoint did not answer. Recorded as an error so a
+      // permanently broken pipeline shows up in `elix usage` instead of looking
+      // like a model that was never tried.
+      return "endpoint-unreachable";
   }
 }
 

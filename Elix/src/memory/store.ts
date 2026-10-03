@@ -31,6 +31,9 @@ const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
 
 type Db = InstanceType<typeof DatabaseSync>;
 
+/** The meta key holding the consolidation watermark (A2). */
+const WATERMARK_KEY = "consolidated_episode_id";
+
 /** Who said it. Elix's own lines are episodes too, so he remembers what he said. */
 export type Speaker = "player" | "elix";
 
@@ -210,6 +213,14 @@ CREATE TABLE IF NOT EXISTS consolidation_log (
   facts_made INTEGER NOT NULL DEFAULT 0,
   diary      TEXT,
   status     TEXT NOT NULL DEFAULT 'ok'
+);
+
+-- A2: the highest episode id already sent to consolidation. Without it every
+-- run re-sent the same episodes: duplicate facts, repeated diary entries, and
+-- the same smart quota spent again. Advanced ONLY after validated writes.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 -- Keyword search. Always available, so a memory is never unreachable because an
@@ -434,6 +445,63 @@ export class MemoryStore {
     }
   }
 
+  // -- consolidation watermark (A2) ---------------------------------------
+
+  /**
+   * The highest episode id already consolidated.
+   *
+   * 0 when nothing has been. The nightly pass and the shutdown pass both read and
+   * write this, so a day is summarised once no matter how many times Elix is
+   * restarted, or how many nights pass.
+   */
+  consolidatedWatermark(): number {
+    const v = this.getMeta(WATERMARK_KEY);
+    const n = v === null ? 0 : Number.parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /**
+   * Advance the watermark.
+   *
+   * Called only after the facts and diary have committed, and only up to the
+   * last episode that was actually summarised — a capped run leaves the deferred
+   * episodes for the next night.
+   */
+  setConsolidatedWatermark(id: number): void {
+    if (id > this.consolidatedWatermark()) this.setMeta(WATERMARK_KEY, String(id));
+  }
+
+  getMeta(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row ? row.value : null;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(key, value);
+  }
+
+  /** Episodes strictly above the watermark, oldest first. */
+  episodesAfterId(id: number, limit = 400): Episode[] {
+    const rows = this.db
+      .prepare("SELECT * FROM episodes WHERE id > ? ORDER BY id ASC LIMIT ?")
+      .all(id, limit) as unknown as Record<string, unknown>[];
+    return rows.map(mapEpisode);
+  }
+
+  /** The largest episode id in the table, or 0. */
+  maxEpisodeId(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM episodes").get() as {
+      m: number;
+    };
+    return row.m;
+  }
+
   /** D2/D5: consolidation may adjust a score after the fact. */
   setImportance(id: number, importance: number): void {
     this.db
@@ -451,6 +519,32 @@ export class MemoryStore {
     confidence?: number;
     sourceEpisode?: number | null;
   }): number {
+    // A2: the SAME subject + predicate + object again is a CONFIRMATION, not a new
+    // fact. Without this every consolidation pass added another row, so a fact
+    // stated once became two, then five, then twenty.
+    //
+    // This has to run BEFORE the insert. Checking afterwards finds the row that
+    // was just written and leaves it behind, which is the very duplicate this is
+    // meant to prevent — the fact count still grew, only the returned id was old.
+    const same = this.db
+      .prepare(
+        `SELECT id, confidence FROM facts
+          WHERE subject = ? AND predicate = ? AND object = ?
+            AND superseded_by IS NULL AND valid_until IS NULL
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get(f.subject, f.predicate, f.object) as
+      | { id: number; confidence: number }
+      | undefined;
+    if (same) {
+      // Repeated evidence raises confidence, and can never lower it.
+      const bumped = Math.min(1, Math.max(same.confidence, f.confidence ?? 0) + 0.02);
+      this.db
+        .prepare("UPDATE facts SET confidence = ?, ts = ? WHERE id = ?")
+        .run(bumped, f.ts, same.id);
+      return same.id;
+    }
+
     const info = this.db
       .prepare(
         `INSERT INTO facts (ts, subject, predicate, object, confidence, source_episode)
@@ -458,6 +552,7 @@ export class MemoryStore {
       )
       .run(f.ts, f.subject, f.predicate, f.object, f.confidence ?? 0.5, f.sourceEpisode ?? null);
     const id = Number(info.lastInsertRowid);
+
     // D1: a changed fact KEEPS its history. The old row's text is never updated;
     // it is only linked forward to the new one.
     //

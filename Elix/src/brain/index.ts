@@ -24,6 +24,8 @@ export interface BuildBrainOptions {
   random?: () => number;
   fastMaxTokens?: number;
   smartMaxTokens?: number;
+  /** A3: availability probes for models off the /v1/chat route. */
+  availabilityChecks?: Record<string, () => Promise<boolean>>;
   /** A3: explicit overrides; otherwise taken from config.brain.timeoutsMs. */
   fastTimeoutMs?: number;
   smartTimeoutMs?: number;
@@ -70,6 +72,9 @@ export function buildBrain(opts: BuildBrainOptions): BrainHandle {
     // A3: brain.timeoutsMs was validated by the config schema and then never
     // read, so every call silently used the hard-coded defaults. Changing
     // timeoutsMs.fast in config/elix.yaml did nothing at all.
+    ...(opts.availabilityChecks
+      ? { availabilityChecks: opts.availabilityChecks }
+      : {}),
     fastTimeoutMs: opts.fastTimeoutMs ?? opts.config?.brain.timeoutsMs.fast,
     smartTimeoutMs: opts.smartTimeoutMs ?? opts.config?.brain.timeoutsMs.smart,
     idleChatterBudgetPerHour:

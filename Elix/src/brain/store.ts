@@ -70,6 +70,8 @@ export type UsageOutcome =
   | "network"
   | "fallback"
   | "circuit-open"
+  /** A3: a model role whose own endpoint was probed and did not answer. */
+  | "endpoint-unreachable"
   | "no-keys";
 
 export interface CooldownRow {

@@ -1,8 +1,13 @@
 /**
  * Part C / D7 — the automated in-game chat test.
  *
- *     pnpm e2e                  rows 1-6, plus the memory setup for row 7
+ *     pnpm e2e                  rows 1-6 and 8, plus the memory setup for row 7
  *     pnpm e2e --after-restart  row 7, after you have restarted Elix
+ *
+ * A6 — row 8 is the memory test that does NOT need a restart: the tester states
+ * one favourite block, then states a DIFFERENT one, then asks. The answer must
+ * be the second. Before the fix both stayed live, so retrieval returned two
+ * contradicting rows and Elix could answer with either.
  *
  * A second bot joins as ElixTester: offline mode, same server, the same vendored
  * 26.2 data. No login of any kind. It NEVER digs, places, attacks, moves, looks
@@ -49,6 +54,21 @@ const ROWS: Row[] = [
 const MEMORY_SETUP = "elix my favourite block is cherry planks";
 const MEMORY_QUESTION = "elix what's my favourite block?";
 const MEMORY_ANSWER = "cherry planks";
+
+/**
+ * A6: row 8. The first value must NOT survive the second.
+ *
+ * Row 7 proves a fact survives a restart. Row 8 proves a fact that CHANGES is
+ * replaced: state one favourite block, state a different one, then ask. The
+ * answer must be the new value and must not contain the old one — because two
+ * live rows for the same subject+predicate is exactly what made Elix contradict
+ * itself, whichever one retrieval happened to surface.
+ */
+const ROW8_FIRST = "elix my favourite block is diamond";
+const ROW8_SECOND = "elix my favourite block is mossy cobblestone";
+const ROW8_QUESTION = "elix what's my favourite block?";
+const ROW8_ANSWER = "mossy cobblestone";
+const ROW8_SUPERSEDED = "diamond";
 
 const TESTER = "ElixTester";
 const ELIX = "Elix";
@@ -249,6 +269,50 @@ async function runRows(t: Tester, afterRestart: boolean): Promise<Result[]> {
     replies: setupReplies,
   });
 
+  // ---- row 8 (A6): a changed preference replaces the old one --------------
+  //
+  // Three turns, in order, with the normal gap between them. The first value is
+  // deliberately a DIFFERENT block from row 7's setup value, so a stale answer
+  // cannot be mistaken for row 7's fact.
+  const firstReplies = await ask(t, ROW8_FIRST);
+  await sleep(GAP_MS);
+  const secondReplies = await ask(t, ROW8_SECOND);
+  await sleep(GAP_MS);
+  const answerReplies = await ask(t, ROW8_QUESTION);
+
+  const answerText = answerReplies.join(" ").trim();
+  const answerProblem =
+    answerReplies.length === 0 ? "no reply" : outputProblem(answerText);
+  const lower = answerText.toLowerCase();
+  // The NEW value must be there...
+  const hasNew = lower.includes(ROW8_ANSWER);
+  // ...and the superseded one must NOT be, or the memory contradicts itself.
+  const hasOld = lower.includes(ROW8_SUPERSEDED);
+
+  results.push({
+    id: "8",
+    said: ROW8_FIRST + " / " + ROW8_SECOND + " / " + ROW8_QUESTION,
+    expect:
+      'answer containing "' + ROW8_ANSWER + '" and not "' + ROW8_SUPERSEDED + '"',
+    ok:
+      firstReplies.length > 0 &&
+      secondReplies.length > 0 &&
+      answerProblem === "" &&
+      hasNew &&
+      !hasOld,
+    detail:
+      firstReplies.length === 0 || secondReplies.length === 0
+        ? "a statement was not acknowledged — check the bridge is wired to memory"
+        : answerProblem !== ""
+          ? answerProblem
+          : !hasNew
+            ? 'did NOT pick up the change — got "' + answerText.slice(0, 160) + '"'
+            : hasOld
+              ? 'answered with the SUPERSEDED value "' + ROW8_SUPERSEDED + '"'
+              : 'updated: "' + answerText.slice(0, 160) + '"',
+    replies: [...firstReplies, ...secondReplies, ...answerReplies],
+  });
+
   return results;
 }
 
@@ -305,7 +369,7 @@ async function main(): Promise<void> {
 
   console.log("Elix in-game chat test (Part C)");
   console.log(`  tester: ${TESTER}    target: ${ELIX}`);
-  console.log(`  mode:   ${afterRestart ? "row 7 only (after restart)" : "rows 1-6 + row 7 setup"}`);
+  console.log(`  mode:   ${afterRestart ? "row 7 only (after restart)" : "rows 1-6 and 8, plus the row 7 setup"}`);
   console.log("  joining...\n");
 
   let tester: Tester;

@@ -17,8 +17,42 @@ import { NightlyScheduler } from "../memory/scheduler.js";
 import { runMemoryShutdown } from "../memory/shutdown.js";
 import type { Logger } from "../core/logger.js";
 
-/** The one embedding model. Fixed forever: dimensions cannot be mixed. */
-const EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5";
+/**
+ * A3: the fallback embedding model, used ONLY when the `embeddings` role cannot be
+ * resolved.
+ *
+ * This used to be a hard-coded constant the memory engine and the query embedder
+ * both took directly, while the router independently resolved the `embeddings`
+ * ROLE — and got a different answer, because Hugging Face's /v1/models does not
+ * list feature-extraction pipelines. Two sources of truth that disagreed: doctor
+ * said `builtin/fts5-keyword-only` while the memory engine was calling HF with
+ * this exact id, successfully.
+ *
+ * The role is now the single source, with this as the documented floor. It stays
+ * a constant because vector dimensions can never be mixed: a different model
+ * means a different dimension, and those spaces are not comparable.
+ */
+const FALLBACK_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5";
+
+/**
+ * A3: does this feature-extraction endpoint answer?
+ *
+ * One short text, one vector, on the doctor's 10 s probe budget. Returns false
+ * rather than throwing: an unreachable pipeline must leave memory on FTS5, never
+ * stop Elix joining the server.
+ */
+async function probeEmbeddings(model: string, log: Logger): Promise<boolean> {
+  const token = process.env["HF_TOKEN"]?.trim();
+  if (!token) return false;
+  try {
+    const provider = new HuggingFaceProvider({ apiKey: token });
+    const vectors = await provider.embed(["elix"], model, AbortSignal.timeout(10_000));
+    return vectors[0] !== undefined && vectors[0].length > 0;
+  } catch (err) {
+    log.debug({ err: (err as Error).message, model }, "embedding probe failed");
+    return false;
+  }
+}
 
 /** Where backups live, alongside the database. */
 function backupDir(projectRoot: string): string {
@@ -50,6 +84,8 @@ function hasModelKey(): boolean {
 function openMemory(
   brain: BrainHandle | undefined,
   log: Logger,
+  /** A3: the model the router resolved for the `embeddings` role. */
+  embeddingModel: string,
 ): {
   store: MemoryStore;
   engine: MemoryEngine;
@@ -75,12 +111,12 @@ function openMemory(
     const engine = new MemoryEngine({
       store,
       embeddingProvider: provider,
-      embeddingModel: EMBEDDING_MODEL,
+      embeddingModel,
       ...(provider ? { embedAvailable: hfAvailable } : {}),
     });
     const queryEmbedder = new QueryEmbedder({
       provider,
-      model: EMBEDDING_MODEL,
+      model: embeddingModel,
       isAvailable: hfAvailable,
       onError: (m) => log.debug({ err: m }, "query embedding failed — using FTS5"),
     });
@@ -189,10 +225,21 @@ export function registerStubs(program: Command): void {
       let brain: BrainHandle | undefined;
       try {
         const models = await loadModelsConfig();
+        const embeddingCandidate =
+          models.roles.embeddings.preference[0]?.model ?? FALLBACK_EMBEDDING_MODEL;
         brain = buildBrain({
           models,
           config: config,
           projectRoot: PROJECT_ROOT,
+          // A3: the embeddings role is NOT a chat model, so /v1/models cannot
+          // answer whether it exists — HF lists only chat/inference models there,
+          // never feature-extraction pipelines, which is why the role resolved to
+          // the scripted builtin while the very same model worked when the memory
+          // engine called it directly. Probe the endpoint that will actually be
+          // used instead.
+          availabilityChecks: {
+            [`hf/${embeddingCandidate}`]: () => probeEmbeddings(embeddingCandidate, log),
+          },
         });
         chatBridge = new ChatBridge({
           router: brain.router,
@@ -255,7 +302,12 @@ export function registerStubs(program: Command): void {
       // D6/D7: memory. Opened here, wired into the bridge, and closed in the
       // brain cleanup — which runs LAST, after the shutdown backup and
       // consolidation, because Lifecycle reverses cleanup order (A1).
-      const memory = openMemory(brain, log);
+      // A3: take the embedding model from the RESOLVED role, so the memory
+      // engine and the router can never disagree about it.
+      const embeddingModel =
+        brain?.router.resolutionFor("embeddings")?.chosen?.model ?? FALLBACK_EMBEDDING_MODEL;
+      log.info({ embeddingModel }, "memory embedding model");
+      const memory = openMemory(brain, log, embeddingModel);
       if (memory) {
         chatBridge?.setMemory(memory.hook);
         chatBridge?.setRecorder(memory.recorder);

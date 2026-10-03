@@ -51,7 +51,9 @@ export type SkipReason =
   | "disabled-for-day"
   | "proactive-token-limit"
   | "no-key"
-  | "not-in-model-list";
+  | "not-in-model-list"
+  /** A3: the model's OWN endpoint did not answer, per an availability probe. */
+  | "endpoint-unreachable";
 
 export interface AttemptRecord {
   provider: ProviderName;
