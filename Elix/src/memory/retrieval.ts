@@ -9,6 +9,7 @@
  * before they are weighted. When no candidate has a vector, cosine is
  * redistributed to bm25 (0.25 -> 0.65) so retrieval still works, FTS5-only.
  */
+import { isGreetingLine } from "../social/emotion.js";
 import type { MemoryStore, Episode, Fact, Person, Promise } from "./store.js";
 import { checkInputSafety } from "../brain/fallback.js";
 
@@ -286,6 +287,14 @@ export class Memory {
       lines.push("Earlier moments:");
       for (const e of episodes) {
         const who = e.episode.player ? `${e.episode.player}: ` : "";
+        // Elix's own welcome-back lines are BOILERPLATE, not memory. They are
+        // recorded as episodes because he did say them (A6), but retrieval feeding
+        // one back made the model quote it verbatim into an unrelated answer:
+        //   "ayy ElixTester! forgot we talked about ... cherry planks. lmao got it
+        //    right!"
+        // Observed live. Our own greeting text is scaffolding, so it is dropped
+        // here rather than trusted to the model to ignore.
+        if (isGreetingLine(e.episode.text)) continue;
         lines.push(`- ${who}${e.episode.text}`);
       }
     }

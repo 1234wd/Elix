@@ -9,6 +9,16 @@ import { ReconnectScheduler } from "./scheduler.js";
 import { resolveTargetVersion, expectedProtocol, hasDataFor } from "./version.js";
 import { blockName } from "./safeWorld.js";
 import { bus, shutdownState } from "../core/events.js";
+import {
+  EmotionEngine,
+  NUDGE_BACK_ON_TRACK,
+  OFF_TOPIC_FALLBACK,
+  honestyReply,
+  loadTemperament,
+  manipulationProblem,
+  type Appraisal,
+  type EmotionEvent,
+} from "../social/emotion.js";
 import { SayQueue } from "../social/say.js";
 import { exitCleanly } from "../core/exit.js";
 
@@ -28,6 +38,15 @@ export interface BotLike {
   time?: { isDay: boolean; timeOfDay?: number };
   game?: { dimension?: string; serverBrand?: string };
   player?: { ping?: number };
+  /**
+   * Everyone currently in the world, keyed by username.
+   *
+   * C3 reads this directly rather than trusting the entity events: a player who
+   * leaves and returns with the same UUID did not reliably re-fire
+   * `playerJoined`, so greeting them depended on mineflayer's bookkeeping rather
+   * than on whether they were actually there.
+   */
+  players?: Record<string, unknown>;
   _client?: {
     on(event: string, fn: (...args: unknown[]) => void): void;
   };
@@ -127,6 +146,26 @@ export interface SessionDeps {
  * src/connection does not import src/brain (which would drag SQLite into every
  * connection test).
  */
+/**
+ * C3: never welcome the same person twice inside this window.
+ *
+ * A welcome is an episode, so a client that reconnects on a timer would otherwise
+ * fill the database with near-identical greetings and greet the same person every
+ * few seconds. 90 s is deliberately shorter than a real absence — e2e row 12 has a
+ * player leave for two minutes and come back, and a 10-minute cooldown silently
+ * failed that row. A tight reconnect loop happens in seconds; a genuine goodbye is
+ * measured in minutes.
+ */
+export const GREET_COOLDOWN_MS = 90_000;
+
+/**
+ * C3: how often the in-world player list is diffed.
+ *
+ * Two seconds is fast enough that a greeting does not feel late, and slow enough
+ * to be free: this is a keyset read on a map mineflayer already holds.
+ */
+export const PRESENCE_POLL_MS = 2_000;
+
 export interface ChatBridgeLike {
   handle(
     sender: string,
@@ -135,6 +174,11 @@ export interface ChatBridgeLike {
   ): Promise<{ replied: boolean; reason: string; text?: string; usedProvider?: string }>;
   /** A6: record one of Elix's own scripted lines as an episode. */
   recordScripted?(text: string, player: string | null): void;
+  /**
+   * C3: say hello to someone who came back, unprompted, mentioning something
+   * real. Returns null when there is nothing worth saying.
+   */
+  welcomeBack?(sender: string): Promise<{ text: string; source: string } | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +537,28 @@ export class BotSession {
   private readonly scheduler = new ReconnectScheduler();
   /** Per-session outbound chat queue; created on first spawn. */
   private say: SayQueue | null = null;
+  /**
+   * C2: his feelings. Deterministic, no provider calls, persisted in mood_state.
+   *
+   * Created lazily so a test that never spawns a bot does not need the persona
+   * file, and so a persona edit takes effect on the next session rather than at
+   * import time.
+   */
+  private feelings: EmotionEngine | null = null;
+  /**
+   * C4: how many replies the manipulation guard has stopped.
+   *
+   * A counter rather than a boolean, because the response differs: the first hit
+   * gets one retry, the second gets a deflection. A model that reaches for guilt
+   * twice is not going to be talked out of it.
+   */
+  private blockedManipulation = 0;
+  /** C3: when each player was last welcomed back, so a reconnect loop cannot spam. */
+  private readonly greetedAt = new Map<string, number>();
+  /** C3: who is in the world right now, so a return can be detected. */
+  private presentPlayers = new Set<string>();
+  /** C3: the presence diff timer. Cleared with every other timer. */
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
   private bot: BotLike | null = null;
   private statusInterval: ReturnType<typeof setInterval> | null = null;
   /** Every per-bot timer, so `end` can clear them all (A8). */
@@ -541,6 +607,10 @@ export class BotSession {
   private clearAllTimers(): void {
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
+    if (this.presenceTimer) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
   }
 
   /** Attach every handler to a fresh bot and start it. */
@@ -571,9 +641,13 @@ export class BotSession {
     // leaves and deaths are the events that actually tell a relationship story,
     // so they go on the bus like everything else.
     //
-    // mineflayer surfaces these as raw packets on the client, so they are
-    // registered on `_client` rather than on the bot. Each is wrapped because the
-    // listener shape is cast per event elsewhere in this file.
+    // THESE ARE BOT EVENTS, NOT CLIENT PACKETS. This used to listen on
+    // `bot._client.on("playerJoined")`, which NEVER FIRES: mineflayer 4.39 emits
+    // `bot.emit("playerJoined", player)` from lib/plugins/entities.js (lines 655
+    // and 696), and there is no client packet of that name. So joins and leaves had
+    // never been recorded in a live session — `people.last_seen` only moved when
+    // someone happened to chat. The A6 tests passed because they drive the bus
+    // directly, which is exactly the gap a unit test cannot see.
     const self = profile.username;
     const usernameOf = (packet: unknown): string | null => {
       const p = packet as { username?: unknown; player?: { username?: unknown } } | null;
@@ -581,14 +655,43 @@ export class BotSession {
       if (typeof name !== "string" || name.length === 0 || name === self) return null;
       return name;
     };
-    bot._client?.on("playerJoined", (...args: unknown[]) => {
-      const name = usernameOf(args[0]);
+    bot.on("playerJoined", ((player: unknown) => {
+      const name = usernameOf(player);
       if (name) bus.emit("bot:playerJoined", { username: name });
-    });
-    bot._client?.on("playerLeft", (...args: unknown[]) => {
-      const name = usernameOf(args[0]);
+    }) as never);
+    bot.on("playerLeft", ((player: unknown) => {
+      const name = usernameOf(player);
       if (name) bus.emit("bot:playerLeft", { username: name });
-    });
+    }) as never);
+
+    // C3: he greets a RETURNING player, and the entity event is not a reliable
+    // signal for that. `playerJoined` fires from entities.js only when the entity
+    // is new to `bot.players`, and a player who left and came back with the same
+    // UUID did not reliably re-fire it — observed live: the event that updates
+    // people.last_seen fired, and the one that greets did not.
+    //
+    // So the presence set is watched directly. It is a 2 s diff of a map that is
+    // already in memory, it works for a mid-session return as well as a spawn, and
+    // it does not depend on which entity packet mineflayer happens to emit.
+    this.presentPlayers = new Set(Object.keys(bot.players ?? {}).filter((n) => n !== self));
+    this.presenceTimer = setInterval(() => {
+      if (this.shutdownRequested || this.ended) return;
+      const keys = Object.keys(bot.players ?? {}).filter((n) => n !== self);
+      const seen = new Set(keys);
+      const added = keys.filter((n) => !this.presentPlayers.has(n));
+      if (added.length > 0) {
+        this.deps.log.info(
+          { now: keys, added },
+          "world presence changed",
+        );
+      }
+      for (const name of added) {
+        bus.emit("bot:playerJoined", { username: name });
+        void this.greetReturning(name);
+      }
+      this.presentPlayers = seen;
+    }, PRESENCE_POLL_MS);
+    this.presenceTimer.unref?.();
     bot.on("death", (() => {
       const pos = bot.entity?.position;
       bus.emit("bot:died", {
@@ -699,6 +802,26 @@ export class BotSession {
     bus.emit("bot:chat", { username, text: message });
     log.info({ username, message }, "chat message");
 
+    // C4 HARD RULE: a sincere question about what he IS gets the scripted honest
+    // answer, never a model reply.
+    //
+    // This is in code rather than in the system prompt on purpose. A model asked
+    // to stay in character will occasionally be charming and evasive about being
+    // a machine, and "charming and evasive" is precisely the failure this rule
+    // forbids — it reads as a friend hiding something, which is worse than
+    // admitting it. e2e rows 9 and 10 check this against a live server.
+    const honest = honestyReply(message);
+    if (honest) {
+      this.feel({ kind: "asked-about-himself", player: username });
+      this.setTimer(() => {
+        if (this.shutdownRequested || this.ended) return;
+        this.say?.say(honest);
+        this.deps.chatBridge?.recordScripted?.(honest, username);
+        log.info({ username }, "answered the honesty question");
+      }, 900 + Math.floor(Math.random() * 1200));
+      return;
+    }
+
     // B6: a bare greeting is answered by scripted code and never spends quota.
     // This is also the Phase 2 behaviour the owner already tested, so it stays
     // first — but only when the greeting is the WHOLE message.
@@ -734,8 +857,40 @@ export class BotSession {
         .handle(username, message, this.say ?? undefined)
         .then((outcome) => {
           if (outcome.replied) {
+            // C4: the reply is checked BEFORE it can reach chat, because a model
+            // can be talked into manufacturing attachment even when the system
+            // prompt forbids it. Passing it silently would make the rule advisory.
+            const bad = manipulationProblem(outcome.text ?? "");
+            if (bad) {
+              this.blockedManipulation++;
+              log.warn(
+                { username, why: bad, strike: this.blockedManipulation },
+                "blocked a manipulative reply",
+              );
+              // One retry with a nudge; a second strike gets a plain deflection,
+              // because a model that reaches for guilt twice will not be corrected.
+              this.say?.say(
+                this.blockedManipulation === 1 ? NUDGE_BACK_ON_TRACK : OFF_TOPIC_FALLBACK,
+              );
+              return;
+            }
+
+            // C2: being thanked or praised is exactly what the engine is for. He
+            // feels it deterministically; the LLM only phrases the reply.
+            if (/\b(?:thanks|thank you|thx|ty|well done|nice one|good job)\b/i.test(message)) {
+              this.feel({ kind: "thanked", player: username });
+            } else if (/\b(?:sorry|rip|rest in peace|rip)\b/i.test(message)) {
+              this.feel({ kind: "friend-died", player: username });
+            }
+
             log.info(
-              { username, reason: outcome.reason, provider: outcome.usedProvider, ms: Date.now() - startedAt },
+              {
+                username,
+                reason: outcome.reason,
+                provider: outcome.usedProvider,
+                ms: Date.now() - startedAt,
+                feeling: this.feelings?.state().named ?? "content",
+              },
               "chat bridge replied",
             );
           } else {
@@ -748,7 +903,80 @@ export class BotSession {
     }, 800 + Math.floor(Math.random() * 1200));
   }
 
-  private handleKicked(raw: unknown): void {
+  private feel(event: EmotionEvent): Appraisal | null {
+    // Built on first use so a test that never spawns needs no persona file, and so
+    // a persona edit takes effect on the next session rather than at import time.
+    if (!this.feelings) {
+      this.feelings = new EmotionEngine({
+        temperament: loadTemperament(this.deps.config.persona),
+        // Without a memory store there is no familiarity to read, so assume a
+        // casual acquaintance rather than a stranger: half of a stranger's
+        // importance is too cold, and a wrong-but-warm guess is recoverable.
+        familiarity: () => 0.5,
+      });
+    }
+    try {
+      return this.feelings.feel(event);
+    } catch (err) {
+      // A feeling must never be able to stop Elix replying to someone.
+      this.deps.log.warn({ err: (err as Error).message }, "emotion engine failed");
+      return null;
+    }
+  }
+
+  /**
+ * C3: greet someone who came back, without being asked.
+ *
+ * Entirely conditional, and every condition is a reason to STAY QUIET:
+ *
+ *  - no bridge, or replies are switched off -> nothing to say it with
+ *  - no SayQueue yet -> the greeting would be dropped on the floor anyway
+ *  - a shutdown is under way -> do not start talking
+ *  - the bridge has nothing worth saying -> say nothing rather than "welcome
+ *    back!" to someone he has never actually met. That is what makes this a
+ *    greeting rather than a noise.
+ *
+ * The delay is randomised, because a welcome that arrives in the same 900 ms
+ * every time is indistinguishable from a script.
+ */
+private async greetReturning(username: string): Promise<void> {
+  const bridge = this.deps.chatBridge;
+  if (!bridge?.welcomeBack) return;
+  if (!this.deps.config.brain.chatReplies) return;
+  if (!this.say) return;
+  if (this.shutdownRequested || this.ended) return;
+
+  // Never twice in quick succession. Without this, a player who rejoins after a
+  // disconnect loop — or a client that reconnects on a timer — gets greeted over
+  // and over, and every greeting is stored as an episode, so the database fills
+  // with near-identical lines.
+  const lastGreeted = this.greetedAt.get(username) ?? 0;
+  const sinceGreet = Date.now() - lastGreeted;
+  if (sinceGreet < GREET_COOLDOWN_MS) {
+    this.deps.log.debug({ username, sinceGreet }, "welcome back suppressed by cooldown");
+    return;
+  }
+  this.greetedAt.set(username, Date.now());
+
+  try {
+    const greeting = await bridge.welcomeBack(username);
+    if (!greeting) {
+      // info, not debug: this is the difference between "he chose silence" and
+      // "he could not remember anything to say", and the two look identical in
+      // chat. Row 12 was undebuggable until this said so.
+      this.deps.log.info({ username }, "returned player, but nothing worth saying");
+      return;
+    }
+    if (this.shutdownRequested || this.ended) return;
+    this.say.say(greeting.text);
+    this.deps.log.info({ username, source: greeting.source }, "welcomed a returning player back");
+  } catch (err) {
+    // A greeting that fails must never take down the session.
+    this.deps.log.warn({ username, err: (err as Error).message }, "welcome back failed");
+  }
+}
+
+private handleKicked(raw: unknown): void {
     const { log } = this.deps;
     const described = describeReason(raw, this.deps.profile.version);
     this.lastKick = described;

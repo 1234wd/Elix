@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ElixConfig } from "../core/config.js";
 import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config.js";
 import { currentBot, runBot } from "../connection/bot.js";
@@ -13,6 +13,7 @@ import { MemoryStore, defaultMemoryPath } from "../memory/store.js";
 import { MemoryEngine } from "../memory/engine.js";
 import { HuggingFaceProvider } from "../brain/hf.js";
 import { WorldRecorder } from "../memory/recorder.js";
+import { EmotionEngine, loadTemperament } from "../social/emotion.js";
 import { QueryEmbedder } from "../memory/queryEmbed.js";
 import { NightlyScheduler } from "../memory/scheduler.js";
 import { runMemoryShutdown } from "../memory/shutdown.js";
@@ -87,6 +88,8 @@ function openMemory(
   log: Logger,
   /** A3: the model the router resolved for the `embeddings` role. */
   embeddingModel: string,
+  /** C2: persona.md, the single source for his temperament. */
+  personaPath: string,
 ): {
   store: MemoryStore;
   engine: MemoryEngine;
@@ -94,6 +97,8 @@ function openMemory(
   recorder: WorldRecorder;
   queryEmbedder: QueryEmbedder;
   storePath: string;
+  /** C2: the emotion engine, restored from mood_state. */
+  feelings: EmotionEngine;
 } | null {
   const storePath = defaultMemoryPath(PROJECT_ROOT);
   try {
@@ -140,8 +145,31 @@ function openMemory(
       },
       preference: (player, kind) => engine.preference(player, kind),
       capturePreference: (player, text) => engine.capturePreference(player, text),
+      // C3: "only greet someone you know". A row in `people` is the definition of
+      // having met them, and it exists for anyone who has ever joined or spoken.
+      known: (player) => store.person(player) !== null,
     };
-    return { store, engine, hook, recorder, queryEmbedder, storePath };
+    // C2: his feelings, restored from the last session's mood_state so a restart
+    // does not wipe how he was feeling. Only the MOOD survives — an emotion is
+    // seconds-to-minutes, and carrying one across a restart would mean feeling
+    // something about an event that is no longer happening.
+    const feelings = new EmotionEngine({
+      temperament: loadTemperament(personaPath),
+      // Familiarity comes from the relationship table, so a stranger's death is
+      // not felt as hard as a friend's.
+      familiarity: (player: string) => {
+        const p = store.person(player);
+        if (!p) return 0.15;
+        return Math.max(0, Math.min(1, (p.familiarity ?? 0) / 100));
+      },
+    });
+    try {
+      feelings.restore(store.mood());
+    } catch {
+      // A missing or corrupt mood row is not a reason to refuse to play.
+    }
+
+    return { store, engine, hook, recorder, queryEmbedder, storePath, feelings };
   } catch (err) {
     log.warn({ err: (err as Error).message }, "memory unavailable — Elix will not remember");
     return null;
@@ -344,12 +372,25 @@ export function registerStubs(program: Command): void {
       const embeddingModel =
         brain?.router.resolutionFor("embeddings")?.chosen?.model ?? FALLBACK_EMBEDDING_MODEL;
       log.info({ embeddingModel }, "memory embedding model");
-      const memory = openMemory(brain, log, embeddingModel);
+      const memory = openMemory(brain, log, embeddingModel, resolve(PROJECT_ROOT, config.persona));
       if (memory) {
         chatBridge?.setMemory(memory.hook);
         chatBridge?.setRecorder(memory.recorder);
         // A6: joins, leaves, deaths and kicks are recorded from the bus.
         memory.recorder.attach();
+
+        // C2: joins, leaves, deaths and idle time are what he feels things ABOUT.
+        // All deterministic — no provider call, so none of it costs quota and all
+        // of it works with no key.
+        const detachFeelings = memory.feelings.attach({
+          on: (event, fn) => bus.on(event as never, fn as never),
+          off: (event, fn) => bus.off(event as never, fn as never),
+          onFeeling: (appraisal) =>
+            log.info(
+              { emotion: appraisal.emotion, cause: appraisal.cause, intensity: Number(appraisal.intensity.toFixed(2)) },
+              "feeling",
+            ),
+        });
 
         // A2: the nightly sleep, the nightly backup and the periodic embedding
         // drain. Before this, all three only ran at startup and on shutdown, so
@@ -374,6 +415,19 @@ export function registerStubs(program: Command): void {
         lifecycle.onCleanup(async () => {
           scheduler.stop();
           memory.recorder.detachAll();
+          detachFeelings();
+          // C2: persist the mood BEFORE the backup, so the backup contains it and a
+          // restore actually restores how he was feeling. The store is still open
+          // at this point — it is closed by runMemoryShutdown, further down.
+          try {
+            const m = memory.feelings.moodState();
+            memory.store.setMood(
+              { valence: m.valence, arousal: m.arousal, dominance: m.dominance, mood: m.mood },
+            );
+            log.info({ mood: m.mood, valence: Number(m.valence.toFixed(2)) }, "mood persisted");
+          } catch (err) {
+            log.warn({ err: (err as Error).message }, "could not persist the mood");
+          }
           await runMemoryShutdown({
             store: memory.store,
             engine: memory.engine,

@@ -208,10 +208,38 @@ Honest status, per phase. Anything not listed here does not exist yet.
 | 1 | Skeleton, config, logger, event bus, `doctor` | part of the 664-test suite |
 | 2 | Connect, reconnect ladder, safe walk, permanent-kick handling, graceful shutdown | fake-bot lifecycle tests + real-process exit tests |
 | 3 | **Brain router: Groq → Hugging Face → scripted.** Model discovery, rate-limit headers, cooldowns persisted in SQLite, reasoning stripped, prompt-injection blocked before any call, `elix ask`, `elix usage`, and an in-game chat bridge. | router, bridge and hazard tests, plus one live smoke test behind `ELIX_LIVE=1` |
-| 4 | **Memory.** Episodes/facts/people/places/self/promises/mood in SQLite WAL, FTS5 by trigger, vec0 vectors embedded exactly once, hybrid retrieval with within-set normalisation, rule-based importance, PII redaction at write time, chunk→merge consolidation with a 5-call nightly cap, `VACUUM INTO` backups, `elix memory search/stats`, `elix forget --player`. | `tests/unit/memory.test.ts` — 62 tests, all zero-network |
+| 4 | **Memory.** Episodes/facts/people/places/self/promises/mood in SQLite WAL, FTS5 by trigger, vec0 vectors embedded exactly once, hybrid retrieval with within-set normalisation, rule-based importance, PII redaction at write time, chunk→merge consolidation with a 5-call nightly cap, `VACUUM INTO` backups, `elix memory search/stats`, `elix memory forget --player`. | `tests/unit/memory.test.ts` — 62 tests, all zero-network |
+| 5 | **Social, persona and emotions.** A deterministic emotion engine with causes, VAD state and named feelings; temperament parsed from `persona.md`; mood persisted in `mood_state` across restarts; multiplayer manners and self-directed initiative inside the idle budget; honesty and healthy attachment as **hard rules in code**, not prompt text. | `tests/unit/round8Phase5.test.ts` — 51 tests, all zero-network, plus e2e rows 9–12 against the live server |
 
-**Still not built:** the emotion engine and the full social layer (Phase 5), voice
-(Phase 9), self-driven goals (Phase 7).
+**Still not built:** voice (Phase 9), self-driven goals at scale (Phase 7).
+
+### Phase 5 notes — how C2–C4 are enforced
+
+The load-bearing decision is that **feelings are code, not output**. The LLM may
+phrase a feeling; it never decides that Elix has one. Every emotion comes from
+`appraise()` scoring a real event, and every one carries a cause built only from
+that event's own fields. Nothing in `src/social/emotion.ts` calls a provider, so
+the whole inner life works with no key and is testable to the bit.
+
+| Rule | Where it is enforced |
+|---|---|
+| Three timescales, with persona.md as the single source | `parseTemperament()` reads the trait table; `EmotionEngine` derives the baseline from it. Editing `\| Warmth \| high \|` to `low` moves the baseline valence from 0.150 to -0.150 |
+| Every emotion carries a cause | `appraise()` builds it from the event's fields; the test asserts the vision's six rows verbatim |
+| Emotion is seconds-to-minutes, mood is hours | two decay constants, `EMOTION_DECAY_TAU_MS` 4 min and `MOOD_DECAY_TAU_MS` 30 min, with the mood aged **before** the emotion chases it |
+| Mood survives a restart, emotion does not | `setMood()`/`mood()` on `mood_state`; carrying an emotion across a restart would mean feeling something about an event that has stopped happening |
+| He only speaks when addressed, or when it is naturally his place | `manners.shouldSpeak()` — addressed always answers, and ambient chatter is a bounded roll inside the idle budget |
+| He does not wait to be told | `manners.shouldInitiate()` over the five drives, plus an unprompted welcome-back driven by the presence diff |
+| He says he is an AI, always | `honestyReply()` in code, **not** the prompt: a model asked to stay in character will occasionally be charming and evasive, and charming-and-evasive is the failure the rule forbids. e2e rows 9 and 10 |
+| His feelings are simulated; no consciousness claim | the same scripted answers, and a test that reads every one of them back and fails if any stops naming the simulation |
+| No guilt-tripping, no pressure, no fake urgency | `manipulationProblem()` runs on **every** reply before it reaches chat. First strike gets a nudge, second gets a deflection. e2e row 11 |
+
+**A bug this found, which no unit test could have:** `bot:playerJoined` /
+`playerLeft` were registered on `bot._client`, but mineflayer 4.39 emits them on
+the **bot** (`bot.emit("playerJoined", player)`, `lib/plugins/entities.js:655`).
+There is no client packet of that name, so joins and leaves had **never** been
+recorded in a live session — `people.last_seen` only moved when someone happened to
+chat. The A6 tests passed because they drive the bus directly. Presence is now read
+from the player map directly, which is also what makes a genuine return detectable.
 
 ### Phase 9 notes — Simple Voice Chat
 
