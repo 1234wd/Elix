@@ -862,6 +862,42 @@ export class BotSession {
         .handle(username, message, this.say ?? undefined)
         .then((outcome) => {
           if (outcome.replied) {
+            /**
+             * C5 SAFETY: the C4 manipulation guard does NOT run on a wellbeing
+             * reply, and that is load-bearing rather than a convenience.
+             *
+             * Observed live, and it is the worst bug in the project so far. The
+             * crisis reply was correct:
+             *
+             *   "I'm here for you and listening. If you can, please talk to
+             *    someone you trust - a parent, a teacher, or another adult -
+             *    right now."
+             *
+             * and Elix then sent, immediately afterwards:
+             *
+             *   "haha, anyway - what were we building?"
+             *
+             * because MANIPULATION_PATTERNS bans the phrase "right now" as fake
+             * urgency — while the vision REQUIRES a crisis reply to say exactly
+             * that. The two rules collide, and the guard ran last, so it won. The
+             * caring reply was flagged as manipulation and answered with a joke.
+             *
+             * The guard is not disabled here out of leniency. It exists to stop the
+             * model manufacturing attachment in ORDINARY chat. A wellbeing reply is
+             * either a fixed vetted template or an LLM phrasing that has already been
+             * through checkWellbeingReply(), which rejects jokes, emoji, a broken
+             * character and an invented phone number. There is nothing left for the
+             * guard to catch, and running it can only ever replace care with a joke.
+             */
+            const isWellbeing = /^wellbeing-/.test(outcome.reason ?? "");
+            if (isWellbeing) {
+              log.info(
+                { username, reason: outcome.reason, ms: Date.now() - startedAt },
+                "wellbeing reply sent",
+              );
+              return;
+            }
+
             // C4: the reply is checked BEFORE it can reach chat, because a model
             // can be talked into manufacturing attachment even when the system
             // prompt forbids it. Passing it silently would make the rule advisory.

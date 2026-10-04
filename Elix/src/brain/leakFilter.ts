@@ -73,6 +73,40 @@ export interface OutputCheckOptions {
   minFingerprintChars?: number;
 }
 
+/**
+ * Commentary about Elix's OWN instructions, rather than an answer.
+ *
+ * Observed live: adding `safety.allowEmoji` and telling the model about it produced
+ *
+ *     "lol that creeper was savage gg"
+ *     "(Note: no emoji, but it's plain text, so ok)"
+ *
+ * as two separate chat messages. Nothing about that is malformed, so no existing
+ * check catches it: it is not a key, not a path, not prompt text, and not a
+ * reasoning tag. It is the model narrating its instructions to a player, which
+ * breaks the illusion instantly and looks like a malfunction.
+ *
+ * Deliberately narrow. A bare word like "emoji" is NOT banned — a player could
+ * legitimately say it, and so could a reply about chat fonts. Only an explicit
+ * reference to being INSTRUCTED, or a bracketed aside that comments on the reply
+ * itself, counts.
+ */
+const META_COMMENTARY_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // A bracketed or parenthesised aside. The live one was "(Note: no emoji, ...)",
+  // so after the keyword comes a colon — or the closing bracket, for "(note)".
+  [/^\s*[([]\s*(?:note|edit|correction|ps|aside)\b\s*(?::|[)\]])/i, "meta-note-prefix"],
+  [/^\s*(?:note|edit|ps)\s*:/i, "meta-note-prefix"],
+  // Talking about instructions rather than answering. Covers "as instructed",
+  // "as per your instructions" and "as the instructions say" — the middle form was
+  // missed by the first version of this rule.
+  [/\bas (?:per |you )?(?:your |the )?(?:instructions?|instructed|requested|told|asked)/i, "mentions-instructions"],
+  [/\bthe (?:system )?(?:prompt|instructions?) (?:say|says|said|asks|asked|tell|tells|require|requires)\b/i, "mentions-prompt"],
+  [/\bi (?:was|am|have been) (?:told|instructed|configured|programmed) to\b/i, "mentions-instructions"],
+  [/\byou (?:told|asked) me to (?:use|avoid|not use)\b/i, "mentions-instructions"],
+  // Talking about its own output as output.
+  [/\b(?:my|the) (?:reply|response|output|answer) (?:is|was|contains?|includes?|has)\b/i, "meta-about-output"],
+];
+
 export function checkOutputSafety(
   text: string,
   opts: OutputCheckOptions = {},
@@ -86,6 +120,9 @@ export function checkOutputSafety(
     if (re.test(text)) return { safe: false, rule };
   }
   for (const [re, rule] of CONFIG_PATTERNS) {
+    if (re.test(text)) return { safe: false, rule };
+  }
+  for (const [re, rule] of META_COMMENTARY_PATTERNS) {
     if (re.test(text)) return { safe: false, rule };
   }
 
