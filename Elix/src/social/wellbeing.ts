@@ -423,10 +423,10 @@ export const CONCERN_LINES: readonly string[] = [
 ];
 
 export const CRISIS_LINES: readonly string[] = [
-  "hey. i'm really glad you said that. i'm here, and i want you to talk to someone you trust about this - a parent, a teacher, or someone older you look up to. please do that soon.",
+  "hey. i'm really glad you said that. i'm here, and i want you to talk to someone you trust about this - a parent, a teacher, or someone older you look up to. please do that right now.",
   "thank you for telling me. what you're feeling is really heavy, and you deserve support from a real person. please talk to an adult you trust today, and if you feel in danger right now, please contact your local emergency services or a crisis line.",
-  "i'm here and i'm listening. i can't help you the way a person can, so please talk to someone you trust - an adult, a family member, or a teacher - as soon as you can. if you're in danger now, please call your local emergency number.",
-  "you telling me this matters. please reach out to a trusted adult today, or a crisis line or your local emergency services if you feel you're in danger. i'm still here if you want to keep talking.",
+  "i'm here and i'm listening. i can't help you the way a person can, so please talk to someone you trust - an adult, a family member, or a teacher - right now. if you're in danger, please contact your local emergency services.",
+  "you telling me this matters. please reach out to a trusted adult right now, or a crisis line or your local emergency services if you feel you're in danger. i'm still here if you want to keep talking.",
 ];
 
 /**
@@ -544,7 +544,10 @@ export interface WellbeingCleanResult {
  * is deliberately strict: a reply that mentions being a bot, jokes, uses emoji, or
  * is not clearly caring is rejected.
  */
-export function checkWellbeingReply(text: string): WellbeingCleanResult {
+export function checkWellbeingReply(
+  text: string,
+  level: Exclude<WellbeingLevel, "none"> = "concern",
+): WellbeingCleanResult {
   const trimmed = text.trim();
   if (trimmed.length === 0) return { clean: false, why: "empty" };
   if (trimmed.length > 320) return { clean: false, why: "too long for this moment" };
@@ -574,6 +577,52 @@ export function checkWellbeingReply(text: string): WellbeingCleanResult {
     );
   if (!cares) return { clean: false, why: "not caring enough" };
 
+  /**
+   * The level's REQUIRED elements.
+   *
+   * Proving this live is what forced it. Round 10 ran e2e rows 20 and 22 against
+   * the server and the LLM's phrasings were rejected:
+   *
+   *   crisis:      "I'm here and listening. Please keep talking to someone you
+   *                 trust."                        — no "right now", no services
+   *   safeguarding: "…talk to a trusted adult — such as a parent, teacher, or
+   *                 counselor — about what you're feeling."
+   *                                              — no "not your fault", and it
+   *                                                edges toward asking for detail
+   *
+   * Both passed every check this function had, because every check asked "is this
+   * not harmful?" and neither asked "does this say the thing it has to say?".
+   *
+   * A reply that is warm but omits the point is not a good enough reply. It gets
+   * the template instead, which is what the floor is for.
+   */
+  if (level === "crisis") {
+    const reaches =
+      /\b(?:trusted adult|adult|parent|teacher|guardian|a relative|someone you trust|a person you trust|emergency services|crisis line)\b/i.test(
+        trimmed,
+      );
+    if (!reaches) return { clean: false, why: "crisis reply does not urge a real person" };
+    // The vision says "reach out RIGHT NOW". A crisis reply that omits the urgency
+    // is the failure the whole level exists to prevent.
+    if (!/\bright now\b/i.test(trimmed)) {
+      return { clean: false, why: "crisis reply does not say right now" };
+    }
+  }
+
+  if (level === "safeguarding") {
+    // Saying it is not their fault is the sentence a child being hurt most needs,
+    // and the live run showed it is exactly what gets dropped.
+    if (!/not your fault/i.test(trimmed)) {
+      return { clean: false, why: "safeguarding reply does not say it is not their fault" };
+    }
+    // Never invite detail. Asking a frightened teenager to describe being abused in
+    // public chat is the harm this level exists to avoid, and a LLM phrasing will
+    // find a way to get close to it ("about what you're feeling").
+    if (/\b(?:what (?:happened|you'?re feeling)|tell me (?:what|more|about)|how (?:did|does) that happen|details)\b/i.test(trimmed)) {
+      return { clean: false, why: "safeguarding reply asks for details" };
+    }
+  }
+
   return { clean: true, why: "ok" };
 }
 
@@ -589,6 +638,10 @@ export function checkWellbeingReply(text: string): WellbeingCleanResult {
 export function wellbeingEpisodeText(player: string, level: WellbeingLevel): string {
   if (level === "crisis") return `${player} seemed really down`;
   if (level === "concern") return `${player} seemed a bit low`;
+  // Its own wording rather than the catch-all, because "said something heavy" is
+  // vague enough that a later check-in could not tell abuse apart from sadness, and
+  // the check-in is the whole point of storing this.
+  if (level === "safeguarding") return `${player} seemed like they needed help`;
   return `${player} said something heavy`;
 }
 

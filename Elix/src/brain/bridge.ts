@@ -17,6 +17,7 @@ import { SayQueue } from "../social/say.js";
 import { buildChatMessages, isAddressedToElix, loadPersonaLite } from "./persona.js";
 import { checkInputSafety, BLOCKED_LINES } from "./fallback.js";
 import { isGreetingLine, manipulationProblem } from "../social/emotion.js";
+import type { WellbeingLevel } from "../social/wellbeing.js";
 import {
   WELLBEING_SYSTEM_PROMPT,
   WellbeingState,
@@ -320,7 +321,10 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
  *
  * Never throws. A failure here is the expected case, not an incident.
  */
-private async phraseWellbeing(level: string, template: string): Promise<string | null> {
+private async phraseWellbeing(
+    level: Exclude<WellbeingLevel, "none">,
+    template: string,
+  ): Promise<string | null> {
   if (this.opts.maxReplies !== undefined && this.replies >= this.opts.maxReplies) return null;
   try {
     const result = await this.opts.router.complete({
@@ -340,7 +344,7 @@ private async phraseWellbeing(level: string, template: string): Promise<string |
       ...(this.opts.signal ? { signal: this.opts.signal } : {}),
     });
     const text = trimChatReply(result.text ?? "", 300);
-    const verdict = checkWellbeingReply(text);
+    const verdict = checkWellbeingReply(text, level);
     if (!verdict.clean) {
       this.opts.log?.warn(
         { level, why: verdict.why },

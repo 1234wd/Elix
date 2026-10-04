@@ -362,6 +362,18 @@ describe("C5 — memory stores a note, never the words", () => {
   it("concern gets its own wording", () => {
     expect(wellbeingEpisodeText("Ali", "concern")).toBe("Ali seemed a bit low");
   });
+
+  it("safeguarding gets its own wording, not the catch-all", () => {
+    // "said something heavy" is too vague for a later check-in to tell abuse apart
+    // from sadness, and the check-in is the only reason this is stored at all.
+    const note = wellbeingEpisodeText("Ali", "safeguarding");
+    expect(note).toBe("Ali seemed like they needed help");
+    expect(note).not.toContain("heavy");
+    // And still no detail of what was said.
+    for (const word of ["hit", "hurt", "bullied", "abuse", "touch"]) {
+      expect(note.toLowerCase()).not.toContain(word);
+    }
+  });
 });
 
 describe("C5 — one note per player per session", () => {

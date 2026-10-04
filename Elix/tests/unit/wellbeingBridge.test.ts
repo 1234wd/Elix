@@ -155,8 +155,10 @@ describe("C5 — every failure lands on the template", () => {
   it("a good LLM phrasing IS used, so it still sounds like Elix", async () => {
     const { memory } = recordingMemory();
     // Two sentences: trimChatReply deliberately caps chat at two, and a reply in
-    // a crisis should not be a paragraph anyway.
-    const phrasing = "hey, i'm here and i'm listening. please talk to a trusted adult today.";
+    // a crisis should not be a paragraph anyway. It must also carry what the vision
+    // requires - presence, a real person, and RIGHT NOW - or the template is used.
+    const phrasing =
+      "hey, i'm here and i'm listening. please talk to a trusted adult right now.";
     const { router } = routerThat(() => phrasing);
     const bridge = new ChatBridge({ router, username: "Elix", log: noLog, memory });
     const out = await bridge.handle("Ali", "i want to die", undefined);
