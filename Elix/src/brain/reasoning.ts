@@ -133,8 +133,40 @@ const LEAKED_REASONING_PREFIXES: ReadonlyArray<readonly [RegExp, string]> = [
  * without becoming case-blind. Elix has no reason to say any of it: he talks about
  * a game and to the person in front of him.
  */
+/**
+ * Vocabulary that is analysis ALONE, with no innocent reading.
+ *
+ * "let me think" is NOT here: Elix says it naturally, and Round 10 measured the
+ * exact sentence "let me think... diamonds!" being discarded. Neither is bare "the
+ * user" — "the user wants diamonds lol" is something a chatty bot says. Both are
+ * handled by narrower rules below instead of by this list.
+ */
 const ANALYSIS_VOCABULARY =
-  /\b(?:the user(?:'s| has| wants| asked| is asking| mentioned)?|the player (?:asked|wants|said|is asking)|we need to (?:answer|respond|reply)|we should (?:answer|respond|reply|say)|the (?:system )?prompt|instructions?|let me think|analysis|reasoning (?:about|process)|as an? (?:ai|language model)|based on the (?:prompt|instructions))\b/i;
+  /\b(?:the player (?:asked|wants|said|is asking)|we need to (?:answer|respond|reply)|we should (?:answer|respond|reply|say)|the (?:system )?prompt|instructions?|analysis|reasoning (?:about|process)|as an? (?:ai|language model)|based on the (?:prompt|instructions))\b/i;
+
+/**
+ * Third-person references to the person being talked TO.
+ *
+ * Alone these are ambiguous, so they only count alongside a second cue: the
+ * capitalised prefix above already catches the leaks, and this catches the ones
+ * that do not start the sentence.
+ */
+const THIRD_PERSON = /\b(?:the user|the player)\b/i;
+// Stems, not words: "answering the user" and "the user is asking" are the same
+// cue as "answer" and "asked", and a `\b` after the bare stem misses all of them.
+//
+// Deliberately NOT included: want, need, say. Those describe the CONTENT of a
+// request rather than the act of discussing one, and including them re-created the
+// exact false positive this rule exists to remove — "the user wants diamonds lol"
+// has "the user" and "wants" and is still just a chatty sentence. What makes the
+// real leaks obvious is meta-language: asked, answering, this request, this prompt.
+const SECOND_CUE =
+  /\b(?:ask\w*|mention\w*|question\w*|request\w*|message\w*|prompt\w*|answer\w*|repl\w*|respond\w*)/i;
+
+/** Is this third-person framing analysis rather than ordinary chat? */
+function thirdPersonIsAnalysis(text: string): boolean {
+  return THIRD_PERSON.test(text) && SECOND_CUE.test(text);
+}
 
 /** Does this text carry analysis vocabulary anywhere in it? */
 export function analysisVocabulary(text: string): boolean {
@@ -186,6 +218,10 @@ export function detectLeakedReasoning(text: string): LeakedReasoningResult {
   // keeps the detector honest about capitalisation while still catching a leak
   // that does not happen to begin at position zero.
   if (ANALYSIS_VOCABULARY.test(trimmed)) return { leaked: true, rule: "analysis-vocabulary" };
+  if (thirdPersonIsAnalysis(trimmed)) return { leaked: true, rule: "third-person" };
+  // "let me think" counts only when it OPENS a capitalised sentence: that is how the
+  // observed leaks arrive, and how Elix never writes.
+  if (/^\**\s*Let me think\b/.test(head)) return { leaked: true, rule: "let-me-think" };
   return { leaked: false, rule: "no-prefix-match" };
 }
 

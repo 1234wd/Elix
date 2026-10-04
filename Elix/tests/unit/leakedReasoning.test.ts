@@ -61,8 +61,7 @@ describe("A3 — every listed reasoning prefix", () => {
     ["Reasoning: they are sad", "scratchpad"],
     ["  \n  We have an idea", "we-"],
     // Lowercase, but unmistakably analysis: caught by the vocabulary fallback.
-    ["the user asked about redstone", "analysis-vocabulary"],
-    ["let me think about the best answer", "analysis-vocabulary"],
+    ["the user asked about redstone", "third-person"],
   ];
 
   it.each(LEAKS)("%j is leaked reasoning", (text, rulePrefix) => {
@@ -211,5 +210,47 @@ describe("A2 — the lowercase fragments that were wrongly discarded", () => {
 
   it.each(FRAGMENTS)("%j is not leaked reasoning", (text) => {
     expect(detectLeakedReasoning(text).leaked, text).toBe(false);
+  });
+});
+
+// --------------------------------------------------------------------------
+// A2 - the leak detector was flagging normal chat. These are the two sentences
+// Round 10 measured being DISCARDED, and the two rules that caused it.
+// --------------------------------------------------------------------------
+
+describe("A2 - \"let me think\" is something Elix says", () => {
+  it.each([
+    "let me think... diamonds!",
+    "let me think about the best answer",
+    "let me think for a sec",
+  ])("is not a leak: %j", (text) => {
+    expect(detectLeakedReasoning(text).leaked, text).toBe(false);
+  });
+
+  it("IS a leak when it opens the reply in capitals", () => {
+    expect(detectLeakedReasoning("Let me think about the best answer").leaked).toBe(true);
+    expect(detectLeakedReasoning("Let me think about the best answer").rule).toBe(
+      "let-me-think",
+    );
+    expect(detectLeakedReasoning("**Let me think** about it").leaked).toBe(true);
+  });
+});
+
+describe("A2 - bare \"the user\" needs company or a capital", () => {
+  it.each([
+    "the user wants diamonds lol",
+    "the user said hi",
+    "the user is going to the mines",
+  ])("is not a leak on its own: %j", (text) => {
+    expect(detectLeakedReasoning(text).leaked, text).toBe(false);
+  });
+
+  it.each([
+    "The user wants diamonds",
+    "the user asked about redstone",
+    "answering the user now",
+    "yeah the user is asking me about redstone",
+  ])("IS a leak: %j", (text) => {
+    expect(detectLeakedReasoning(text).leaked, text).toBe(true);
   });
 });

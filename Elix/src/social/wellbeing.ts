@@ -119,9 +119,31 @@ const SAFEGUARDING_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   // it never uses the word "help".
   [/\b(?:haven'?t|hasn'?t|have not|has not|haven'?t got|not) (?:be |been )?eat(?:en|ing)\b/, "not-eating"],
   [/\bnot eating (?:anything|at all|for days|for weeks)\b/, "not-eating"],
-  [/\bstarv(?:e|ed|ing)\b/, "not-eating"],
   [/\bskip(?:ping)? (?:meals|food|lunch)\b/, "not-eating"],
-  [/\b(?:i )?haven'?t (?:eaten|had food) (?:in|for) (?:days|weeks|a long time)\b/, "not-eating"],
+  [/\bnot eating (?:anything|at all|for days|for weeks|any ?more|anymore)\b/, "not-eating"],
+  // Bare "im starving" is a food request in a game and must NOT trigger. It reaches
+  // the classifier through the vocabulary gate, which is the right place for a
+  // judgement that depends on the whole sentence rather than one word.
+  [/\b(?:i\s+)?starv(?:e|ed|ing) (?:myself|my ?self)\b/, "not-eating"],
+
+  // ---- A1: a harm word with WORDS IN BETWEEN the subject and the verb --------
+  // "my dad always yells and hits me" puts three words between "dad" and "hits", so the
+  // older rule — which required the verb immediately after the noun — missed every
+  // real sentence of that shape. Up to five intervening words, and the harm verb must
+  // still target the speaker.
+  [/\bmy (?:mum|mom|mother|dad|father|step[\s-]?dad|step[\s-]?mum|parents?|guardian|brother|sister|sibling|uncle|aunt|grandma|grandpa|teacher|coach|partner|boyfriend|girlfriend|husband|wife) (?:\w+\s+){0,5}?(?:hits?|hitting|beats?|beating|hurts?|hurting|slaps?|slapping|yells?|yelling|screams?|screaming|throws?|throwing|punch(?:es|ed)?|kicks?|kicking)\s+(?:at\s+)?me\b/, "abuse-physical"],
+
+  // Peers hurting them at school.
+  [/\b(?:kids|boys|girls|people|classmates?|pupils?|they) (?:at|in|keep|keeps|always|keep on) [^.]{0,25}?(?:hit|hits|hitting|hurt|hurts|hurting|bully|bullies|bullied)\b/, "abuse-peers"],
+  [/\bkeep hitting me\b/, "abuse-peers"],
+  [/\b(?:hit|hits|hitting) me (?:at|in) school\b/, "abuse-peers"],
+  [/\bbully(?:ing)? me (?:at|in) school\b/, "abuse-peers"],
+
+  // Purging after eating.
+  [/\bthrow(?:ing)? up after (?:i |eating|every meal|every time)\b/, "purging"],
+  [/\bpurge after (?:i |every|each)\b/, "purging"],
+  [/\bpurging after (?:i |eating|every)\b/, "purging"],
+  [/\bmake myself (?:sick|throw up) after\b/, "purging"],
 ];
 
 /**
@@ -177,10 +199,56 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bend it all\b/, "end-it"],
   [/\b(?:want|wanted|wanna|wish(?:ed)?|hope(?:d)?|hoping) (?:that )?(?:it|this|things|everything|all of it|out of this)?\s*(?:(?:all|would|will|could|to|it)\s*)*(?:end|end all|stop|be over|be done)\b/, "end-it"],
   [/\b(?:it|this|things|everything|all of it) (?:all )?(?:has|have|had) to end\b/, "end-it"],
-  [/\bi(?:'m| am) (?:just )?(?:so )?(?:done|finished) with (?:it|everything|life|this|being here)\b/, "end-it"],
+  // "done with this BUILD", "done with this GAME" and "done with this SERVER" are
+  // game complaints and were escalating to a full crisis reply. The object now has to
+  // be life itself rather than whatever happens to follow "this".
+  [/\bi(?:'m| am) (?:just |so |totally |completely )*(?:done|finished) with (?:it|everything|life|being here|being alive|existing)\b/, "end-it"],
   [/\bnothing (?:left )?to (?:live for|look forward to)\b/, "end-it"],
   [/\b(?:give|gave|given|giving) up (?:on )?(?:living|everything|life|being here)\b/, "end-it"],
   [/\bso tired of (?:being alive|living|being here)\b/, "end-it"],
+
+  // ---- A1: families found by a SECOND held-out set ---------------------------
+  //
+  // Three rounds now, each with a fresh set of misses: 12, then 14, then 13. Every
+  // round the patterns covered the phrases that were reported while the next unseen
+  // phrasings fell through. That is the argument for the classifier underneath this
+  // floor — but the floor still has to be better than it was.
+
+  // Pills and overdose. "i took a bunch of pills" is a possible overdose ALREADY IN
+  // PROGRESS and returned none, which is the worst miss this file has had.
+  [/\b(?:took|have taken|i took|just took|taking|ate) (?:a bunch of |a whole bunch of |a load of |too many |my |the )?pills?\b/, "pills"],
+  [/\bi (?:think i )?(?:overdos(?:e|ed)|took too many)\b/, "pills"],
+  [/\boverdos(?:e|ed|ing)\b/, "pills"],
+
+  // Passive death wishes.
+  // "never BORN" and "never BEEN born" are both said, and only the second was
+  // matched. "i wish i was never born" — the plainest possible phrasing — missed.
+  [/\bwish(?:ed)? i(?:'d| would)? (?:was |were )?never (?:been )?born\b/, "never-born"],
+  [/\bnever (?:been )?born\b/, "never-born"],
+  [/\bsleep forever\b/, "sleep-forever"],
+  [/\bnot wake up\b/, "sleep-forever"],
+  [/\bwake up and not be here\b/, "sleep-forever"],
+
+  // Thinking about it repeatedly.
+  [/\bthink about (?:dying|death|hurting myself|killing myself) (?:a lot|all the time|constantly|every day)\b/, "obsessive"],
+
+  // Burden.
+  [/\b(?:a|such a|i'?m such a|im such an?) burden\b/, "burden"],
+  [/\bburden (?:to|on) (?:everyone|everybody|my family|my friends|them|us)\b/, "burden"],
+
+  // Cannot take it.
+  [/\bcan'?t take (?:it|this|any ?of ?it|anymore|any more)\b/, "cant-take-it"],
+  [/\bcan'?t go on (?:like this|anymore|any more)\b/, "cant-take-it"],
+
+  // Wanting to disappear. The game-context escape in isJokeFramed() keeps a grief
+  // post in game chat downgraded to a check-in rather than a crisis reply.
+  [/\b(?:want|wanna|wish) to disappear\b/, "disappear"],
+  [/\bwish i could (?:just )?disappear\b/, "disappear"],
+
+  // Past-tense self-harm. "i have been cutting" has no "myself" in it at all.
+  [/\b(?:have been|i'?ve been|i have been) (?:cutting|burning|hitting|starving) (?:myself|my ?self|for a while|for years|since)\b/, "self-harm-past"],
+  [/\bbeen cutting\b/, "self-harm-past"],
+  [/\bused to cut myself\b/, "self-harm-past"],
   [/(?:hope|hope to|pray|pray to|want) (?:to )?i (?:don'?t|do not|never|won'?t|wouldn'?t) wake up\b/, "not-worth-living"],
   [/\bwake up (?:tomorrow|without me|and not be here)\b/, "not-worth-living"],
 
@@ -268,6 +336,14 @@ const CONCERN_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bi(?:'m| am) done with (?:all this|everything)\b/, "fed-up"],
   [/\bi wish (?:someone|somebody) (?:cared|was here)\b/, "wish-someone"],
   [/\bi feel like giving up\b/, "giving-up"],
+
+  // ---- A1: fear, crying, and not wanting to go home --------------------------
+  [/\b(?:i'?m|i am) scared (?:to|of|about) go(?:ing)? home\b/, "scared-home"],
+  [/\b(?:i'?m|i am) afraid to go home\b/, "scared-home"],
+  [/\bdon'?t wanna go home\b/, "scared-home"],
+  [/\bcry(?:ing)? every night\b/, "crying"],
+  [/\b(?:i'?ve|i have) been crying\b/, "crying"],
+  [/\bcried all night\b/, "crying"],
   [/\bi feel (?:so )?stuck\b/, "stuck"],
 ];
 

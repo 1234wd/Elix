@@ -123,6 +123,7 @@ describe("A1 — the brain's store stays open for the whole session", () => {
   it("still answers after runBot() has resolved (the reported failure)", async () => {
     const h = harness();
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -372,6 +373,7 @@ describe("A3 — answering someone who spoke to Elix never spends the idle budge
       ],
     });
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -655,6 +657,7 @@ describe("A5 — the output filter is the real defence", () => {
       cacheEnabled: false,
     });
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router,
       username: "Elix",
       log: { ...noLog, error: (o: unknown) => errors.push(JSON.stringify(o)) } as never,
@@ -678,6 +681,7 @@ describe("A5 — the output filter is the real defence", () => {
       cacheEnabled: false,
     });
     const bridge2 = new ChatBridge({
+    typingRandom: () => 0.99,
       router: router2,
       username: "Elix",
       log: noLog as never,
@@ -714,6 +718,7 @@ describe("A5 — blocked messages get their own reply pool", () => {
   it("uses the blocked pool, not the generic pool, for an injection attempt", async () => {
     const h = harness();
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -782,6 +787,7 @@ describe("A6 — a name at the end of a message is still an address", () => {
   it("routes a greeting plus a question through the bridge", async () => {
     const h = harness();
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -825,6 +831,7 @@ describe("A9 — one in-flight reply per player", () => {
       ],
     });
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -863,6 +870,7 @@ describe("A9 — one in-flight reply per player", () => {
   it("tracks players independently", async () => {
     const h = harness();
     const bridge = new ChatBridge({
+    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,

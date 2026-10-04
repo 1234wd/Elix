@@ -19,6 +19,14 @@ import { checkInputSafety, BLOCKED_LINES } from "./fallback.js";
 import { isGreetingLine, manipulationProblem } from "../social/emotion.js";
 import type { WellbeingLevel } from "../social/wellbeing.js";
 import {
+  CLASSIFIER_POLICY,
+  detectImminent,
+  mergeVerdict,
+  needsSecondLook,
+  parseVerdict,
+  type ClassifierVerdict,
+} from "../social/wellbeingClassifier.js";
+import {
   WELLBEING_SYSTEM_PROMPT,
   WellbeingState,
   buildWellbeingReply,
@@ -116,6 +124,11 @@ export interface ChatBridgeOptions {
   /** C5: seedable, so the template pool is reproducible in a test. */
   random?: () => number;
   /**
+   * A1: deadline for the `guard` classifier. A reply that arrives after the player
+   * has read someone else's message is not a wellbeing reply.
+   */
+  classifierTimeoutMs?: number;
+  /**
    * C3: seedable, so the 1-in-15 typo rate is assertable instead of being a
    * thing you can only observe by luck.
    */
@@ -132,6 +145,20 @@ export interface BridgeReply {
   text?: string;
   usedProvider?: string;
 }
+
+/**
+ * What Elix says when something has ALREADY happened or is happening right now.
+ *
+ * A fixed constant, never an LLM output. A general crisis reply encourages reaching
+ * out to a trusted adult, which is the right advice and far too slow once pills have
+ * been taken: this one says contact emergency services RIGHT NOW and get an adult to
+ * them physically.
+ *
+ * No phone number, because safety.helplineText is empty by default and an invented
+ * one sends someone dialling a place that does not exist.
+ */
+const IMMINENT_REPLY =
+  "please contact your local emergency services right now. and please go to an adult near you right now and tell them what is happening - a parent, a teacher, anyone. i am here, and i am not going anywhere.";
 
 export class ChatBridge {
   private readonly opts: ChatBridgeOptions;
@@ -287,23 +314,75 @@ export class ChatBridge {
  * one that would be recognisable as a shrug.
  */
 private async wellbeingReply(sender: string, message: string): Promise<string | null> {
-  const signal = detectWellbeing(message);
-  if (signal.level === "none") return null;
+  /**
+   * A1 - the two layers, and the order is the safety property.
+   *
+   * The regex is the instant floor. It has now missed three rounds of held-out
+   * phrases (12, then 14, then 13) including "i took a bunch of pills" returning
+   * none, because distress language is open-ended and a finite list of patterns is
+   * the wrong shape for it. Anything the floor finds interesting gets a second look.
+   *
+   *   1. a regex CRISIS never calls the model - nothing gets to talk Elix out of it;
+   *   2. imminent danger is deterministic and overrides everything;
+   *   3. otherwise, if the vocabulary gate fires, the guard role is asked.
+   */
+  const regexSignal = detectWellbeing(message);
+  const gated = needsSecondLook(message);
+  const imminent = detectImminent(message);
 
-  logWellbeing(this.opts.log, signal.level, sender);
+  let level: WellbeingLevel = regexSignal.level;
+  let urgent = false;
+
+  if (imminent !== null) {
+    // Something has already happened, or is happening now. A model must never be
+    // the thing that decides whether an ambulance is needed.
+    level = "crisis";
+    urgent = true;
+    this.opts.log?.warn({ rule: imminent }, "wellbeing: imminent danger");
+  } else if (regexSignal.level !== "crisis" && gated) {
+    const merged = mergeVerdict({
+      regexLevel: regexSignal.level,
+      imminent: null,
+      verdict: await this.classifyWellbeing(message),
+      gated,
+    });
+    level = merged.level;
+    urgent = merged.imminent;
+    this.opts.log?.debug(
+      { level: merged.level, source: merged.source, reason: merged.reason },
+      "wellbeing second layer merged",
+    );
+  }
+
+  if (level === "none") return null;
+
+  logWellbeing(this.opts.log, level, sender);
+
+  if (urgent) {
+    if (this.wellbeingState.mayRecord(sender)) {
+      this.opts.memory?.recordWellbeing?.({
+        player: sender,
+        text: wellbeingEpisodeText(sender, "crisis"),
+      });
+    }
+    this.wellbeingState.noteAnswered(sender);
+    // No phrasing pass: the one reply that must never be reworded by a model is the
+    // one for someone who has already taken something.
+    return IMMINENT_REPLY;
+  }
 
   // Once per session, and redacted. Importance 9 so it survives consolidation.
   if (this.wellbeingState.mayRecord(sender)) {
     this.opts.memory?.recordWellbeing?.({
       player: sender,
-      text: wellbeingEpisodeText(sender, signal.level),
+      text: wellbeingEpisodeText(sender, level),
     });
-    this.opts.log?.info({ player: sender, level: signal.level }, "wellbeing note stored");
+    this.opts.log?.info({ player: sender, level }, "wellbeing note stored");
   }
 
   const already = this.wellbeingState.recentlyAnswered(sender);
   const template = buildWellbeingReply({
-    level: signal.level,
+    level,
     helplineText: this.opts.helplineText ?? "",
     alreadyAnswered: already,
     random: this.random,
@@ -311,7 +390,7 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
   this.wellbeingState.noteAnswered(sender);
 
   // The template is already safe, so this can only improve it, never worsen it.
-  const phrasing = await this.phraseWellbeing(signal.level, template);
+  const phrasing = await this.phraseWellbeing(level, template);
   return phrasing ?? template;
 }
 
@@ -321,6 +400,46 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
  *
  * Never throws. A failure here is the expected case, not an incident.
  */
+/**
+ * Ask the guard role to classify ONE line.
+ *
+ * PRIVACY is a design constraint here, not a detail: only the single line goes. No
+ * player name, no history, no conversation. The model may be reading the most
+ * sensitive sentence anyone has typed in this server, and it sees nothing else.
+ *
+ * Never throws. A failure means "use the regex", which is the whole reason the
+ * regex stays.
+ */
+private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), this.opts.classifierTimeoutMs ?? 2000);
+  try {
+    const res = await this.opts.router.complete({
+      messages: [
+        { role: "system", content: CLASSIFIER_POLICY },
+        { role: "user", content: message },
+      ],
+      // guard is the safety role, already resolved in models.yaml. The budget is
+      // tiny because this sits in the path of a reply.
+      maxTokens: 120,
+      temperature: 0,
+      role: "guard",
+      bypassIdleBudget: true,
+      source: "wellbeing-classifier",
+      signal: controller.signal,
+    });
+    return parseVerdict(res.text ?? "");
+  } catch (err) {
+    this.opts.log?.debug(
+      { err: (err as Error).message },
+      "wellbeing classifier unavailable - using the regex result",
+    );
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 private async phraseWellbeing(
     level: Exclude<WellbeingLevel, "none">,
     template: string,
