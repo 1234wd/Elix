@@ -85,6 +85,85 @@ export function stripReasoning(raw: unknown): ReasoningSplit {
 }
 
 /** Is this a reasoning model at all? Non-reasoning models get no extra params. */
+
+/* ------------------------------------------------------- leaked reasoning */
+
+/**
+ * Prefixes that mean the model's ANALYSIS, not its answer, got sent to a player.
+ *
+ * gpt-oss emits its scratchpad into `content` when the reasoning channel is not
+ * separated, and what reaches the game reads like this:
+ *
+ *     "We have **………..?????..?....????…"
+ *
+ * The punctuation-run check caught that one, but only by luck. The real defect is
+ * the PREFIX: a coherent leaked sentence passes every other check there is. This
+ * is the actual observed coherent leak:
+ *
+ *     "We need to answer the user about their favourite block."
+ *
+ * Nothing about that is malformed. It is a well-formed sentence, it is simply not
+ * something to say to someone in a Minecraft server.
+ *
+ * Matched on the FIRST few characters only. A mid-message "the user" is
+ * legitimate — Elix talks about the person he is talking to — so this must not
+ * fire on a stray mention.
+ */
+const LEAKED_REASONING_PREFIXES: ReadonlyArray<readonly [RegExp, string]> = [
+  // "We have…", "We need to…", "We should…". The leading \** absorbs the markdown
+  // bold the model wraps its scratchpad in.
+  [/^\**\s*we\s+(?:have|need|should|must|want|can|could|are|will)\b/i, "we-" + "prefix"],
+  [/^\**\s*the\s+user\b/i, "the-user"],
+  [/^\**\s*let(?:'?s|\s+us)\s+(?:think|consider|analy[sz]e|break\s+it\s+down)\b/i, "lets-think"],
+  [/^\**\s*analysis\b/i, "analysis"],
+  // A numbered or bulleted scratchpad that slipped through.
+  [/^\**\s*(?:step\s+\d|reasoning\s*:)/i, "scratchpad-marker"],
+];
+
+export interface LeakedReasoningResult {
+  leaked: boolean;
+  /** Which prefix matched. Never the text itself. */
+  rule: string;
+}
+
+/**
+ * Is this analysis rather than an answer?
+ *
+ * TRUE POSITIVES matter more than a missed one here, because the failure mode is
+ * mild: the router treats it as a failed attempt and tries the NEXT model. The
+ * worst false positive is that a perfectly good reply from one model gets
+ * discarded in favour of another model's answer.
+ *
+ * That is the trade, and it is worth making. The cost of the opposite mistake —
+ * sending "We need to answer the user about their favourite block" to a player on
+ * a public server — is the whole product looking broken.
+ *
+ * THE KNOWN COLLISION SURFACE, measured rather than assumed. These are ordinary
+ * things Elix might say that this rule will still discard:
+ *
+ *     "we have enough iron for that"
+ *     "we should meet at spawn"
+ *     "the user of this server is not me"
+ *
+ * That is the accepted cost, and it is the right way round: a discarded reply
+ * means one extra model call and a slightly different answer, while a leaked
+ * sentence means a player on a public server is told "We need to answer the user
+ * about their favourite block". tests/unit/leakedReasoning.test.ts asserts these
+ * specific collisions, so the surface is a measured property rather than
+ * something to be surprised by later.
+ */
+export function detectLeakedReasoning(text: string): LeakedReasoningResult {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return { leaked: false, rule: "empty" };
+  // Only the opening of the message. A leak is a model that starts its answer
+  // with its scratchpad.
+  const head = trimmed.slice(0, 120);
+  for (const [re, rule] of LEAKED_REASONING_PREFIXES) {
+    if (re.test(head)) return { leaked: true, rule };
+  }
+  return { leaked: false, rule: "no-prefix-match" };
+}
+
 export function isReasoningModel(model: string): boolean {
   const m = model.toLowerCase();
   return (

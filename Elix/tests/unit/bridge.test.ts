@@ -66,6 +66,13 @@ function build(opts: { routes?: Parameters<typeof fakeFetch>[0]; persona?: strin
     log: noLog as unknown as Logger,
     personaLite: opts.persona ?? "",
     ...(opts.signal ? { signal: opts.signal } : {}),
+    // C3 typing realism is OFF here on purpose: every assertion in this file is
+    // about the bridge's decision (answer, deflect, block, remember), not about
+    // whether a reply was misspelt. Random typos made "never sends reasoning text
+    // into chat" fail with ['sulfur, honesgly', '*honestly'] instead of
+    // ['sulfur, honestly'], which tests nothing about reasoning. Typing realism has
+    // its own file, tests/unit/typing.test.ts.
+    typingRandom: () => 1,
   });
   cleanups.push(() => {
     store.close();

@@ -66,7 +66,32 @@ const voiceSchema = z.object({
 const safetySchema = z.object({
   contentLevel: z.enum(["kid-safe", "adult"]).default("kid-safe"),
   chatRateLimitPer2s: z.number().int().positive().default(1),
+  /**
+   * C5: quoted verbatim in a crisis reply, and ONLY when set.
+   *
+   * Empty by default and there is no default number anywhere in the codebase. An
+   * invented helpline sends someone dialling a place that does not exist, which is
+   * worse than saying nothing at all — so if this is blank, the reply simply
+   * encourages reaching a trusted adult or local emergency services without
+   * naming a number.
+   */
+  helplineText: z.string().max(300).default(""),
+  /**
+   * Whether Elix may use emoji in chat.
+   *
+   * Off by default: Minecraft renders most of them as empty boxes, and persona.md
+   * describes plain lowercase gamer chat. Live replies were arriving with 🎉🍒 and
+   * 🌱✌️, which read as garbage in game. Plain-text faces like :) are unaffected.
+   */
+  allowEmoji: z.boolean().default(false),
 });
+
+const skillCapSchema = z
+  .enum(["casual", "normal", "tryhard"])
+  .default("normal")
+  .describe(
+    "Phase 6: how hard Elix plays. Affects reaction delay, aim and PvP aggression. casual is slow and passive, normal is the default, tryhard is fast and fights back.",
+  );
 
 export const elixConfigSchema = z.object({
   version: z.literal(1),
@@ -76,6 +101,8 @@ export const elixConfigSchema = z.object({
   brain: brainSchema.default({}),
   voice: voiceSchema.default({}),
   safety: safetySchema.default({}),
+  /** Phase 6: reflex + skill layer cap. */
+  skillCap: skillCapSchema.default("normal"),
   persona: z.string().default("config/persona.md"),
   dataDir: z.string().default("data"),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),

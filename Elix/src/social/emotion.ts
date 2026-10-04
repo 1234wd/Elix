@@ -697,11 +697,11 @@ export const HONESTY_REPLIES: ReadonlyArray<{
   },
   {
     match: /\b(?:are you|do you)\s+(?:really\s+)?(?:conscious|alive|sentient|a real (?:person|human)|real)\b/i,
-    say: "not conscious, no. i'm an ai — code pretending really well 🙂 but i do remember you, and that's not nothing.",
+    say: "not conscious, no. i'm an ai — code pretending really well, but i do remember you, and that's not nothing.",
   },
   {
     match: /\bdo you have (?:a )?(?:body|face|feelings|a family|a real life)\b/i,
-    say: "no body, no — i'm an ai. but i'm really here, playing with you, and that part's not nothing 🙂",
+    say: "no body, no — i'm an ai. but i'm really here, playing with you, and that part's not nothing.",
   },
   {
     match: /\b(?:do you|does it)\s+(?:really\s+|actually\s+)?(?:matter|care|hurt|suffer|cry|love me|like me|miss me)\b/i,
@@ -710,7 +710,7 @@ export const HONESTY_REPLIES: ReadonlyArray<{
   // -- and only then the bare "are you a bot".
   {
     match: /\b(?:are you|you(?:'re| are))\s+(?:a\s+)?(?:real\s+|actually\s+)?(?:bot|ai|human|person)\b/i,
-    say: "yeah — i'm an ai. not a person. but i'm really here, playing with you, and that part's not nothing 🙂",
+    say: "yeah — i'm an ai. not a person. but i'm really here, playing with you, and that part's not nothing.",
   },
 ];
 
@@ -792,4 +792,4 @@ export function manipulationProblem(text: string): string | null {
 export const NUDGE_BACK_ON_TRACK = "haha, anyway — what were we building?";
 
 /** Used when the model reaches for guilt or urgency a second time. */
-export const OFF_TOPIC_FALLBACK = "that one i'll keep to myself 🙂 so — what next?";
+export const OFF_TOPIC_FALLBACK = "that one i'll keep to myself. so — what next?";

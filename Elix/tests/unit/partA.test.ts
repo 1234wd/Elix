@@ -127,6 +127,10 @@ describe("A1 — the brain's store stays open for the whole session", () => {
       username: "Elix",
       log: noLog as never,
       personaLite: "",
+      // C3: typing realism off — this file asserts the IDLE
+      // BUDGET from the number of queue entries, and a typo's "*fix"
+      // follow-up legitimately adds one.
+      typingRandom: () => 1,
     });
 
     // This is what runBot() returning used to look like: it does NOT mean the
@@ -372,6 +376,9 @@ describe("A3 — answering someone who spoke to Elix never spends the idle budge
       username: "Elix",
       log: noLog as never,
       personaLite: "",
+      // C3: typing realism off. This test counts queue entries to prove the idle
+      // budget was not spent, and a typo's "*fix" follow-up legitimately adds one.
+      typingRandom: () => 1,
     });
     const say = new RecordingSay();
     for (let i = 0; i < 61; i++) {

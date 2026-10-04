@@ -46,6 +46,31 @@ safety:
   # Max 1 chat message per 2 seconds.
   chatRateLimitPer2s: 1
 
+  # Quoted verbatim in a CRISIS reply, and only when this is non-empty.
+  #
+  # There is no default helpline anywhere in the codebase, and none is invented:
+  # a made-up phone number sends someone dialling a place that does not exist,
+  # which is worse than saying nothing. Left empty, a crisis reply still tells the
+  # player to reach a trusted adult or their local emergency services, without
+  # naming a number.
+  #
+  # Set it to YOUR local crisis line if you want one quoted, e.g.
+  #   helplineText: "childline on 0800 1111 (UK)"
+  helplineText: ""
+
+  # Whether Elix may use emoji. OFF by default.
+  #
+  # Minecraft's font has no glyph for most emoji, so 🎉 arrives in game as an empty
+  # box, and persona.md describes plain lowercase chat. Live replies were observed
+  # carrying 🎉🍒 and 🌱✌️. Plain-text faces like :) and :D are unaffected either way.
+  allowEmoji: false
+
+# How hard Elix plays. Affects reaction delay, aim and PvP aggression.
+#   casual   slow to react, passive, avoids fights
+#   normal   the default
+#   tryhard  fast reactions, fights back
+skillCap: normal
+
 persona: config/persona.md
 dataDir: data
 logLevel: info

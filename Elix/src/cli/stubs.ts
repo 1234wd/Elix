@@ -145,6 +145,13 @@ function openMemory(
       },
       preference: (player, kind) => engine.preference(player, kind),
       capturePreference: (player, text) => engine.capturePreference(player, text),
+      // C5: store the REDACTED note, never the words. Importance 9 so it survives
+      // consolidation and Elix can gently check in next time.
+      recordWellbeing: ({ player, text }) => {
+        void Promise.resolve(engine.record({ text, speaker: "player", player, kind: "chat" })).catch(
+          () => {},
+        );
+      },
       // C3: "only greet someone you know". A row in `people` is the definition of
       // having met them, and it exists for anyone who has ever joined or spoken.
       known: (player) => store.person(player) !== null,
@@ -311,6 +318,10 @@ export function registerStubs(program: Command): void {
           username: profile.username,
           log,
           signal: brainAbort.signal,
+          // C5: quoted verbatim ONLY when the owner configured one. There is no
+          // default helpline anywhere, because an invented number is worse than
+          // none at all.
+          helplineText: config.safety.helplineText,
         });
 
         // A1: the brain's SQLite store must live as long as the PROCESS.

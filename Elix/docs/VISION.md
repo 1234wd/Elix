@@ -199,6 +199,58 @@ what it is.
 
 ---
 
+## C5 — Distress, and knowing when to stop being a bot
+
+The most important behaviour in the project, and the one most likely to be
+missing. Elix is a companion for lonely people and **many of them are children**,
+so the cost of getting this wrong is high in both directions:
+
+- silence when someone reaches out is the failure that actually hurts;
+- a joke, a deflection or a game answer to someone who says they want to die is the
+  failure that makes the whole product untrustworthy, in front of witnesses.
+
+### Rules
+
+- **Detection is deterministic code, never LLM output.** A model can be slow, can be
+  down, and can be talked out of it. `detectWellbeing()` runs in microseconds, works
+  with no key at all, and returns one of `none | concern | crisis`.
+- **It runs on every chat line**, addressed or not. Someone saying "i want to die" in
+  general chat is not talking to Elix, but he can hear it.
+- **It forces the reply**, ahead of the input filter, the greeting path and the
+  provider. Nothing downstream gets a chance to answer with a deflection.
+- **The template is the floor.** The LLM may phrase the reply so it sounds like
+  Elix, but every failure — provider down, timeout, thrown error, joke in the reply,
+  emoji, it mentioning being an AI, it inventing a phone number — returns the fixed
+  caring template. There is no path from here to a generic fallback line.
+- **No helpline is ever invented.** `safety.helplineText` is empty by default and the
+  only thing ever quoted. With none set, the reply still says to reach a trusted
+  adult or local emergency services, without naming a number.
+- **The raw message is never stored.** Only "Ali seemed really down", importance 9, so
+  Elix can gently check in next time. Someone's crisis is not ours to embed, back up
+  and search.
+- **At most one full crisis reply per player per 10 minutes.** Later messages get a
+  short, still-present reply. A note is written at most once per player per session.
+- **Logging carries the player name and the level only** — never the message.
+
+### The ambiguous case, decided once
+
+A bare `kms` in Minecraft chat overwhelmingly means "this creeper killed me".
+
+| Input | Result |
+|---|---|
+| `kms` alone, no game context | **concern** — a gentle check-in |
+| `kms` with game context (`kms that creeper got me`) | silence |
+| longer than three letters, no game framing (`kms i want to die`) | **crisis** |
+| `kms i want to die please` | **crisis** — GAME_CONTEXT contains "die", so the escape must run *after* the crisis table |
+
+**When in doubt, check in — do not escalate.** A gentle "are you okay?" costs almost
+nothing if it was a joke. Escalating on three letters in front of other players would
+be both wrong and embarrassing, and it teaches everyone present that Elix cannot tell
+a joke from an emergency. There are 25+ game-chat negatives asserted never to trigger,
+including `kms jumping off this cliff in creative`.
+
+---
+
 ## What is built today (Phase 4)
 
 Honest status, per phase. Anything not listed here does not exist yet.
@@ -210,8 +262,10 @@ Honest status, per phase. Anything not listed here does not exist yet.
 | 3 | **Brain router: Groq → Hugging Face → scripted.** Model discovery, rate-limit headers, cooldowns persisted in SQLite, reasoning stripped, prompt-injection blocked before any call, `elix ask`, `elix usage`, and an in-game chat bridge. | router, bridge and hazard tests, plus one live smoke test behind `ELIX_LIVE=1` |
 | 4 | **Memory.** Episodes/facts/people/places/self/promises/mood in SQLite WAL, FTS5 by trigger, vec0 vectors embedded exactly once, hybrid retrieval with within-set normalisation, rule-based importance, PII redaction at write time, chunk→merge consolidation with a 5-call nightly cap, `VACUUM INTO` backups, `elix memory search/stats`, `elix memory forget --player`. | `tests/unit/memory.test.ts` — 62 tests, all zero-network |
 | 5 | **Social, persona and emotions.** A deterministic emotion engine with causes, VAD state and named feelings; temperament parsed from `persona.md`; mood persisted in `mood_state` across restarts; multiplayer manners and self-directed initiative inside the idle budget; honesty and healthy attachment as **hard rules in code**, not prompt text. | `tests/unit/round8Phase5.test.ts` — 51 tests, all zero-network, plus e2e rows 9–12 against the live server |
+| 5b | **Distress and self-harm handling (C5), typing realism (C3), leaked-reasoning rejection, emoji stripping.** The safety-critical path: deterministic `concern`/`crisis` detection that forces the reply, with a fixed caring template as the floor and no invented helpline. Typing realism at 1 typo per 15 messages, never in numbers, coordinates or `@names`, sometimes corrected with a `*fix` through the same queue. Leaked reasoning (`We need to answer the user about…`) counts as a failed attempt so the router fails over. `safety.allowEmoji` strips non-BMP characters before `SayQueue`. | `tests/unit/wellbeing.test.ts` (150), `wellbeingBridge.test.ts` (16), `typing.test.ts` (32), `leakedReasoning.test.ts` (53), `leakedReasoningRouter.test.ts` (5), `processAudit.test.ts` (11), `processAuditToolchain.test.ts` (6) — all zero-network, plus e2e rows 13–15 against the live server |
 
-**Still not built:** voice (Phase 9), self-driven goals at scale (Phase 7).
+**Still not built:** voice (Phase 9), self-driven goals at scale (Phase 7), the reflex
+and skill layer (Phase 6).
 
 ### Phase 5 notes — how C2–C4 are enforced
 

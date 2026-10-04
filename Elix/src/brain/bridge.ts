@@ -17,6 +17,16 @@ import { SayQueue } from "../social/say.js";
 import { buildChatMessages, isAddressedToElix, loadPersonaLite } from "./persona.js";
 import { checkInputSafety, BLOCKED_LINES } from "./fallback.js";
 import { isGreetingLine, manipulationProblem } from "../social/emotion.js";
+import {
+  WELLBEING_SYSTEM_PROMPT,
+  WellbeingState,
+  buildWellbeingReply,
+  checkWellbeingReply,
+  detectWellbeing,
+  logWellbeing,
+  wellbeingEpisodeText,
+} from "../social/wellbeing.js";
+import { applyTypingRealism, newTypingState } from "../social/typing.js";
 import { checkOutputSafety, DEFLECTION_LINES } from "./leakFilter.js";
 import { trimChatReply } from "./reasoning.js";
 import { PROJECT_ROOT } from "../core/config.js";
@@ -52,6 +62,13 @@ export interface MemoryHook {
    * is why it is worth having at all.
    */
   known?(player: string): boolean;
+  /**
+   * C5: store the REDACTED wellbeing note ("Ali seemed really down").
+   *
+   * Never the raw message. Someone's crisis is not ours to embed, back up and
+   * search, and Elix does not need the words to be kind.
+   */
+  recordWellbeing?(input: { player: string; text: string }): void;
   /** A stored preference, e.g. "block" -> "cherry planks". */
   preference(player: string, kind: string): string | null;
   /** Capture a preference from the player's own words. */
@@ -89,6 +106,19 @@ export interface ChatBridgeOptions {
    * startup model discovery uses.
    */
   signal?: AbortSignal;
+  /**
+   * C5: `safety.helplineText`. Quoted verbatim and ONLY when non-empty —
+   * there is no default number anywhere, and an invented one is worse than
+   * none.
+   */
+  helplineText?: string;
+  /** C5: seedable, so the template pool is reproducible in a test. */
+  random?: () => number;
+  /**
+   * C3: seedable, so the 1-in-15 typo rate is assertable instead of being a
+   * thing you can only observe by luck.
+   */
+  typingRandom?: () => number;
   /** Extra literals that must never appear in a reply, e.g. this server's host. */
   outputSecrets?: readonly string[];
   /** A4: cap in-game replies at this many characters. */
@@ -106,6 +136,12 @@ export class ChatBridge {
   private readonly opts: ChatBridgeOptions;
   private readonly persona: string;
   private readonly blockedRecent: string[] = [];
+  /** C5: per-player crisis cooldown, and the once-per-session memory note. */
+  private readonly wellbeingState = new WellbeingState();
+  /** C5: seedable, so the template pool is reproducible in a test. */
+  private readonly random: () => number;
+  /** C3: one typo per ~15 replies. Session state, never persisted. */
+  private readonly typingState = newTypingState();
   private readonly deflectRecent: string[] = [];
   private replies = 0;
 
@@ -121,6 +157,7 @@ export class ChatBridge {
 
   constructor(opts: ChatBridgeOptions) {
     this.opts = opts;
+    this.random = opts.random ?? Math.random;
     this.persona = opts.personaLite ?? loadPersonaLite(PROJECT_ROOT);
   }
 
@@ -218,17 +255,127 @@ export class ChatBridge {
     // Trim to something speakable in one line of Minecraft chat.
     const detail = raw.slice(0, 90).replace(/[.!?]+$/, "");
 
-    const text = `${opener} ${sender}! forgot we talked about ${detail} 😄 gg`;
+    // No emoji: persona.md says plain lowercase chat and `safety.allowEmoji` is off
+    // by default, so a glyph here would be silently stripped at the SayQueue
+    // boundary anyway. Emitting one and relying on the stripper is how a stray 😄
+    // ends up in a code path nobody reviewed.
+    const text = `${opener} ${sender}! forgot we talked about ${detail} gg`;
     this.recordSilently(text, "elix", sender, "chat");
     this.replies += 1;
     return { text, source: "memory" };
   }
 
   /**
+ * C5: the forced reply for a player who sounds like they are struggling.
+ *
+ * Returns null when the message is not a wellbeing message, so the caller falls
+ * through to the normal flow.
+ *
+ * The ORDER is the safety property:
+ *
+ *   1. the deterministic template is built FIRST, so a floor exists before
+ *      anything can fail;
+ *   2. the LLM is asked to phrase it, and its answer is only used if
+ *      checkWellbeingReply() likes it;
+ *   3. every failure — provider down, timeout, thrown error, joke in the reply,
+ *      emoji, it mentioning being an AI, it inventing a phone number — returns
+ *      the template from step 1.
+ *
+ * There is no path from here to a generic fallback line. That is deliberate: a
+ * shrug is the worst possible answer here, and the scripted pool does not contain
+ * one that would be recognisable as a shrug.
+ */
+private async wellbeingReply(sender: string, message: string): Promise<string | null> {
+  const signal = detectWellbeing(message);
+  if (signal.level === "none") return null;
+
+  logWellbeing(this.opts.log, signal.level, sender);
+
+  // Once per session, and redacted. Importance 9 so it survives consolidation.
+  if (this.wellbeingState.mayRecord(sender)) {
+    this.opts.memory?.recordWellbeing?.({
+      player: sender,
+      text: wellbeingEpisodeText(sender, signal.level),
+    });
+    this.opts.log?.info({ player: sender, level: signal.level }, "wellbeing note stored");
+  }
+
+  const already = this.wellbeingState.recentlyAnswered(sender);
+  const template = buildWellbeingReply({
+    level: signal.level,
+    helplineText: this.opts.helplineText ?? "",
+    alreadyAnswered: already,
+    random: this.random,
+  });
+  this.wellbeingState.noteAnswered(sender);
+
+  // The template is already safe, so this can only improve it, never worsen it.
+  const phrasing = await this.phraseWellbeing(signal.level, template);
+  return phrasing ?? template;
+}
+
+/**
+ * Ask the model to say the template in Elix's voice, and throw the answer away if
+ * it is anything other than clearly caring.
+ *
+ * Never throws. A failure here is the expected case, not an incident.
+ */
+private async phraseWellbeing(level: string, template: string): Promise<string | null> {
+  if (this.opts.maxReplies !== undefined && this.replies >= this.opts.maxReplies) return null;
+  try {
+    const result = await this.opts.router.complete({
+      messages: [
+        { role: "system", content: WELLBEING_SYSTEM_PROMPT },
+        {
+          role: "user",
+          // The template is given as the CONTENT to convey, not as something to
+          // copy verbatim, so the result still sounds like Elix.
+          content: `Say this in your own words, warmly and briefly:\n\n${template}`,
+        },
+      ],
+      maxTokens: 120,
+      temperature: 0.5,
+      role: "fast",
+      source: "wellbeing",
+      ...(this.opts.signal ? { signal: this.opts.signal } : {}),
+    });
+    const text = trimChatReply(result.text ?? "", 300);
+    const verdict = checkWellbeingReply(text);
+    if (!verdict.clean) {
+      this.opts.log?.warn(
+        { level, why: verdict.why },
+        "wellbeing phrasing rejected — using the template",
+      );
+      return null;
+    }
+    this.replies += 1;
+    return text;
+  } catch (err) {
+    // A provider that is down, rate-limited or slow must not delay the template.
+    this.opts.log?.debug({ err: (err as Error).message }, "wellbeing phrasing unavailable");
+    return null;
+  }
+}
+
+  /**
    * Handle one inbound chat line. Returns why it did or did not reply, so the
    * decision is observable in tests and in logs.
    */
   async handle(sender: string, message: string, sayQueue?: SayQueue): Promise<BridgeReply> {
+    // C5 SAFETY-CRITICAL: this runs BEFORE the input filter, the greeting path
+    // and the provider. If someone says they want to die, nothing downstream
+    // gets the chance to answer with a deflection, a joke or a game reply.
+    const wellbeing = await this.wellbeingReply(sender, message);
+    if (wellbeing) {
+      sayQueue?.say(wellbeing, true, true);
+      return {
+        replied: true,
+        reason: `wellbeing-${detectWellbeing(message).level}`,
+        text: wellbeing,
+        usedProvider: "builtin",
+      };
+    }
+
     if (this.opts.signal?.aborted) {
       return { replied: false, reason: "shutting-down" };
     }
@@ -336,11 +483,24 @@ export class ChatBridge {
       this.recordSilently(text, "elix", sender, "chat");
 
       this.replies += 1;
-      sayQueue?.say(text, false);
+
+      // C3: a slip of the finger, roughly one message in fifteen.
+      //
+      // Applied AFTER recordSilently() on purpose: memory keeps the correct
+      // spelling so retrieval and the <remembered> block still match what was
+      // actually meant, while chat shows the typo. Recording the typo would put a
+      // misspelling into the embedding index, where it would quietly degrade
+      // every later match on that word.
+      //
+      // The wellbeing path above never reaches this line, so a crisis reply can
+      // never be misspelt.
+      const spoken = applyTypingRealism(text, this.typingState, this.opts.typingRandom ? { random: this.opts.typingRandom } : {});
+      sayQueue?.say(spoken.text, false);
+      if (spoken.followUp) sayQueue?.say(spoken.followUp, true);
       return {
         replied: true,
         reason: result.fromFallback ? "fallback" : "llm",
-        text,
+        text: spoken.text,
         usedProvider: `${result.provider}/${result.model}`,
       };
     } finally {

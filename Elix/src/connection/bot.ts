@@ -750,7 +750,12 @@ export class BotSession {
 
     // The rate limit comes from safety.chatRateLimitPer2s (A14).
     if (!this.say) {
-      this.say = new SayQueue({ maxPerWindow: this.deps.config.safety.chatRateLimitPer2s });
+      // A4: emoji off by default, because Minecraft renders most of them as empty
+      // boxes and persona.md describes plain lowercase chat.
+      this.say = new SayQueue({
+        maxPerWindow: this.deps.config.safety.chatRateLimitPer2s,
+        stripEmoji: this.deps.config.safety.allowEmoji !== true,
+      });
       this.say.setTransport((text) => {
         try {
           this.bot?.chat(text);

@@ -21,6 +21,7 @@ import {
   IdleBudget,
 } from "./budget.js";
 import { pickFallbackLine, classifySituation, type FallbackSituation } from "./fallback.js";
+import { detectLeakedReasoning } from "./reasoning.js";
 import {
   classifyLimitWindow,
   isCreditOrQuotaError,
@@ -576,6 +577,29 @@ export class BrainRouter {
             tokensOut: res.tokensOut,
             reasoningTokens: res.reasoningTokens,
             error: "empty content after stripping reasoning",
+          });
+          continue;
+        }
+
+        // A3: leaked reasoning is a FAILED attempt, so the cascade moves on.
+        //
+        // This is not a cosmetic filter. gpt-oss puts its scratchpad in `content`
+        // when the reasoning channel is not separated, and what arrives is a
+        // well-formed sentence that is simply not an answer: "We need to answer the
+        // user about their favourite block." Returning that to a player on a public
+        // server is the bug. Discarding the attempt and trying the next model costs
+        // one extra call and is the cheapest correct thing to do.
+        const leaked = detectLeakedReasoning(res.text);
+        if (leaked.leaked) {
+          this.attempt(attempts, role, {
+            provider: candidate.provider,
+            model: candidate.model,
+            outcome: "network",
+            latencyMs,
+            tokensIn: res.tokensIn,
+            tokensOut: res.tokensOut,
+            reasoningTokens: res.reasoningTokens,
+            error: `leaked reasoning (${leaked.rule})`,
           });
           continue;
         }

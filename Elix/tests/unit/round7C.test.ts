@@ -16,12 +16,14 @@
  * real process is killed and no server is contacted.
  */
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   controlPath,
   isControlLive,
+  removeStaleControl,
   requestStop,
   startControlServer,
 } from "../../src/core/controlChannel.js";
@@ -49,6 +51,105 @@ function tempDir(): string {
 }
 
 /* ================================================ A1 — elix stop, a 2nd door */
+
+/**
+ * A child process that binds the control channel and then does nothing.
+ *
+ * The stale-socket test needs a process that bound the socket and then vanished
+ * WITHOUT unlinking it. The previous version faked that with a server that was
+ * still listening in the same process, which is the opposite of a crash and made
+ * the test contradict the very next one:
+ *
+ *   - a live listener ACCEPTS a connection, so `isControlLive()` returns true,
+ *     `removeStaleControl()` correctly refuses to unlink it, and the second
+ *     `startControlServer()` throws "Elix is already running";
+ *   - on Windows the test returned early, so nobody ever saw it. On a fresh
+ *     Linux clone — where `elix.sh` is a documented entry point — it failed.
+ *
+ * SIGKILL is the only honest way to arrange a real crash: no exit handler runs, no
+ * finally block, no chance to clean up. The child prints "ready" once the socket
+ * is definitely bound, so the test never races the listen.
+ */
+interface CrashChild {
+  pid: number;
+  kill: () => void;
+  /** Resolves when the child is gone, with the signal that killed it. */
+  exited: Promise<NodeJS.Signals | null>;
+}
+
+async function spawnCrashChild(projectRoot: string): Promise<CrashChild> {
+  // The PARENT computes the channel path and passes it in. The child must not
+  // import controlPath itself: the build is a single bundled dist/cli/index.js, so
+  // there is no dist/core/controlChannel.js to import from — an earlier version of
+  // this fixture pointed at that path and would have failed on Linux while being
+  // skipped on Windows. Duplicating the hash logic here would be worse still: a
+  // fixture that computes its own path quietly stops testing the real one.
+  const path = controlPath(projectRoot);
+
+  const script = [
+    'import net from "node:net";',
+    "const server = net.createServer(() => {});",
+    'server.listen(process.argv[2], () => process.stdout.write("ready\\n"));',
+    "// Deliberately no close handler and no unlink: this process is meant to die.",
+  ].join("\n");
+
+  const file = join(tempDir(), "crash-child.mjs");
+  writeFileSync(file, script, "utf8");
+
+  const child = spawn(process.execPath, [file, path], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Registered BEFORE the readiness wait, so an early death cannot slip past
+  // unobserved.
+  let settleExit: ((sig: NodeJS.Signals | null) => void) | undefined;
+  const exited = new Promise<NodeJS.Signals | null>((resolve) => {
+    settleExit = resolve;
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("crash child never became ready")), 10_000);
+    const settle = (fn: () => void): void => {
+      clearTimeout(timer);
+      fn();
+    };
+    child.stdout.once("data", () => settle(resolve));
+    child.once("error", (err) => {
+      settleExit?.(null);
+      settle(() => reject(err as Error));
+    });
+    child.once("exit", (code, sig) => {
+      settleExit?.(sig ?? null);
+      settle(() => reject(new Error(`crash child exited early with code ${String(code)}`)));
+    });
+  });
+
+  return {
+    pid: child.pid ?? 0,
+    kill: () => child.kill("SIGKILL"),
+    exited,
+  };
+}
+
+/** Wait until a killed process is really gone, so the socket has no listener. */
+function waitForDead(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    const check = (): void => {
+      if (pid === 0) {
+        resolve();
+        return;
+      }
+      try {
+        // Signal 0 asks whether the process still exists without touching it.
+        process.kill(pid, 0);
+        setTimeout(check, 25);
+      } catch {
+        resolve();
+      }
+    };
+    check();
+  });
+}
 
 describe("A1 — `elix stop` reaches the same shutdown as Ctrl+C", () => {
   it("goes through lifecycle.shutdown and every registered cleanup runs", async () => {
@@ -109,21 +210,98 @@ describe("A1 — `elix stop` reaches the same shutdown as Ctrl+C", () => {
     if (!result.ok) expect(result.reason).toBe("not-running");
   });
 
-  it("cleans up a stale socket left by a crashed run", async () => {
+  /**
+   * The crash fixture itself, verified on EVERY platform.
+   *
+   * The stale-socket test above returns early on Windows, because a named pipe
+   * leaves no file behind. That means on Windows the fixture was never actually
+   * exercised — a broken helper would still report green. This test runs
+   * everywhere and proves the four things the stale-socket case depends on:
+   *
+   *   1. the child really binds the channel this project would use;
+   *   2. it really answers while alive;
+   *   3. a LIVE channel is never unlinked;
+   *   4. after SIGKILL it stops answering.
+   *
+   * On Linux that closes the gap directly; on Windows it means "the Linux branch
+   * rests on a helper that is known to work here", not on a guess.
+   */
+  it("the crash child binds, answers, survives no cleanup, and dies for real", async () => {
     const projectRoot = tempDir();
     const path = controlPath(projectRoot);
-    if (process.platform === "win32") return; // named pipes have no on-disk file
 
-    // Simulate a crash: a server that is never closed.
-    const dead = await startControlServer({ projectRoot, onStop: () => {}, log: noLog });
-    // Forget it without closing — exactly what a force-killed process leaves.
-    expect(existsSync(path)).toBe(true);
-    void dead;
+    const child = await spawnCrashChild(projectRoot);
 
-    // A fresh listen must succeed rather than dying on EADDRINUSE.
+    try {
+      expect(await isControlLive(path), "the child must really be listening").toBe(true);
+      // A live channel is never removed, on any platform.
+      expect(await removeStaleControl(path)).toBe(false);
+      expect(await isControlLive(path), "unlinking a live channel would blind it").toBe(true);
+    } finally {
+      child.kill();
+    }
+
+    const diedBy = await child.exited;
+    await waitForDead(child.pid);
+
+    // SIGKILL, not a graceful exit: nothing in the child ran on the way out.
+    expect(diedBy, `child ended with signal ${String(diedBy)} instead of SIGKILL`).toBe("SIGKILL");
+    expect(await isControlLive(path), "a dead process cannot answer").toBe(false);
+  });
+
+  it("cleans up a stale socket left by a REALLY crashed run", async () => {
+    const projectRoot = tempDir();
+    const path = controlPath(projectRoot);
+
+    // A Windows named pipe has no on-disk file: the kernel destroys it with the
+    // last handle, so a crash leaves nothing behind and there is genuinely
+    // nothing to clean up. Asserted rather than quietly returning.
+    if (process.platform === "win32") {
+      expect(existsSync(path)).toBe(false);
+      return;
+    }
+
+    const child = await spawnCrashChild(projectRoot);
+    try {
+      expect(existsSync(path), "the child should have left a socket file").toBe(true);
+      expect(await isControlLive(path), "the child really is listening").toBe(true);
+    } finally {
+      child.kill();
+    }
+    await waitForDead(child.pid);
+
+    // The file survives the death, but nothing answers on it. That pair — file
+    // present, no listener — is the definition of stale.
+    expect(existsSync(path), "SIGKILL cannot unlink anything").toBe(true);
+    expect(await isControlLive(path), "a dead process cannot answer").toBe(false);
+
+    // So a fresh start succeeds instead of dying on EADDRINUSE.
     const fresh = await startControlServer({ projectRoot, onStop: () => {}, log: noLog });
     expect(fresh.path).toBe(path);
+    expect(await isControlLive(path)).toBe(true);
     await fresh.close();
+  });
+
+  it("never unlinks a LIVE channel, which is why a crashed one is distinguishable", async () => {
+    const projectRoot = tempDir();
+    const path = controlPath(projectRoot);
+    if (process.platform === "win32") return;
+
+    const child = await spawnCrashChild(projectRoot);
+    try {
+      expect(await isControlLive(path)).toBe(true);
+      // Unlinking a live socket would leave a running Elix invisible while it
+      // still holds it.
+      expect(await removeStaleControl(path)).toBe(false);
+      expect(existsSync(path)).toBe(true);
+      // And a second Elix is still refused for the right reason.
+      await expect(
+        startControlServer({ projectRoot, onStop: () => {}, log: noLog }),
+      ).rejects.toThrow(/already running/i);
+    } finally {
+      child.kill();
+      await waitForDead(child.pid);
+    }
   });
 
   it("refuses a second Elix on the same project instead of fighting over the DB", async () => {

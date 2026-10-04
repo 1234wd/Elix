@@ -26,6 +26,11 @@ export interface SayOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Notified when a message is dropped by the dedup window. */
   onDrop?: (text: string) => void;
+  /**
+   * A4: strip emoji before sending. Default TRUE, because most of them render
+   * as empty boxes in Minecraft and persona.md describes plain lowercase chat.
+   */
+  stripEmoji?: boolean;
 }
 
 export interface SayDefaults {
@@ -43,6 +48,45 @@ export const SAY_DEFAULTS: SayDefaults = {
   maxTypingMs: 3000,
   dedupWindowMs: 10_000,
 };
+
+/**
+ * Strip everything Minecraft cannot render.
+ *
+ * Emoji are the default problem: U+1F300 and above is outside the Basic
+ * Multilingual Plane, and Minecraft's font has no glyph for most of them, so
+ * 🎉 arrives in game as an empty box. Observed live in replies.
+ *
+ * The variation selector (U+FE0F), zero-width joiner (U+200D) and skin-tone
+ * modifiers are removed too: they are invisible on their own and render as
+ * tofu when a preceding glyph IS supported, which is the nastier case
+ * because it looks fine in a terminal and broken in game.
+ *
+ * Plain-text faces like :) and :D are untouched, as are accented letters,
+ * CJK, and everything else inside the BMP.
+ */
+export function stripEmoji(text: string): string {
+  return (
+    text
+      // Every pictograph, astral or not, in ONE property class. Hand-written
+      // ranges were wrong twice over: they missed blocks, and a range like
+      // U+2600-U+27BF reads as a single run of arrows and dingbats, which is
+      // what lint calls a misleading character class and is genuinely ambiguous
+      // to whoever edits it next.
+      .replace(/\p{Extended_Pictographic}/gu, "")
+      // Zero-width joiner, variation selectors and text selectors. Invisible on
+      // their own, and they turn a supported glyph into a broken one. Written as
+      // ALTERNATION, not a character class: U+FE0E and U+FE0F are combining marks,
+      // and a class containing combining marks is genuinely ambiguous about
+      // whether they combine with what precedes them.
+      .replace(/\u200D|\uFE0E|\uFE0F/gu, "")
+      // Regional indicators: flag glyphs, which render as stray letter pairs.
+      .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, "")
+      // Tidy up whatever the removals left behind.
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/[ \t]+([,.!?])/g, "$1")
+      .trim()
+  );
+}
 
 /** Result of enqueueing a message. */
 export type SayResult = "queued" | "dropped-duplicate" | "dropped-queue-full";
@@ -97,6 +141,7 @@ export class SayQueue {
       typingMsPerChar: opts.typingMsPerChar ?? SAY_DEFAULTS.typingMsPerChar,
       maxTypingMs: opts.maxTypingMs ?? SAY_DEFAULTS.maxTypingMs,
       dedupWindowMs: opts.dedupWindowMs ?? SAY_DEFAULTS.dedupWindowMs,
+      stripEmoji: opts.stripEmoji ?? true,
       onDrop: opts.onDrop,
       now,
       sleep,
@@ -115,6 +160,10 @@ export class SayQueue {
    */
   say(text: string, skipTypingDelay = false, priority = false): SayResult {
     if (this.closed) return "dropped-duplicate";
+    // A4: strip at the boundary. Every outbound message goes through say()
+    // or sayFinal(), so this is the one place that has to know.
+    if (this.opts.stripEmoji) text = stripEmoji(text);
+    if (text.trim().length === 0) return "dropped-queue-full";
     const now = this.opts.now();
 
     // A11: prune the dedup map. Without this it grew for the whole session —

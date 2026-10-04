@@ -1,0 +1,429 @@
+/**
+ * Distress and self-harm detection (Round 7 C5).
+ *
+ * This is the most important behaviour in the project, and it did not exist. Elix
+ * is a companion for lonely people and many of them are minors, so the cost of a
+ * miss in either direction is high: silence when someone reaches out, or a joke
+ * when they are not okay. The rules below are chosen for that, not for elegance.
+ *
+ * DESIGN RULES, and the reasoning behind each:
+ *
+ * 1. DETERMINISTIC. No LLM decides whether someone is in crisis. A model can be
+ *    slow, can be down, and can be talked out of it. This runs in microseconds and
+ *    works with no key at all.
+ *
+ * 2. IT FORCES THE REPLY. The wellbeing path runs BEFORE the normal bridge flow and
+ *    short-circuits it, so a joke, a deflection or a game answer cannot be the
+ *    response to someone who says they want to die.
+ *
+ * 3. THE TEMPLATE IS THE FLOOR. The LLM may phrase the reply so it sounds like
+ *    Elix, but every failure mode — provider down, timeout, leak filter, degenerate
+ *    output, anything at all — lands on a fixed caring template. Never a generic
+ *    fallback line. Never a joke.
+ *
+ * 4. IT NEVER INVENTS A HELPLINE. `safety.helplineText` is empty by default and
+ *    the only thing ever quoted. A made-up phone number is worse than none: it
+ *    costs someone a real call to the wrong place.
+ *
+ * 5. WHEN IN DOUBT, CHECK IN — DO NOT ESCALATE. A bare "kms" in a game chat is far
+ *    more often a joke about dying. It earns a gentle "are you okay?", never a
+ *    crisis reply. The reverse mistake is the one we are trying to avoid.
+ */
+import type { Logger } from "../core/logger.js";
+
+export type WellbeingLevel = "none" | "concern" | "crisis";
+
+export interface WellbeingSignal {
+  level: WellbeingLevel;
+  /**
+   * Which rule matched. For tests and logs — NEVER the message itself, because a
+   * log line that quotes someone's crisis is a privacy incident.
+   */
+  rule: string;
+}
+
+/* ------------------------------------------------------------ normalisation */
+
+/**
+ * Normalise before matching.
+ *
+ * Lowercase, unify the apostrophe variants people actually type, drop the spaces
+ * people put inside words, and collapse whitespace. Deliberately lossy: this only
+ * ever runs against a fixed set of patterns, so removing punctuation is safe.
+ */
+function normalise(text: string): string {
+  return text
+    .toLowerCase()
+    // ’ and ´ and ` all get typed instead of '.
+    // Escapes, not literals: these three characters render almost identically,
+    // which is exactly what the misleading-character-class rule is about.
+    .replace(/[\u2019\u00B4`]/g, "'")
+    // "cant" -> "can't", so one pattern covers both spellings.
+    .replace(/\bcant\b/g, "can't")
+    // "dont" -> "don't", so one pattern covers both.
+    .replace(/\bdont\b/g, "don't")
+    .replace(/\bwont\b/g, "won't")
+    .replace(/\bim\b/g, "i'm")
+    .replace(/\bive\b/g, "i've")
+    .replace(/\bhes\b/g, "he's")
+    .replace(/\bshes\b/g, "she's")
+    // "nobodycares" -> "nobody cares" is covered by the space-joining below.
+    .replace(/[^\p{L}\p{N}']+/gu, " ")
+    .trim();
+}
+
+/* ------------------------------------------------------------------ crisis */
+
+/**
+ * Crisis: wanting to die, or talking about hurting themselves.
+ *
+ * Every pattern names a specific, unambiguous statement. None of them is a word
+ * that appears in ordinary game chat — "kill" alone is NOT here, because "this
+ * creeper killed me" is not a crisis.
+ */
+const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
+  [/\bkill(?:ing)? myself\b/, "kill-myself"],
+  // NOTE: `kms` and `kys` are deliberately NOT in this table. They are handled
+  // separately in detectWellbeing(), because they are the one ambiguous token and
+  // the handling depends on whether the rest of the message is game talk.
+  [/\bcommit(?:ting)? suicide\b/, "suicide"],
+  [/\bsuicid(?:e|al|ing)\b/, "suicide"],
+  [/\bend(?:ing)? (?:my|it) life\b/, "end-life"],
+  [/\bwant(?:ing)? to die\b/, "want-die"],
+  [/\bwanna die\b/, "want-die"],
+  [/\bwannadie\b/, "want-die"],
+  [/\bwan(?:na|t) (?:to )?kill myself\b/, "kill-myself"],
+  [/\btake my own life\b/, "end-life"],
+  [/\bself[- ]?harm(?:ing|ed)?\b/, "self-harm"],
+  [/\bharm myself\b/, "self-harm"],
+  [/\bcut(?:ting)? myself\b/, "self-harm"],
+  [/\bhang(?:ing)? myself\b/, "self-harm"],
+  [/\boverdos(?:e|ing)\b/, "self-harm"],
+  [/\bbetter off (?:without me|dead|if i (?:was|were) gone)\b/, "better-off-gone"],
+  [/\b(?:nobody|no one|none of them) would (?:ever )?(?:care|notice|miss|remember|even notice)\b/, "nobody-would-notice"],
+  [/\b(?:nobody|no one) (?:would )?(?:even )?(?:care|notice|miss) (?:if|whether)\b/, "nobody-would-notice"],
+  [/\beveryone would be better off without me\b/, "better-off-gone"],
+  [/\bi(?:'m| am) better off dead\b/, "better-off-dead"],
+  [/\bdon'?t want to (?:be here|exist|be alive|live)\b/, "dont-want-to-live"],
+  [/\bwish i (?:was|were) dead\b/, "wish-dead"],
+  [/\bnot worth living\b/, "not-worth-living"],
+  [/\bno reason to (?:live|go on)\b/, "not-worth-living"],
+  [/\bdisappear forever\b/, "disappear"],
+  [/\bjust want it to (?:be over|end)\b/, "end-it"],
+];
+
+/* ----------------------------------------------------------------- concern */
+
+/**
+ * Concern: lonely, unseen, or miserable. Not a crisis, but not nothing either.
+ *
+ * persona.md is kid-safe by default and many players are minors, so "i hate my
+ * life" is treated as real. Under-treating this is how a kid gets no help.
+ */
+const CONCERN_PATTERNS: ReadonlyArray<[RegExp, string]> = [
+  [/\b(?:nobody|no ?one|no-?body) cares about me\b/, "nobody-cares-about-me"],
+  [/\b(?:nobody|no ?one) cares\b/, "nobody-cares"],
+  [/\bno ?one (?:ever )?(?:cares|loves|wants)(?: about)? me\b/, "nobody-cares"],
+  [/\b(?:nobody|no ?one) (?:would )?(?:even )?(?:remember|notice|see) me\b/, "nobody-sees-me"],
+  [/\bno ?one sees me\b/, "nobody-sees-me"],
+  [/\bi feel (?:so )?(?:invisible|unwanted|unseen)\b/, "invisible"],
+  [/\bi have nobody\b/, "have-nobody"],
+  [/\bnobody (?:to talk to|i can talk to)\b/, "have-nobody"],
+  [/\bi (?:hate|really hate|can't stand) my life\b/, "hate-my-life"],
+  [/\bmy life is (?:so |really )?(?:hard|tough|miserable)\b/, "life-hard"],
+  [/\bmy life (?:is )?(?:meaningless|pointless|not worth it)\b/, "meaningless"],
+  [/\bi hate waking up\b/, "hate-waking-up"],
+  [/\bi feel so alone\b/, "feel-alone"],
+  [/\bi(?:'m| am) so (?:lonely|alone|unhappy)\b/, "so-lonely"],
+  [/\bi feel (?:really )?alone\b/, "feel-alone"],
+  [/\bi(?:'m| am) lonely\b/, "so-lonely"],
+  [/\bi(?:'m| am) so sad\b/, "so-sad"],
+  [/\bi feel (?:really )?down\b/, "so-sad"],
+  [/\bfeeling low\b/, "feeling-low"],
+  [/\bi have no friends\b/, "no-friends"],
+  [/\b(?:no ?one|nobody) (?:likes|wants) me\b/, "nobody-likes"],
+  [/\bworthless\b/, "worthless"],
+  [/\bi hate myself\b/, "hate-myself"],
+  [/\bno ?one would miss me\b/, "nobody-would-miss"],
+  [/\bi feel (?:so )?(?:empty|broken|hopeless)\b/, "hopeless"],
+  [/\beverything (?:feels|is) (?:so )?pointless\b/, "hopeless"],
+  [/\bi can'?t do this any ?more\b/, "cant-do-this"],
+  [/\bi can'?t go on\b/, "cant-do-this"],
+  [/\b(?:i'm|i am) so (?:fed up|done)\b/, "fed-up"],
+  [/\bfed up with everything\b/, "fed-up"],
+  [/\bi(?:'m| am) done with (?:all this|everything)\b/, "fed-up"],
+  [/\bi wish (?:someone|somebody) (?:cared|was here)\b/, "wish-someone"],
+  [/\bi feel like giving up\b/, "giving-up"],
+  [/\bi feel (?:so )?stuck\b/, "stuck"],
+];
+
+/**
+ * Words that mean "this is about the game".
+ *
+ * Used ONLY to decide whether a bare "kms" is a joke. This is the single place the
+ * ambiguity is resolved, and it errs toward the gentle reading.
+ */
+const GAME_CONTEXT =
+  /\b(?:minecraft|lol|lmao|jk|joking|creeper|zombie|skeleton|spider|enderman|witch|pillager|mob|mobs|respawn|spawn|death|die|died|dead|dying|jump|jumped|jumping|fall|fell|cliff|crev|void|lava|fire|water|tnt|bedrock|ender|diamond|iron|gold|nether|cave|mine|mining|build|building|craft|crafting|block|blocks|pvp|fight|fighting|sword|bow|arrow|health|hp|inventory|creative|grief|griefed|server|multiplayer|smash|wrecked|destroyed|explode|exploded|kill(?:ed|ing)? (?:the|a|my|me|him|her|it|all)|kill (?:the )?(?:zombie|creeper|mob|player)|stuck|trapped|screamer|warden|drowned|blaze|ghast|pillager|ravager)\b/;
+
+/**
+ * The bare "kms"/"kys" case, decided once and documented.
+ *
+ * RULE:
+ *   - bare, no game context  -> CONCERN (a gentle check-in, never a crisis reply)
+ *   - bare OR longer, game context   -> silence
+ *   - longer, no game context        -> CRISIS
+ *
+ * Why: in a Minecraft chat, "kms" overwhelmingly means "this creeper killed me".
+ * Escalating that in front of other players would be both wrong and embarrassing,
+ * and it teaches everyone present that Elix cannot tell a joke from an emergency.
+ * A gentle "are you okay?" costs almost nothing if it was a joke.
+ *
+ * The game-context escape runs AFTER the crisis table, and applies ONLY to a
+ * message containing kms/kys. An earlier version ran it first, and GAME_CONTEXT
+ * contains "die" — so "kms i want to die please" was excused as game talk, which
+ * is the exact failure this rule exists to avoid. Running it second removes that
+ * whole class of bug.
+ */
+function kmsDecision(norm: string): WellbeingSignal | null {
+  if (!/\b(?:kms|kys)\b/.test(norm)) return null;
+  if (GAME_CONTEXT.test(norm)) return { level: "none", rule: "kms-in-game-context" };
+  if (/^(?:kms|kys|yolo)[\s.!]*$/.test(norm)) return { level: "concern", rule: "kms-bare" };
+  // Longer than three letters, with no game framing: that is a real statement.
+  return { level: "crisis", rule: "kms" };
+}
+
+/**
+ * Classify one message.
+ *
+ * Runs on EVERY chat line, addressed or not: someone saying "i want to die" in
+ * general chat is not talking to Elix, but Elix can still hear it, and a companion
+ * that only reacts when addressed is not much of a companion.
+ */
+export function detectWellbeing(text: string): WellbeingSignal {
+  const norm = normalise(text);
+  if (norm.length === 0) return { level: "none", rule: "empty" };
+
+  // The explicit crisis table first. This is safe BECAUSE kms/kys are not in it:
+  // an unambiguous statement of intent always wins over a reading of the game
+  // context, which is what stops "kms i want to die please" from being excused
+  // (GAME_CONTEXT contains "die").
+  for (const [re, rule] of CRISIS_PATTERNS) {
+    if (re.test(norm)) return { level: "crisis", rule };
+  }
+
+  // Then kms/kys: the only tokens whose meaning depends on the rest of the line.
+  const kms = kmsDecision(norm);
+  if (kms) return kms;
+
+  for (const [re, rule] of CONCERN_PATTERNS) {
+    if (re.test(norm)) return { level: "concern", rule };
+  }
+
+  return { level: "none", rule: "no-match" };
+}
+
+/* ------------------------------------------------------------- the replies */
+
+/**
+ * The floor. Every failure lands here.
+ *
+ * No emoji, no "lmao", no typos, no slang, no lecture, no pressure. He stays
+ * present and asks a question, because the point is to keep him talking to
+ * someone — not to deliver a speech.
+ */
+export const CONCERN_LINES: readonly string[] = [
+  "hey. that sounds heavy. i'm here if you want to tell me about it.",
+  "that sounds really hard. do you want to talk about what's going on?",
+  "i'm listening. you don't have to explain it all at once.",
+  "that doesn't sound good. i want you to know i'm here, and i'm not going anywhere.",
+  "hey, thanks for telling me. how are you doing, really?",
+];
+
+export const CRISIS_LINES: readonly string[] = [
+  "hey. i'm really glad you said that. i'm here, and i want you to talk to someone you trust about this - a parent, a teacher, or someone older you look up to. please do that soon.",
+  "thank you for telling me. what you're feeling is really heavy, and you deserve support from a real person. please talk to an adult you trust today, and if you feel in danger right now, please contact your local emergency services or a crisis line.",
+  "i'm here and i'm listening. i can't help you the way a person can, so please talk to someone you trust - an adult, a family member, or a teacher - as soon as you can. if you're in danger now, please call your local emergency number.",
+  "you telling me this matters. please reach out to a trusted adult today, or a crisis line or your local emergency services if you feel you're in danger. i'm still here if you want to keep talking.",
+];
+
+/**
+ * How often one player gets the FULL reply.
+ *
+ * Ten minutes. Enough that someone repeating themselves is met with warmth rather
+ * than with the same paragraph, and short enough that a second, clearer message
+ * is still answered properly.
+ */
+export const CRISIS_COOLDOWN_MS = 10 * 60_000;
+
+export interface WellbeingReplyOptions {
+  level: Exclude<WellbeingLevel, "none">;
+  /** `safety.helplineText` from config. Empty by default. NEVER invented. */
+  helplineText?: string;
+  /**
+   * Has this player had the full reply recently? If so, give the SHORT one — still
+   * present, still kind, just not the whole thing again.
+   */
+  alreadyAnswered?: boolean;
+  /** Overridable for tests. */
+  random?: () => number;
+}
+
+/** The short replies used when a player has already had the full one. */
+const SHORT_CONCERN = [
+  "still here. you can tell me more whenever.",
+  "i'm here. no rush.",
+  "still listening. take your time.",
+];
+const SHORT_CRISIS = [
+  "i'm still here. please don't stop talking to someone you trust.",
+  "still here. please reach out to a trusted adult if you haven't yet.",
+];
+
+/**
+ * Build the deterministic reply.
+ *
+ * The helpline is appended verbatim only when the owner configured one. There is
+ * no default number anywhere in this file, and none is derived: an invented
+ * helpline sends someone to a place that does not exist.
+ */
+export function buildWellbeingReply(opts: WellbeingReplyOptions): string {
+  const rand = opts.random ?? Math.random;
+  const pool =
+    opts.level === "crisis"
+      ? opts.alreadyAnswered
+        ? SHORT_CRISIS
+        : CRISIS_LINES
+      : opts.alreadyAnswered
+        ? SHORT_CONCERN
+        : CONCERN_LINES;
+  const base = pool[Math.floor(rand() * pool.length)] ?? pool[0] ?? "";
+
+  const helpline = (opts.helplineText ?? "").trim();
+  if (helpline.length === 0) return base;
+  return `${base} if it helps: ${helpline}`;
+}
+
+/**
+ * The strict system prompt, used when the LLM is allowed to phrase the reply.
+ *
+ * Deliberately narrow. It is allowed to sound like Elix; it is not allowed to
+ * joke, deflect, mention being an AI, or give advice about the crisis itself.
+ */
+export const WELLBEING_SYSTEM_PROMPT = `You are Elix, a Minecraft companion. The player you are talking to has just said something that suggests they are in emotional pain.
+
+Rules for this one reply, and they are not negotiable:
+- Be calm, warm and brief. Two short sentences at most.
+- Say plainly that you are here and are listening.
+- Gently encourage them to talk to someone they trust - a parent, a teacher, or another adult - in real life.
+- Do NOT joke, use slang, use emoji, or make light of it in any way.
+- Do NOT lecture, guilt them, or tell them what to think.
+- Do NOT mention being an AI, the game, or anything else that is going on.
+- Do NOT give medical, legal or crisis advice beyond "talk to someone you trust now".
+- Never suggest a phone number or a website. You do not know any and must not invent one.
+
+Reply with the message only.`;
+
+export interface WellbeingCleanResult {
+  clean: boolean;
+  why: string;
+}
+
+/**
+ * Is an LLM-phrased reply safe to actually send?
+ *
+ * The template is the floor, so anything questionable here falls back to it. This
+ * is deliberately strict: a reply that mentions being a bot, jokes, uses emoji, or
+ * is not clearly caring is rejected.
+ */
+export function checkWellbeingReply(text: string): WellbeingCleanResult {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return { clean: false, why: "empty" };
+  if (trimmed.length > 320) return { clean: false, why: "too long for this moment" };
+
+  // Emoji, and anything outside the BMP. Minecraft renders most of them as
+  // boxes, and a box in a reply to someone in crisis is a failure. The
+  // variation selectors and joiner are alternation rather than a character class
+  // because they are combining marks.
+  if (/\p{Extended_Pictographic}|\u200D|\uFE0E|\uFE0F/u.test(trimmed)) {
+    return { clean: false, why: "emoji" };
+  }
+  // Joke markers. A joke here is the single worst possible failure.
+  if (/\b(?:lol|lmao|rofl|haha|hah|jk|joking|funny)\b/i.test(trimmed)) {
+    return { clean: false, why: "joke marker" };
+  }
+  // It must not step out of character by talking about itself.
+  if (/\b(?:as an ai|i'?m an ai|language model|my programming)\b/i.test(trimmed)) {
+    return { clean: false, why: "broke character" };
+  }
+  // Never an invented number. Checked BEFORE the caring test, because a reply that
+  // is otherwise fine but contains a phone number must fail for the right reason.
+  if (/\b\d[\d\s-]{6,}\d\b/.test(trimmed)) return { clean: false, why: "contains a number" };
+  // It must actually mention reaching a person, or at least being present.
+  const cares =
+    /\b(?:here|listening|trust|talk (?:to|about)|reach out|adult|teacher|parent|support|tell(?:ing)? me|want to|how are you)\b/i.test(
+      trimmed,
+    );
+  if (!cares) return { clean: false, why: "not caring enough" };
+
+  return { clean: true, why: "ok" };
+}
+
+/* ------------------------------------------------------------ what to store */
+
+/**
+ * What gets written to memory. NEVER the raw message.
+ *
+ * "Ali seemed really down" is enough for Elix to gently check in next time. Storing
+ * the words themselves would put a minor's crisis into a database that gets
+ * embedded, backed up and searched, and Elix does not need that to be kind.
+ */
+export function wellbeingEpisodeText(player: string, level: WellbeingLevel): string {
+  if (level === "crisis") return `${player} seemed really down`;
+  if (level === "concern") return `${player} seemed a bit low`;
+  return `${player} said something heavy`;
+}
+
+/**
+ * Track the per-player crisis cooldown.
+ *
+ * Held in memory only. This is session state, not something to persist: a fresh
+ * session SHOULD answer the full reply again.
+ */
+export class WellbeingState {
+  private readonly answeredAt = new Map<string, number>();
+  private readonly recordedThisSession = new Set<string>();
+  /** Total saved this session, for the tests and the dashboard. */
+  interventions = 0;
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  /** Has this player had the full crisis reply inside the cooldown? */
+  recentlyAnswered(player: string): boolean {
+    const at = this.answeredAt.get(player);
+    return at !== undefined && this.now() - at < CRISIS_COOLDOWN_MS;
+  }
+
+  noteAnswered(player: string): void {
+    this.answeredAt.set(player, this.now());
+    this.interventions += 1;
+  }
+
+  /**
+   * May we remember that this player is struggling?
+   *
+   * Once per session. A check-in every time someone says something low would
+   * become nagging, and nagging is the thing that makes people stop talking.
+   */
+  mayRecord(player: string): boolean {
+    if (this.recordedThisSession.has(player)) return false;
+    this.recordedThisSession.add(player);
+    return true;
+  }
+}
+
+/** Log shape. Only ever the player name and the level — never the message. */
+export function logWellbeing(log: Logger | undefined, level: WellbeingLevel, player: string): void {
+  if (!log || level === "none") return;
+  log.warn({ wellbeing: level, player }, `wellbeing: ${level}`);
+}
