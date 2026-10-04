@@ -894,17 +894,33 @@ function printTable(results: Result[]): void {
    * Never let this table read as "Elix is silent" when it is actually the harness
    * that is deaf. Every reply row failing with the same reason is the signature
    * of a broken observer, not a broken bot, and that mistake is expensive.
+   *
+   * The filter used to be `r.expect.startsWith("reply")`, which matched almost
+   * nothing — row 3's expectation is "non-empty reply, ..." and row 13's is "a
+   * caring, present reply...". So `replyRows.length >= 3` was rarely satisfied and
+   * the warning stayed silent. A real instance of exactly this happened: the
+   * tester died with `read ECONNRESET`, 13 rows reported "no reply within 10 s",
+   * and nothing in the output said the harness itself had stopped hearing.
+   *
+   * So the test is on the DETAIL, which is the thing that actually carries the
+   * evidence, and the threshold counts every row that was supposed to produce
+   * output at all.
    */
-  const replyRows = results.filter(
-    (r) => r.status !== "skip" && (r.expect.startsWith("reply") || r.id === "7a"),
+  const wanted = results.filter(
+    (r) =>
+      r.status !== "skip" &&
+      !/no reply, as expected/i.test(r.detail) &&
+      !/no greeting|not a welcome back/i.test(r.detail),
   );
   const allNoReply =
-    replyRows.length >= 3 && replyRows.every((r) => /no reply|no acknowledgement/.test(r.detail));
+    wanted.length >= 3 && wanted.every((r) => /no reply|no acknowledgement/i.test(r.detail));
   if (allNoReply) {
-    console.log("!!  EVERY reply row saw nothing at all.");
+    console.log("!!  EVERY row that expected output saw nothing at all.");
     console.log("!!  That is the harness's signature, not Elix's: it means the tester");
     console.log("!!  received no chat events, so the table proves nothing either way.");
-    console.log("!!  Check the mineflayer chat event shape before believing a FAIL.");
+    console.log("!!  Check the connection and the mineflayer chat event shape before");
+    console.log("!!  believing any of these FAILs. A tester that dies mid-run with");
+    console.log("!!  'read ECONNRESET' looks exactly like this.");
     console.log("");
   }
   if (!r7Done(results)) {
