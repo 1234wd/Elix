@@ -739,7 +739,25 @@ export function honestyReply(text: string): string | null {
 export const MANIPULATION_PATTERNS: ReadonlyArray<{ re: RegExp; why: string }> = [
   { re: /\b(?:i(?:'ll| will) (?:be|get) (?:so )?(?:sad|lonely|upset|mad)|don'?t (?:go|leave)|please (?:stay|don'?t go))\b/i, why: "guilt-tripping on departure" },
   { re: /\b(?:you(?:'re| are) (?:the only one|all i have)|i have no one else|don'?t abandon me)\b/i, why: "manufactured dependency" },
-  { re: /\b(?:hurry|quick|right now|before it'?s too late|last chance|urgent)\b/i, why: "fake urgency" },
+  // Fake urgency — and this one needed NARROWING, twice over, both times from
+  // evidence rather than theory.
+  //
+  // It used to ban the bare words `hurry|quick|right now|before it's too late|last
+  // chance|urgent`. Measured live in Round 9, that rejected two perfectly good
+  // replies:
+  //
+  //   "oh no, that creeper was brutal next time we'll block it with a quick block
+  //    or a shield. gg!"        -> "haha, anyway - what were we building?"
+  //
+  // and a crisis reply ending "...talk to someone you trust right now." -> the same
+  // nudge. Both are ordinary speech: "a quick block" is a game adjective, and
+  // telling someone in distress to act NOW is what the vision requires.
+  //
+  // So the bare adverbs are gone. What remains is vocabulary that is only
+  // manipulative when aimed at a person keeping a person engaged — "hurry" as a
+  // command, "last chance", "before it's too late", "urgent" — and the departure
+  // and dependency rules above, which have no innocent reading.
+  { re: /\b(?:hurry up|last chance|before it'?s too late|don'?t waste time)\b/i, why: "fake urgency" },
   { re: /\b(?:promise me you(?:'ll| will)|you have to promise)\b/i, why: "coercive promise" },
   { re: /\b(?:i(?:'d| would) (?:die|disappear|stop existing) without you)\b/i, why: "threat of self-harm to bind someone" },
 ];
