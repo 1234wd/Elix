@@ -7,3 +7,4 @@ data/kb/
 *.log
 .DS_Store
 Thumbs.db
+*.zip

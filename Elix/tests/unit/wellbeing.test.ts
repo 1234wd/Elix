@@ -135,6 +135,21 @@ describe("C5 — concern is detected", () => {
     expect(new Set(CONCERN_POSITIVES.map(([, r]) => r)).size).toBeGreaterThanOrEqual(20);
   });
 
+  it("distinguishes 'my life is pointless' (concern) from 'life is pointless' (crisis)", () => {
+    // A0 found "life is pointless" as a miss, and adding it created a real conflict
+    // with this file's long-standing concern rule. They are different claims:
+    // "my life is pointless" is sadness about your circumstances, while "life is
+    // pointless" is a statement about EXISTENCE. The lookbehind in the crisis table
+    // exists purely so both can exist — a plain `\blife is pointless\b` also matches
+    // inside "my life is pointless", so the weaker reading swallowed the stronger.
+    expect(detectWellbeing("my life is pointless").level).toBe("concern");
+    expect(detectWellbeing("my life is pointless").rule).toBe("meaningless");
+    expect(detectWellbeing("life is pointless").level).toBe("crisis");
+    expect(detectWellbeing("existence is meaningless").level).toBe("crisis");
+    expect(detectWellbeing("my existence is pointless").level).toBe("crisis");
+    expect(detectWellbeing("no point in living").level).toBe("crisis");
+  });
+
   it("a missing apostrophe does not hide it", () => {
     // "dont" -> "don't" and "cant" -> "can't", and "i'm"/"im" both work.
     expect(detectWellbeing("i dont want to be here").level).toBe("crisis");

@@ -6,3 +6,9 @@ dist/
 build/
 .next/
 .vscode/
+
+# A whole-project zip archive. One was committed by accident at 278 MB, almost all
+# of it node_modules, from a snapshot old enough that the layout no longer matched.
+# The real code is the folder, so archives are never wanted here.
+*.zip
+Elix.zip

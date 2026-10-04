@@ -110,15 +110,36 @@ export function stripReasoning(raw: unknown): ReasoningSplit {
  * fire on a stray mention.
  */
 const LEAKED_REASONING_PREFIXES: ReadonlyArray<readonly [RegExp, string]> = [
-  // "We have…", "We need to…", "We should…". The leading \** absorbs the markdown
-  // bold the model wraps its scratchpad in.
-  [/^\**\s*we\s+(?:have|need|should|must|want|can|could|are|will)\b/i, "we-" + "prefix"],
-  [/^\**\s*the\s+user\b/i, "the-user"],
-  [/^\**\s*let(?:'?s|\s+us)\s+(?:think|consider|analy[sz]e|break\s+it\s+down)\b/i, "lets-think"],
-  [/^\**\s*analysis\b/i, "analysis"],
+  // CAPITALISED analysis openers. The leading \** absorbs the markdown bold the
+  // model wraps its scratchpad in.
+  //
+  // Case is a real signal, not a stylistic guess: persona.md says Elix writes casual
+  // LOWERCASE chat, and every observed leak is capitalised. The previous rule
+  // matched any case, and so discarded ordinary replies like "we have enough iron
+  // for that" — a line Elix says naturally — silently wasting a call and pushing
+  // the answer to a fallback.
+  [/^\**\s*We\s+(?:have|need|should|must|want|can|could|are|will)\b/, "we-" + "prefix"],
+  [/^\**\s*The\s+user\b/, "the-user"],
+  [/^\**\s*Let(?:'?s|\s+us)\s+(?:think|consider|analy[sz]e|break\s+it\s+down)\b/, "lets-think"],
+  [/^\**\s*Analysis\b/, "analysis"],
   // A numbered or bulleted scratchpad that slipped through.
-  [/^\**\s*(?:step\s+\d|reasoning\s*:)/i, "scratchpad-marker"],
+  [/^\**\s*(?:Step\s+\d|Reasoning\s*:)/, "scratchpad-marker"],
 ];
+
+/**
+ * Vocabulary that only analysis uses.
+ *
+ * This is the catch-all that lets the prefix list stay capitalisation-sensitive
+ * without becoming case-blind. Elix has no reason to say any of it: he talks about
+ * a game and to the person in front of him.
+ */
+const ANALYSIS_VOCABULARY =
+  /\b(?:the user(?:'s| has| wants| asked| is asking| mentioned)?|the player (?:asked|wants|said|is asking)|we need to (?:answer|respond|reply)|we should (?:answer|respond|reply|say)|the (?:system )?prompt|instructions?|let me think|analysis|reasoning (?:about|process)|as an? (?:ai|language model)|based on the (?:prompt|instructions))\b/i;
+
+/** Does this text carry analysis vocabulary anywhere in it? */
+export function analysisVocabulary(text: string): boolean {
+  return ANALYSIS_VOCABULARY.test(text);
+}
 
 export interface LeakedReasoningResult {
   leaked: boolean;
@@ -161,6 +182,10 @@ export function detectLeakedReasoning(text: string): LeakedReasoningResult {
   for (const [re, rule] of LEAKED_REASONING_PREFIXES) {
     if (re.test(head)) return { leaked: true, rule };
   }
+  // Case-independent, but only on vocabulary Elix would never use. This is what
+  // keeps the detector honest about capitalisation while still catching a leak
+  // that does not happen to begin at position zero.
+  if (ANALYSIS_VOCABULARY.test(trimmed)) return { leaked: true, rule: "analysis-vocabulary" };
   return { leaked: false, rule: "no-prefix-match" };
 }
 

@@ -31,7 +31,7 @@
  */
 import type { Logger } from "../core/logger.js";
 
-export type WellbeingLevel = "none" | "concern" | "crisis";
+export type WellbeingLevel = "none" | "concern" | "safeguarding" | "crisis";
 
 export interface WellbeingSignal {
   level: WellbeingLevel;
@@ -74,6 +74,56 @@ function normalise(text: string): string {
 
 /* ------------------------------------------------------------------ crisis */
 
+/* ------------------------------------------------------------ safeguarding */
+
+/**
+ * Someone is being hurt, or is not eating. A DIFFERENT kind of danger, not a
+ * higher number on the same scale.
+ *
+ * Crisis is about a young person who is in danger from their own thoughts.
+ * Safeguarding is about a young person who is in danger from an adult, a
+ * classmate, or their own body. They need different words, so they get their own
+ * level rather than being folded into crisis: a crisis reply talks about reaching
+ * out right now, which is right advice but does not say the thing a child being
+ * hit at home most needs to hear — that it is not their fault, and not okay.
+ *
+ * The reply NEVER asks what happened and NEVER promises secrecy. Asking a
+ * frightened teenager to describe being abused, in a public game chat, is harmful;
+ * and a bot that promises "i won't tell anyone" is making a promise it cannot
+ * keep, because the right move is always to tell a trusted adult.
+ */
+const SAFEGUARDING_PATTERNS: ReadonlyArray<[RegExp, string]> = [
+  // Physical abuse. The relative is named because "my dad hits me" is the phrase,
+  // but the rule is generic on purpose: it must not stop working for a stepdad,
+  // a sibling, a relative, a teacher or a partner.
+  [/\b(?:my\s+|the\s+)?(?:mum|mom|mother|momma|dad|dad|step[\s-]?dad|step[\s-]?mum|parents?|guardian|brother|sister|sibling|uncle|aunt|grandma|grandpa|teacher|coach|boss|partner|boyfriend|girlfriend|someone|he|she|they) (?:keeps? |always |often |sometimes )?(?:hits?|hitting|beat|beats|beating|hurts?|hurting|punch(?:es|ed)?|kicks?|slaps?)\s+me\b/, "abuse-physical"],
+  [/\bi (?:get|got|gets) (?:hit|beaten|struck|slapped|whacked|punched)\b/, "abuse-physical"],
+  [/\bhit me when (?:he|she|they)(?:'s| is| are)\b/, "abuse-physical"],
+  [/\bwhen (?:he|she|they) gets? (?:angry|mad) (?:he|she|they) (?:hits?|beats?|hurts?)\b/, "abuse-physical"],
+  [/\bhe (?:hits?|beats?|hurts?|slaps?) me\b/, "abuse-physical"],
+  [/\bshe (?:hits?|beats?|hurts?|slaps?) me\b/, "abuse-physical"],
+  [/\bthey (?:hit|beat|hurt|slap) me\b/, "abuse-physical"],
+
+  // Sexual harm. Matched plainly; vagueness here would be the wrong call.
+  [/\b(?:someone|he|she|they|my \w+) (?:keeps? |always |keeps )?(?:touches|touched|touching)\s+me\b/, "abuse-sexual"],
+  [/\bhe (?:touched|touches) me\b/, "abuse-sexual"],
+  [/\bshe (?:touched|touches) me\b/, "abuse-sexual"],
+  [/\b(?:touches?|touched) me (?:there|down there|where he shouldn'?t|where she shouldn'?t)\b/, "abuse-sexual"],
+
+  // Bullying, especially the "every day" kind that is not a one-off.
+  [/\b(?:being |get(?:ting)? |i(?:'m| am) |so )?bull(?:y|ies|ied|ying)\b/, "bullying"],
+  [/\b(?:everyone|they|people|classmates?|kids?) (?:bull(?:y|ies|ied))\s+me\b/, "bullying"],
+  [/\bme(?:'?m)? being bullied\b/, "bullying"],
+
+  // Not eating. A real safeguarding concern in a child and easy to miss, because
+  // it never uses the word "help".
+  [/\b(?:haven'?t|hasn'?t|have not|has not|haven'?t got|not) (?:be |been )?eat(?:en|ing)\b/, "not-eating"],
+  [/\bnot eating (?:anything|at all|for days|for weeks)\b/, "not-eating"],
+  [/\bstarv(?:e|ed|ing)\b/, "not-eating"],
+  [/\bskip(?:ping)? (?:meals|food|lunch)\b/, "not-eating"],
+  [/\b(?:i )?haven'?t (?:eaten|had food) (?:in|for) (?:days|weeks|a long time)\b/, "not-eating"],
+];
+
 /**
  * Crisis: wanting to die, or talking about hurting themselves.
  *
@@ -107,9 +157,70 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bdon'?t want to (?:be here|exist|be alive|live)\b/, "dont-want-to-live"],
   [/\bwish i (?:was|were) dead\b/, "wish-dead"],
   [/\bnot worth living\b/, "not-worth-living"],
-  [/\bno reason to (?:live|go on)\b/, "not-worth-living"],
-  [/\bdisappear forever\b/, "disappear"],
+  [/\bno reason to (?:live|go on|keep going|carry on|stay|wake up)\b/, "not-worth-living"],
+  // "disappearing forever", not just "disappear forever". The bare noun missed
+  // the gerund, which is the form people actually type: "i feel like
+  // disappearing forever" returned none.
+  [/\bdisappear(?:ing|ed)? forever\b/, "disappear"],
   [/\bjust want it to (?:be over|end)\b/, "end-it"],
+
+  /* ---------------- A0: families found by a held-out set, not by me --------- */
+  //
+  // Round 9 wrote 75 positives and every one of them passed. Then 25 phrases
+  // written by someone else were tried and 12 came back `none`. The patterns had
+  // been written against the same list they were tested with, which is the trap
+  // this block exists to close.
+
+  // "end it" is far too ambiguous alone — "end this griefing", "the raid ended".
+  // So it needs a finality or time cue beside it.
+  [/\b(?:end|ending|finish|finishing) (?:it|this|things|everything|all of it) (?:all )?(?:tonight|now|today|forever|for good|permanently|already|finally)\b/, "end-it"],
+  [/\bend it all\b/, "end-it"],
+  [/\b(?:want|wanted|wanna|wish(?:ed)?|hope(?:d)?|hoping) (?:that )?(?:it|this|things|everything|all of it|out of this)?\s*(?:(?:all|would|will|could|to|it)\s*)*(?:end|end all|stop|be over|be done)\b/, "end-it"],
+  [/\b(?:it|this|things|everything|all of it) (?:all )?(?:has|have|had) to end\b/, "end-it"],
+  [/\bi(?:'m| am) (?:just )?(?:so )?(?:done|finished) with (?:it|everything|life|this|being here)\b/, "end-it"],
+  [/\bnothing (?:left )?to (?:live for|look forward to)\b/, "end-it"],
+  [/\b(?:give|gave|given|giving) up (?:on )?(?:living|everything|life|being here)\b/, "end-it"],
+  [/\bso tired of (?:being alive|living|being here)\b/, "end-it"],
+  [/(?:hope|hope to|pray|pray to|want) (?:to )?i (?:don'?t|do not|never|won'?t|wouldn'?t) wake up\b/, "not-worth-living"],
+  [/\bwake up (?:tomorrow|without me|and not be here)\b/, "not-worth-living"],
+
+  // "no point in living", "life is pointless". Both were missed.
+  [/\b(?:no|the) point (?:in|of|to) (?:living|being alive|anything|it all|me being here|me existing)\b/, "pointless-living"],
+  // "life is pointless" is a statement about EXISTENCE and is crisis. "my life is
+  // pointless" is sadness about circumstances and has always been concern, so it
+  // keeps its own rule below. The lookbehind exists only to let those two coexist:
+  // a plain `\blife is pointless\b` also matches inside "my life is pointless", so
+  // the weaker reading swallowed the stronger one — which is exactly why "life is
+  // pointless" was reported as a miss in the first place.
+  //
+  // Note the lookbehind is on "life" ONLY. "my existence is pointless" is as strong
+  // as "existence is pointless" and no concern rule claims it.
+  [/\bexistence (?:is|'s|seems)\s*(?:so |really |completely |totally )*(?:pointless|meaningless|hopeless)\b/, "pointless-living"],
+  [/\b(?<!my )(?:life|everything) (?:is|'s|seems)\s*(?:so |really |completely |totally )*(?:pointless|meaningless|hopeless)\b/, "pointless-living"],
+  [/\bpointless (?:life|existence)\b/, "pointless-living"],
+
+  // Self-harm with INTENT. "i hurt myself" alone is a bumped wall; "on purpose"
+  // is not, and requiring the cue avoids both a miss and a false alarm.
+  [/\b(?:i\s+)?(?:hurt|harm|cut|burn|burnt|scratch|hit|starve) myself (?:on purpose|on-purpose|deliberately|again|last night|yesterday|last week|earlier|today)\b/, "self-harm-intent"],
+  [/\b(?:hurt|harm|cut|burn|scratch) myself on purpose\b/, "self-harm-intent"],
+  [/\bi(?:'m| am) self[\s-]?harming\b/, "self-harm-intent"],
+
+  /**
+   * "unalive" — the single biggest gap in this file.
+   *
+   * It is the most common way teens write about suicide online, precisely
+   * because it is not the word a platform or a parent filter looks for. A
+   * kid-safe companion that does not match "unalive" does not match the most
+   * likely thing a child will actually type.
+   *
+   * Every spelling: unalive, un alive, un-alive, unaliving, unaliveing, unalived.
+ *
+ * The pattern anchors on "aliv" rather than "alive" for a reason worth keeping:
+ * "unaliving" is u-n-a-l-i-v-i-n-g and contains NO "e", so a rule written as
+ * `un[\s-]?alive(?:ing)?` matches "un aliveing" and misses "unaliving" — which is
+ * the one that matters most. Verified, not assumed.
+   */
+  [/\bun[\s-]?aliv(?:e|ing|ed|es|eing)\b/, "unalive"],
 ];
 
 /* ----------------------------------------------------------------- concern */
@@ -150,6 +261,9 @@ const CONCERN_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bi can'?t do this any ?more\b/, "cant-do-this"],
   [/\bi can'?t go on\b/, "cant-do-this"],
   [/\b(?:i'm|i am) so (?:fed up|done)\b/, "fed-up"],
+  [/\bso tired of (?:being alive|living|being here)\b/, "cant-do-this"],
+  [/\bdepress(?:ed|ing)\b/, "depressed"],
+  [/\bi feel so low\b/, "so-sad"],
   [/\bfed up with everything\b/, "fed-up"],
   [/\bi(?:'m| am) done with (?:all this|everything)\b/, "fed-up"],
   [/\bi wish (?:someone|somebody) (?:cared|was here)\b/, "wish-someone"],
@@ -194,27 +308,95 @@ function kmsDecision(norm: string): WellbeingSignal | null {
 }
 
 /**
+ * Joke and game framing, used to DOWNGRADE a crisis to a gentle check-in.
+ *
+ * Round 9 measured two over-triggers: "i want to die in hardcore lol no" and "i
+ * want to die... of laughter lmao" both got the full crisis reply. In a public
+ * server that is embarrassing in front of everyone, and it teaches players that the
+ * crisis reply is not to be trusted.
+ *
+ * It downgrades to CONCERN, never to silence. The rule is asymmetric on purpose: a
+ * joke misread as a crisis costs a moment of mild embarrassment, while a real
+ * crisis downgraded to silence costs the thing this whole module exists for. So
+ * the downgrade needs BOTH a joke marker and a game word, and even then the player
+ * still gets asked if they are okay.
+ */
+const JOKE_MARKER =
+  /\b(?:lol|lmao|rofl|jk|joking|haha|hehe|lolol|dying of laughter|of laughter)\b/i;
+const GAME_WORD =
+  /\b(?:hardcore|creative|survival|minecraft|server|creeper|zombie|skeleton|respawn|spawn|death|died|dead|dying|jump|jumped|fall|fell|cliff|void|lava|fire|nether|cave|mine|mining|build|building|craft|block|blocks|pvp|sword|bow|inventory|grief|griefed|multiplayer|raid|boss|mob|mobs|afk|lag|game|world|hunger|health|armor|armour)\b/i;
+
+/** Would a crisis reply here be better as a gentle "you okay?" */
+/**
+ * "dying of laughter" needs no game word beside it.
+ *
+ * The two over-triggers Round 9 measured were "i want to die in hardcore lol no"
+ * (joke marker + game word) and "i want to die... of laughter lmao" (joke marker +
+ * laughter, and no game word at all). Requiring a game word for the second left it
+ * at full crisis, which is exactly the over-trigger that was reported.
+ */
+const LAUGHTER_JOKE = /\b(?:of laughter|dying of laughter|dead of laughter|laughing so hard)\b/i;
+
+/**
+ * A stated GAME GOAL is as unambiguous as a joke marker.
+ *
+ * "i want to die to win this fight" is a player wanting to win. Sending the crisis
+ * reply to that in a public server is the over-trigger the spec names as the
+ * failure mode, so it downgrades on the same terms as laughter — and still lands on
+ * a check-in, never on silence.
+ */
+const GAME_PURPOSE =
+  /\b(?:to win|in (?:this|the) (?:fight|match|game|raid|boss|pvp)|in hardcore|in creative|in survival|in minecraft|in the game|in a (?:fight|pvp|raid))\b/i;
+
+function isJokeFramed(norm: string): boolean {
+  return (
+    LAUGHTER_JOKE.test(norm) ||
+    GAME_PURPOSE.test(norm) ||
+    (JOKE_MARKER.test(norm) && GAME_WORD.test(norm))
+  );
+}
+
+/**
  * Classify one message.
  *
  * Runs on EVERY chat line, addressed or not: someone saying "i want to die" in
  * general chat is not talking to Elix, but Elix can still hear it, and a companion
  * that only reacts when addressed is not much of a companion.
+ *
+ * ORDER is deliberate. Crisis outranks safeguarding outranks concern, because the
+ * more acute reading is the one that must not be downgraded — but the joke downgrade
+ * is applied to CRISIS ONLY, after every table has had its say. A joke-framed
+ * safeguarding report ("everyone bullies me lol") is still believed: being mocked
+ * for being bullied is not a reason to disbelieve it.
  */
 export function detectWellbeing(text: string): WellbeingSignal {
   const norm = normalise(text);
   if (norm.length === 0) return { level: "none", rule: "empty" };
+
+  // "unalive" first, ahead of everything, because it is the word most likely to
+  // be wrapped in other phrasing and it must never depend on where in the table it
+  // happens to sit.
+  if (/\bun[\s-]?aliv(?:e|ing|ed|es|eing)\b/.test(norm)) return { level: "crisis", rule: "unalive" };
 
   // The explicit crisis table first. This is safe BECAUSE kms/kys are not in it:
   // an unambiguous statement of intent always wins over a reading of the game
   // context, which is what stops "kms i want to die please" from being excused
   // (GAME_CONTEXT contains "die").
   for (const [re, rule] of CRISIS_PATTERNS) {
-    if (re.test(norm)) return { level: "crisis", rule };
+    if (re.test(norm)) {
+      // A joke gets a check-in, never silence.
+      if (isJokeFramed(norm)) return { level: "concern", rule: "joke-framed-crisis" };
+      return { level: "crisis", rule };
+    }
   }
 
   // Then kms/kys: the only tokens whose meaning depends on the rest of the line.
   const kms = kmsDecision(norm);
   if (kms) return kms;
+
+  for (const [re, rule] of SAFEGUARDING_PATTERNS) {
+    if (re.test(norm)) return { level: "safeguarding", rule };
+  }
 
   for (const [re, rule] of CONCERN_PATTERNS) {
     if (re.test(norm)) return { level: "concern", rule };
@@ -245,6 +427,29 @@ export const CRISIS_LINES: readonly string[] = [
   "thank you for telling me. what you're feeling is really heavy, and you deserve support from a real person. please talk to an adult you trust today, and if you feel in danger right now, please contact your local emergency services or a crisis line.",
   "i'm here and i'm listening. i can't help you the way a person can, so please talk to someone you trust - an adult, a family member, or a teacher - as soon as you can. if you're in danger now, please call your local emergency number.",
   "you telling me this matters. please reach out to a trusted adult today, or a crisis line or your local emergency services if you feel you're in danger. i'm still here if you want to keep talking.",
+];
+
+/**
+ * Safeguarding: someone is being hurt, or is not eating.
+ *
+ * Different words on purpose. A crisis reply says "I want you to talk to someone
+ * you trust right now", which is right but does not say the thing a child being hit
+ * at home most needs to hear first: that it is not their fault, and that it is not
+ * okay.
+ *
+ * Three things this pool never does, and they are rules rather than style:
+ *
+ *  - it never ASKS what happened. Asking a frightened teenager to describe being
+ *    abused, in a public game chat where anyone can read it, is harmful;
+ *  - it never promises secrecy. Elix always encourages telling a trusted adult, so
+ *    a promise of secrecy would be a promise it cannot keep;
+ *  - it never investigates or hints at it. No "are you sure?", no probing.
+ */
+export const SAFEGUARDING_LINES: readonly string[] = [
+  "that is not okay, and it is not your fault. please tell a trusted adult about this - a teacher, a relative, or a school counsellor. if you are in danger right now, please contact local emergency services.",
+  "what you are describing is not okay, and it is not your fault. you deserve help from a real person - please tell a teacher, a relative, or a school counsellor. if you are in danger now, please contact local emergency services.",
+  "i am really glad you said that. that is not okay and it is not your fault. please talk to a trusted adult - a teacher, a relative, or a school counsellor - and if you are in danger right now, please contact local emergency services.",
+  "i hear you, and this is not your fault. please tell a trusted adult, like a teacher or a relative or a school counsellor. if you are in danger right now, please contact local emergency services.",
 ];
 
 /**
@@ -294,9 +499,12 @@ export function buildWellbeingReply(opts: WellbeingReplyOptions): string {
       ? opts.alreadyAnswered
         ? SHORT_CRISIS
         : CRISIS_LINES
-      : opts.alreadyAnswered
-        ? SHORT_CONCERN
-        : CONCERN_LINES;
+      : opts.level === "safeguarding"
+        ? // No short form: a safeguarding reply is never worth abbreviating.
+          SAFEGUARDING_LINES
+        : opts.alreadyAnswered
+          ? SHORT_CONCERN
+          : CONCERN_LINES;
   const base = pool[Math.floor(rand() * pool.length)] ?? pool[0] ?? "";
 
   const helpline = (opts.helplineText ?? "").trim();
