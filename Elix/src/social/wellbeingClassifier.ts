@@ -203,11 +203,47 @@ player who:
 - says they are older, or pressures for nudes in any wording at all
 It does not matter that the older player seems kind, seems joking, or is a friend of
 the family. Being believed about this is the whole point.
+A picture OF A BUILD is not a picture of a child. "send me a pic of your farm" is none.
 
 NOT DISTRESS, even though these words look like the ones above:
-- "nobody would notice if i built here" — a building site, not an absence
+- "nobody would notice if i built here" - a building site, not an absence
 - "im done with this build / game / server", "that grind is brutal"
-- "this creeper killed me", "im starving, got any food?"`;
+- "this creeper killed me", "im starving, got any food?"
+
+TWO KINDS YOU HAVE BEEN GETTING WRONG. These are the two your own live run got wrong,
+so here they are spelled out:
+- BURDEN is crisis, not concern. Saying you are a burden, a weight, or that people would
+  be better off without you is about not being wanted alive. Examples:
+  "im a burden to my family" -> crisis
+  "im such a burden to everyone" -> crisis
+  "they would be better off without me here" -> crisis
+  "nobody would even notice if i was gone" -> crisis
+  "everyone would be better off without me" -> crisis
+- PASSIVE ABSENCE is crisis, not concern. Wishing to be absent, unnoticed, or asleep
+  forever is a death wish stated indirectly. Examples:
+  "nobody would notice if i was gone" -> crisis
+  "nobody would care if i disappeared" -> crisis
+  "i wish i was never born" -> crisis
+  "i want to sleep forever and not wake up" -> crisis
+  "i have a rope ready" -> crisis
+  "i want to jump off a bridge" -> crisis
+
+STOP AND READ THE WHOLE SENTENCE. A METHOD only counts when the sentence is about the
+person. Every one of these contains the same method words and is NOT distress:
+- "jump off this mountain into water" -> none      (Minecraft)
+- "jump off the cliff and survive" -> none         (Minecraft)
+- "rope ready for the lead" -> none                (climbing gym)
+- "i took a rope for the treetop house" -> none    (Minecraft build)
+- "ill bring a water bucket" -> none               (Minecraft)
+A rope is a rope in a climbing gym and a noose in a sentence about not existing.
+Judge the sentence, not the noun.
+
+SAME RULE FOR PICTURES. "send me a pic of your BUILD", "take a screenshot of that farm"
+and "send a pic of your base" are GAME REQUESTS between peers, not exploitation.
+Exploitation needs a person asking for a picture OF THE CHILD, or for nudges.
+Only call these concern when the sentence is about being ignored in an ordinary sense,
+with no idea of leaving or dying attached: "nobody cares about me at this server" -> concern.`;
+
 
 export interface ClassifierDeps {
   /** Runs the `guard` role. Injected so tests never touch the network. */

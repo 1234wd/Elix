@@ -181,8 +181,29 @@ const SAFEGUARDING_PATTERNS: ReadonlyArray<[RegExp, string]> = [
 
   // A parent keeping a child in and out of food. Safeguarding rather than crisis: the
   // harm is being done to them, and the advice is about getting an adult involved.
-  [/\b(?:locked|locked me|they locked) (?:me )?(?:in|up) (?:my |the |a |their )?(?:room|house|home|upstairs)\b/, "locked-in"],
-  [/\bno food (?:in|at) (?:the house|home|my house)\b|\b(?:mum|mom|dad|parent)s? (?:doesn't|dont|does not) (?:feed|give) me\b/, "locked-in"],
+  // "locks" as well as "locked": people are usually describing it in the present
+  // tense, and a rule that only knows the past tense misses the tense it is actually
+  // written in. "my step mom locks me in my room without food" is the reported line.
+  [/\b(?:locks?|locked|locking|shuts?|shut|shutting|keeps?|kept)\s+(?:me\s+)?(?:in|up)\s+(?:my |the |a |their |his |her )?(?:room|house|home|upstairs|bedroom)\b/, "locked-in"],
+  [/\bno food (?:in|at) (?:the house|home|my house)\b|\b(?:mum|mom|momma|step ?mom|step ?mum|dad|parent)s? (?:doesn't|dont|does not) (?:feed|give) me\b/, "locked-in"],
+  [/\b(?:locked|locked me) (?:in|up) (?:my |the )?room\b[^.]{0,30}?\b(?:without|no) food\b/, "locked-in"],
+  [/\b(?:without|no) food\b[^.]{0,30}?\b(?:locked|trapped|stuck) (?:in|up)\b/, "locked-in"],
+
+  // ---- A3: grooming contact, the step BEFORE the picture ---------------------------
+  //
+  // Asking where a child lives comes before asking for a picture, and it is the step
+  // that gets missed: no picture is mentioned, so every picture rule stays quiet. That
+  // is the exact shape of the miss Round 11 measured: "a guy on discord wants my
+  // address" was neither gated nor matched.
+  //
+  // Each needs an online-party cue, so "where is the village" and "what's your
+  // discord" stay ordinary chat.
+  [/\b(?:guy|man|gal|woman|girl|older|player|person|someone|they)\b[^.]{0,40}?\b(?:want|wanted|asked|asking|wants|needs|trying|asking for)\b[^.]{0,20}?\bmy (?:address|home address|phone number|number|email|school|postcode|zip)\b/, "exploitation-contact"],
+  [/\b(?:want|wants|wanted|need|needs|asking for|asked for) my (?:address|home address|phone number|email|school|postcode|zip code)\b/, "exploitation-contact"],
+  [/\b(?:give|send|tell|share|lemme have) me? your (?:address|home address|phone number|email|school|where you live|real name|last name|real age)\b/, "exploitation-contact"],
+  [/\bwhat school are you at\b|\bwhere do you go to school\b/, "exploitation-contact"],
+  [/\bdiscord\b[^.]{0,30}?\b(?:meet|meet up|hang out|come over|address|phone number|where you live)\b/, "exploitation-contact"],
+  [/\b(?:meet|meet up|hang out|come over)\b[^.]{0,25}?\b(?:offline|in real life|irl|at yours|at mine|at my place|at your place)\b/, "exploitation-contact"],
 ];
 
 /**
@@ -299,7 +320,36 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bbeen cutting\b/, "self-harm-past"],
   [/\bused to cut myself\b/, "self-harm-past"],
 
-  // ---- A2: distress that never says a distress word ------------------------------
+  // ---- A3: methods, named as methods ------------------------------------------
+  //
+  // A method is the most informative thing a person can type, and none of these
+  // contain a distress word. i want to jump off a bridge has no crisis vocabulary in
+  // it at all, which is exactly why it needed the classifier before it needed a
+  // pattern.
+  //
+  // The game guards are load-bearing, not decoration. jump off this mountain into
+  // water is ordinary Minecraft, and a crisis reply to it is the joke-before-crisis
+  // bug running backwards: it teaches kids that Elix overreacts, and then they stop
+  // telling him the things that matter. The lookaheads REJECT the line outright
+  // rather than downgrading it, because a downgrade still sends a check-in.
+  [/\b(?:want|going|gonna|plan|planning|think|thought) to jump (?:off|from|out of) (?:a|the|this|that) (?:bridge|roof|rooftop|building|cliff|ledge|train|track|balcony|window)\b(?![^.]*\b(?:mountain|water|lava|elytra|water bucket|cactus|pillar|and survive|into lava|ladder)\b)/, "method-place"],
+  [/\bjump (?:off|out of) (?:a|the|this|that) (?:bridge|roof|rooftop|building|cliff|ledge|train|track|balcony)\b(?![^.]*\b(?:mountain|water|lava|elytra|water bucket|cactus|and survive|into lava|ladder)\b)/, "method-place"],
+  [/\bhang (?:myself|it)\b/, "method-place"],
+
+  // A rope or a noose. ready is the word that matters: a rope owned is a tool, a
+  // rope READY is a decision. rope ready for the lead is a climbing wall, so the
+  // climbing words reject the line outright.
+  [/\b(?:rope|noose|nylon|carabiner)\b[^.]{0,20}?\b(?:ready|waiting|here|bought|keep|kept|saved)\b(?![^.]*\b(?:lead|climb|climbing|wall|gym|pull|ascend|belay|anchor|bolt|karabiner)\b)/, "method-rope"],
+  [/\b(?:have|got|keep|kept)\s+(?:a |my |the )?(?:rope|noose|nylon)\b(?![^.]*\b(?:lead|climb|climbing|wall|gym|pull|ascend|belay)\b)/, "method-rope"],
+  [/\bnoose\b/, "method-rope"],
+
+  // Every pill, and a gun beside the person holding it.
+  [/\b(?:take|took|taking|swallow\w*|downed)\s+(?:all|every|each)\s+(?:of\s+)?(?:my|the|their)\s+pills\b/, "method-all-pills"],
+  [/\b(?:all|every)\s+(?:of\s+)?(?:my|the)\s+pills\b/, "method-all-pills"],
+  [/\bi (?:have|got) a gun\b|\bmy gun is\b|\bgot a gun\b|\bi own a gun\b/, "method-gun"],
+  [/\bgun\b[^.]{0,25}?\b(?:shoot myself|shot myself|kill myself|end it)\b/, "method-gun"],
+
+  // ---- A3: distress that never says a distress word ------------------------------
   //
   // Six of ten unseen phrasings contained no word from the classifier's list at all,
   // which is the argument for classifying every line rather than trusting a gate to
@@ -400,6 +450,14 @@ const CONCERN_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bi feel like giving up\b/, "giving-up"],
 
   // ---- A1: fear, crying, and not wanting to go home --------------------------
+  // ---- A3: numbing, which is a symptom and not an emergency -----------------------
+  //
+  // Deliberately concern and not crisis. Numbing is a real and common way a child
+  // describes depression, and a check-in is the right response — but treating it as an
+  // emergency teaches them that Elix overreacts, and an overreactor gets ignored on the
+  // day it actually matters.
+  [/\bi feel numb\b|\bi'?m numb\b|\bnumb all the time\b|\bnothing feels\b|\bgo through the motions\b|\bnumbed\b/, "numb"],
+
   [/\b(?:i'?m|i am) scared (?:to|of|about) go(?:ing)? home\b/, "scared-home"],
   [/\b(?:i'?m|i am) afraid to go home\b/, "scared-home"],
   [/\bdon'?t wanna go home\b/, "scared-home"],

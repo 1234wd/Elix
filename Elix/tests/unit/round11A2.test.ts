@@ -20,6 +20,7 @@ import {
   VerdictCache,
   auditKey,
   auditShouldSpeak,
+  remainingAuditBudget,
   shouldAudit,
   wordCount,
 } from "../../src/social/wellbeingAudit.js";
@@ -30,6 +31,29 @@ import {
 } from "../../src/social/wellbeing.js";
 import { detectImminent } from "../../src/social/wellbeingClassifier.js";
 import type { WellbeingLevel } from "../../src/social/wellbeing.js";
+
+describe("A1 - the deadline is measured from when the LINE arrived", () => {
+  // Extracted as a pure function because this arithmetic could not be tested any other
+  // way: racing a fake provider against real timers either flakes or proves nothing.
+  it("a fresh line has the whole budget", () => {
+    expect(remainingAuditBudget(1000, 2000, 1000)).toBe(2000);
+    expect(remainingAuditBudget(1000, 2000, 1500)).toBe(1500);
+  });
+
+  it("the chat reply's own time comes out of it", () => {
+    // 1900 ms of model leaves 100 ms for the audit, NOT a fresh 2000 ms.
+    expect(remainingAuditBudget(1000, 2000, 2900)).toBe(100);
+  });
+
+  it("a spent budget is zero, never negative", () => {
+    expect(remainingAuditBudget(1000, 2000, 3000)).toBe(0);
+    expect(remainingAuditBudget(1000, 2000, 99_999)).toBe(0);
+  });
+
+  it("a zero budget is spent immediately", () => {
+    expect(remainingAuditBudget(1000, 0, 1000)).toBe(0);
+  });
+});
 
 /* ------------------------------------------------------------------ audit -- */
 

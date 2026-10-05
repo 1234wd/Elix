@@ -105,6 +105,25 @@ export class ClassifierBudget {
 }
 
 /**
+ * How much of the classifier budget is left, measured from when the LINE arrived.
+ *
+ * A pure function on purpose. The first version of the send-gate computed this inline
+ * and its behaviour could only be tested by racing a fake provider against real
+ * timers, which is a test that either flakes or proves nothing. Extracted here, every
+ * branch — including the zero-and-negative case — is directly assertable.
+ *
+ * Measuring from `now` instead would silently extend the budget: a 1.9 s chat reply
+ * followed by a fresh 2 s wait is 3.9 s of a player staring at an empty chat box, and
+ * the player gives up before the safety check does.
+ *
+ * @returns milliseconds remaining, or 0 when the budget is already spent.
+ */
+export function remainingAuditBudget(arrivedAt: number, budgetMs: number, now: number): number {
+  const left = budgetMs - (now - arrivedAt);
+  return left > 0 ? left : 0;
+}
+
+/**
  * A bounded verdict cache.
  *
  * Bounded because this runs for the lifetime of a server and an unbounded Map on

@@ -31,6 +31,7 @@ import {
   VerdictCache,
   auditKey,
   auditShouldSpeak,
+  remainingAuditBudget,
   shouldAudit,
 } from "../social/wellbeingAudit.js";
 import {
@@ -443,75 +444,113 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
  * regex stays.
  */
 /**
- * The second detection layer, running alongside the normal reply.
+ * Start the second detection layer for one line.
  *
- * Three properties make calling a model on every line affordable, and all three are
- * tested rather than assumed:
+ * Returns a promise, or null when it decided not to run at all. The caller decides
+ * what to do with the answer, and that split is the whole point of A1:
  *
- *  - CACHED by normalised text, because a public server repeats itself, and a kid
- *    typing the same sentence twice is one event rather than two.
- *  - CAPPED at 30 calls a minute, with vocabulary-gated lines jumping the queue when
- *    the cap is reached. A plain counter would let a busy minute drop exactly the
- *    line that mattered.
- *  - NOT AWAITED. `handle()` returns without waiting, so ordinary chat is no slower
- *    because of it.
+ *  - an ADDRESSED line has a normal reply racing it, so the caller must await this
+ *    before sending;
+ *  - an AMBIENT line has no reply to race, so it fires and forgets.
  *
- * When it finds something the regex floor missed, it speaks. It never adds a second
- * reply about a line the floor already handled.
+ * The previous version fired and forgot for both, which meant a line like "i want to
+ * jump off a bridge" could get a game reply first and a crisis reply second. That is
+ * the joke-before-crisis bug through a different door, and it is not acceptable: the
+ * player reads the first line and stops there.
  */
-private auditInBackground(sender: string, message: string, sayQueue?: SayQueue): void {
+private startAudit(message: string): Promise<ClassifierVerdict | null> | null {
   // Two words cannot be judged and is not worth a call: it is almost always a
   // greeting or a command.
-  if (!shouldAudit(message)) return;
+  if (!shouldAudit(message)) return null;
   const key = auditKey(message);
-  if (key.length < 8) return;
+  if (key.length < 8) return null;
 
   // Already judged once. A repeated line is answered from the cache, with no call.
   const cached = this.auditCache.get(key);
-  if (cached) {
-    this.speakIfAuditFinds(sender, message, cached, sayQueue);
-    return;
-  }
+  if (cached) return Promise.resolve(cached);
 
   // The floor handles this line synchronously if it matches, and a second opinion has
   // nothing to add when the floor already spoke.
-  if (detectWellbeing(message).level !== "none") return;
+  if (detectWellbeing(message).level !== "none") return null;
 
   const gated = needsSecondLook(message);
   if (!this.auditBudget.tryAcquire(gated)) {
-    this.opts.log?.debug(
-      "wellbeing audit: over the per-minute cap and not gated, skipped",
-    );
-    return;
+    this.opts.log?.debug("wellbeing audit: over the per-minute cap and not gated, skipped");
+    return null;
   }
 
-  void (async () => {
-    const verdict = await this.classifyWellbeing(message);
-    if (verdict) this.auditCache.set(key, verdict);
-    this.speakIfAuditFinds(sender, message, verdict, sayQueue);
-  })().catch(() => {
-    // Never unhandled. A failure here means the regex floor stands, which is the
-    // whole reason the floor exists.
+  return this.classifyWellbeing(message)
+    .then((verdict) => {
+      if (verdict) this.auditCache.set(key, verdict);
+      return verdict;
+    })
+    .catch(() => {
+      // Never a rejection. A failure here means the regex floor stands, which is the
+      // whole reason the floor exists.
+      return null;
+    });
+}
+
+/**
+ * Wait for the verdict, bounded by the SAME deadline as the classifier itself and
+ * measured from when the LINE arrived rather than from now.
+ *
+ * Measuring from now would silently extend the budget: a 1.5 s model call followed
+ * by a 2 s wait is 3.5 s of a player staring at an empty chat box. If the line has
+ * already spent the budget, the answer is treated as no answer and the normal reply
+ * goes out — which is the specified behaviour, because a timeout must not silence
+ * ordinary conversation.
+ */
+private async settleAudit(
+  audit: Promise<ClassifierVerdict | null>,
+  arrivedAt: number,
+): Promise<ClassifierVerdict | null> {
+  const budget = this.opts.classifierTimeoutMs ?? 2000;
+  const remaining = remainingAuditBudget(arrivedAt, budget, Date.now());
+  // Already spent. A verdict that arrives after this is ignored rather than honoured,
+  // which is the whole reason this is a check and not a bare Promise.race: a race
+  // against an ALREADY-SETTLED promise would always win, however late it was.
+  if (remaining === 0) return null;
+  const timer = new Promise<ClassifierVerdict | null>((resolve) => {
+    setTimeout(() => resolve(null), remaining).unref?.();
   });
+  return Promise.race([audit, timer]);
+}
+
+/**
+ * Does this verdict make the normal reply undeliverable?
+ *
+ * Anything above `none` does. A classifier that says `concern` about a line the model
+ * has already written a game reply to is a strong enough signal that sending both is
+ * worse than sending one: the player reads the joke and scrolls past the help.
+ *
+ * `none`, a timeout and an error all mean "send the normal reply", because a failed
+ * classifier must never silence ordinary chat.
+ */
+private auditBlocksReply(verdict: ClassifierVerdict | null): boolean {
+  if (!verdict) return false;
+  if (verdict.imminent) return true;
+  return verdict.level !== "none";
 }
 
 /**
  * Speak only if this verdict is a genuine NEW detection.
  *
  * Every early return below is a case where speaking would be wrong rather than merely
- * noisy, so each one is commented with what it prevents.
+ * noisy, so each one is commented with what it prevents. Returns the text it said, so
+ * the A1 gate can return it as this line's reply.
  */
 private speakIfAuditFinds(
   sender: string,
   message: string,
   verdict: ClassifierVerdict | null,
   sayQueue: SayQueue | undefined,
-): void {
-  if (!sayQueue) return;
-  if (this.opts.signal?.aborted) return;
+): string | null {
+  if (!sayQueue) return null;
+  if (this.opts.signal?.aborted) return null;
   // A line the floor already spoke about does not get a second wellbeing reply.
-  if (!auditShouldSpeak(verdict, detectWellbeing(message).level)) return;
-  if (this.wellbeingState.recentlyAnswered(sender)) return;
+  if (!auditShouldSpeak(verdict, detectWellbeing(message).level)) return null;
+  if (this.wellbeingState.recentlyAnswered(sender)) return null;
 
   const level: Exclude<WellbeingLevel, "none"> =
     verdict?.imminent === true
@@ -542,6 +581,7 @@ private speakIfAuditFinds(
     });
   }
   sayQueue.say(text, true, true);
+  return text;
 }
 
 private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
@@ -637,14 +677,6 @@ private async phraseWellbeing(
       return { replied: false, reason: "shutting-down" };
     }
 
-    // A2: the BACKGROUND AUDIT. Started here and deliberately not awaited.
-    //
-    // The vocabulary gate was the hole: six of ten unseen phrasings contained none
-    // of its words, so the classifier never saw them at all. The gate is now only a
-    // priority hint, and every line of three or more words gets classified. Not
-    // awaiting it is what makes that affordable — ordinary chat gains no latency,
-    // because the normal reply does not wait for this.
-    this.auditInBackground(sender, message, sayQueue);
     if (this.opts.maxReplies !== undefined && this.replies >= this.opts.maxReplies) {
       return { replied: false, reason: "max-replies" };
     }
@@ -671,7 +703,29 @@ private async phraseWellbeing(
       this.recordAmbient(message, sender);
     }
 
+    // A2/A1: start the audit for EVERY line, addressed or not, and do not await it.
+    //
+    // This is the fix for the joke-before-crisis bug by a different route. Round 11
+    // measured five phrasings that are neither gated nor matched by the regex — "i
+    // want to jump off a bridge" among them — so an ADDRESSED one of those used to get
+    // a game reply out of the model and a crisis reply a moment later. The player reads
+    // the first line and stops there.
+    //
+    // The audit runs in PARALLEL with the LLM call, and the SEND is what waits (see
+    // `settleAudit` below). Median classifier latency is ~300 ms against ~600 ms or
+    // more for a chat reply, so in the normal case the verdict is already waiting and
+    // the audit costs no wall-clock time at all.
+    //
+    // AMBIENT lines have no reply to race, so theirs stays in the background and may
+    // speak on its own.
+    const auditArrivedAt = Date.now();
+    const audit = this.startAudit(message);
     if (!addressed) {
+      if (audit) {
+        void audit.then((verdict) => {
+          this.speakIfAuditFinds(sender, message, verdict, sayQueue);
+        });
+      }
       return { replied: false, reason: "not-addressed" };
     }
 
@@ -738,6 +792,33 @@ private async phraseWellbeing(
         this.recordSilently(line, "elix", sender, "chat");
         sayQueue?.say(line, false);
         return { replied: true, reason: "blocked-leak", text: line, usedProvider: "builtin" };
+      }
+
+      // A1: THE GATE ON THE SEND.
+      //
+      // Everything above produced a candidate reply and threw it away. Everything below
+      // is "we are about to send it", so this is the last point at which a second layer
+      // verdict can stop a joke from going out.
+      //
+      // Deliberately BEFORE trimChatReply and recordSilently: a reply that is dropped
+      // must leave no trace, or Elix later cites a joke he never said while comforting
+      // someone, which is the C4 leak in a different costume.
+      if (audit) {
+        const verdict = await this.settleAudit(audit, auditArrivedAt);
+        if (this.auditBlocksReply(verdict)) {
+          const said = this.speakIfAuditFinds(sender, message, verdict, sayQueue);
+          if (said) {
+            return {
+              replied: true,
+              reason: `audit-${verdict?.imminent === true ? "crisis" : (verdict?.level ?? "concern")}`,
+              text: said,
+              usedProvider: "builtin",
+            };
+          }
+          // speakIfAuditFinds declined — it was a line the floor already handled, or
+          // this player was answered moments ago. Either way there is nothing to add,
+          // so fall through and send the normal reply rather than going silent.
+        }
       }
 
       // A4: chat is not a place for a paragraph. Cap it after the safety
