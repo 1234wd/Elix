@@ -893,6 +893,20 @@ export function wellbeingEpisodeText(player: string, level: WellbeingLevel): str
 export class WellbeingState {
   private readonly answeredAt = new Map<string, number>();
   private readonly recordedThisSession = new Set<string>();
+  /**
+   * The HIGHEST level each player has been answered at inside the cooldown.
+   *
+   * This is the single source of truth for two things that used to be tracked in two
+   * places and disagreed:
+   *
+   *  - ESCALATION. Round 14 measured a regex-caught concern followed by an audit-caught
+   *    crisis producing the SHORT "still here" form, because the audit path had its own
+   *    record of the last level and the regex path never wrote to it. A level that lives
+   *    in one place cannot be written by one caller and missed by another.
+   *  - GENTLE MODE. Initiative reads `lastContact` from here, so it cannot speak
+   *    cheerfully to someone who was answered five seconds ago.
+   */
+  private readonly answeredLevel = new Map<string, WellbeingLevel>();
   /** Total saved this session, for the tests and the dashboard. */
   interventions = 0;
 
@@ -904,9 +918,47 @@ export class WellbeingState {
     return at !== undefined && this.now() - at < CRISIS_COOLDOWN_MS;
   }
 
-  noteAnswered(player: string): void {
+  /**
+   * When did this player last get a wellbeing reply of any kind, from any path?
+   *
+   * Null means never. Deliberately NOT bounded by the cooldown: B's quiet window is a
+   * different, longer number, and it must still know that something was said.
+   */
+  lastContact(player: string): number | null {
+    return this.answeredAt.get(player) ?? null;
+  }
+
+  /** The highest level this player has been answered at inside the cooldown. */
+  lastLevel(player: string): WellbeingLevel | undefined {
+    return this.answeredLevel.get(player);
+  }
+
+  /**
+   * Record a reply, from ANY path.
+   *
+   * `escalation` is why the level is kept rather than just the timestamp: a player
+   * answered at `concern` and then at `crisis` inside the cooldown has been given
+   * something new, and the short form would drop the emergency guidance that is the one
+   * thing a crisis reply must carry. The caller uses this to decide whether to shorten,
+   * and the state keeps it so both callers agree.
+   */
+  noteAnswered(player: string, level: WellbeingLevel = "concern"): { escalation: boolean } {
+    const previous = this.answeredLevel.get(player);
+    const at = this.answeredAt.get(player);
+    const withinCooldown = at !== undefined && this.now() - at < CRISIS_COOLDOWN_MS;
+    const escalation = level === "crisis" && (!withinCooldown || previous !== "crisis");
     this.answeredAt.set(player, this.now());
+    // The highest level wins, so a later `concern` cannot downgrade a recorded `crisis`
+    // and turn the next reply into a shrug.
+    const highest: WellbeingLevel =
+      previous === "crisis" || previous === "safeguarding"
+        ? previous
+        : level === "crisis" || level === "safeguarding"
+          ? level
+          : (previous ?? level);
+    this.answeredLevel.set(player, highest);
     this.interventions += 1;
+    return { escalation };
   }
 
   /**

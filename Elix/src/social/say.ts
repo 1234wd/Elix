@@ -351,7 +351,6 @@ export class SayQueue {
     this.onSend = fn;
   }
 
-  /** Test helper: number of messages still waiting. */
   /**
    * Is anything still waiting to be typed out?
    *
@@ -363,6 +362,7 @@ export class SayQueue {
     return this.pending > 0;
   }
 
+  /** Test helper: number of messages still waiting. */
   get pending(): number {
     return this.queue.length;
   }

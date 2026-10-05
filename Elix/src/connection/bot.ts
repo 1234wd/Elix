@@ -20,7 +20,7 @@ import {
   type EmotionEvent,
 } from "../social/emotion.js";
 import { SayQueue } from "../social/say.js";
-import { detectWellbeing } from "../social/wellbeing.js";
+import { WellbeingState, detectWellbeing, type WellbeingLevel } from "../social/wellbeing.js";
 import { DEFAULT_INITIATIVE, type Drive } from "../social/manners.js";
 import { decideInitiative, nextShape } from "./initiative.js";
 import { exitCleanly } from "../core/exit.js";
@@ -49,6 +49,16 @@ export interface BotLike {
    * `playerJoined`, so greeting them depended on mineflayer's bookkeeping rather
    * than on whether they were actually there.
    */
+/**
+ * R4: `players` stays `Record<string, unknown>` on purpose.
+ *
+ * It is the shape mineflayer actually hands over - a record of Player objects whose
+ * position lives on `entity.position`, and whose `entity` is undefined out of range - but
+ * it cannot be narrowed in the type, because the reviewer's FakeBot declares
+ * `players: Record<string, unknown>` and that file is not mine to edit. Every read goes
+ * through `playerPosition()`, which checks the shape at runtime instead of casting it
+ * away. A cast silences the compiler; a guard cannot.
+ */
   players?: Record<string, unknown>;
   _client?: {
     on(event: string, fn: (...args: unknown[]) => void): void;
@@ -82,6 +92,31 @@ export interface Vec3Like {
   x: number;
   y: number;
   z: number;
+}
+
+/**
+ * R4: the position of one mineflayer player, or undefined.
+ *
+ * THE COMPENSATING CONTROL. `BotLike.players` is `Record<string, unknown>` rather than
+ * `Record<string, PlayerLike>`, because a narrower interface cannot be implemented by the
+ * reviewer's `FakeBot`, whose `players` is declared wide and which I am not allowed to
+ * edit. So the type does not narrow; the RUNTIME does, here.
+ *
+ * That is strictly better than what Round 13 did. The previous code cast the whole record
+ * to a shape with a `position` property, tsc agreed, the policy tests passed against
+ * hand-built objects that had `position`, and initiative never fired in a real server
+ * because mineflayer's Player has no `position` — it has `entity.position`, and `entity`
+ * is undefined out of range. A cast silences the compiler; a guard cannot.
+ */
+export function playerPosition(player: unknown): Vec3Like | undefined {
+  if (player === null || typeof player !== "object") return undefined;
+  const entity = (player as { entity?: unknown }).entity;
+  if (entity === null || typeof entity !== "object") return undefined;
+  const pos = (entity as { position?: unknown }).position;
+  if (pos === null || typeof pos !== "object") return undefined;
+  const { x, y, z } = pos as { x?: unknown; y?: unknown; z?: unknown };
+  if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return undefined;
+  return { x, y, z };
 }
 
 export type BotFactory = () => BotLike | Promise<BotLike>;
@@ -210,6 +245,39 @@ export interface ChatBridgeLike {
    * reason initiative goes through the gate instead of straight to SayQueue.
    */
   hasPendingAudits?(): boolean;
+  /**
+   * Is THIS player waiting on a safety decision?
+   *
+   * The narrower question, and the one B asks. A stranger's ambient line is a much weaker
+   * reason to stay quiet than a live decision about the person standing next to Elix, and
+   * using the global flag let one passer-by mute Elix for the whole session.
+   */
+  hasUnsettledAudits?(sender: string): boolean;
+  /**
+   * The bridge's own wellbeing state, so the session and the bridge share ONE.
+   *
+   * R5: the two of them previously kept separate records — a map in BotSession that
+   * nothing wrote, and a private level map in the bridge that only one of its four reply
+   * paths updated. Sharing the object removes the possibility of them disagreeing, which
+   * is what let a crisis reply be followed by "how is your day going".
+   */
+  wellbeingState?: WellbeingState;
+  /**
+   * When did this player last get a wellbeing reply of any kind, from any path?
+   *
+   * The single source of truth for B's quiet window. In Round 13 `BotSession` kept its own
+   * map for this, which nothing ever wrote to, so five seconds after a crisis reply Elix
+   * cheerfully asked how the player's day was going.
+   */
+  /**
+   * R3: wait only for what this player is already owed. Never classifies the line.
+   *
+   * `gateScriptedReply` classifies the line it is given, and for initiative that line is
+   * ELIX'S OWN — so the bot was spending classifier quota re-reading his own unprompted
+   * message and filing an audit against the player for words they never said. In a safety
+   * module, inventing a crisis attributed to someone is worse than wasting a call.
+   */
+  gateOwnLine?(sender: string): Promise<boolean>;
   /**
    * C3: say hello to someone who came back, unprompted, mentioning something
    * real. Returns null when there is nothing worth saying.
@@ -568,6 +636,52 @@ export async function makeSafeMovements(
  * bookkeeping. `runBot` creates one per connection attempt; the tests drive
  * `end`/`kicked`/`spawn` by hand on a fake bot.
  */
+  /**
+ * The closest player's name, or null.
+ *
+ * Takes the already-mapped positions so there is exactly one place in this file that knows
+ * where a mineflayer player's coordinates live.
+ */
+function nearestPlayerName(
+  players: Record<string, { position?: Vec3Like } | undefined>,
+  selfName: string,
+  selfPosition: Vec3Like | undefined,
+): string | null {
+  if (!selfPosition) return null;
+  let best: { name: string; d: number } | null = null;
+  for (const [name, p] of Object.entries(players)) {
+    if (name === selfName || !p?.position) continue;
+    const d = Math.hypot(
+      p.position.x - selfPosition.x,
+      p.position.y - selfPosition.y,
+      p.position.z - selfPosition.z,
+    );
+    if (!best || d < best.d) best = { name, d };
+  }
+  return best?.name ?? null;
+}
+
+/**
+ * R4: mineflayer's players, mapped into the shape the initiative policy reads.
+ *
+ * The mapping is the point. `bot.players[name].entity.position` is the real path, and
+ * `entity` is undefined for anyone out of range, so a player with no tracked entity maps
+ * to `undefined` rather than to a fabricated position of zero. That is why this is a
+ * function with a loop in it and not a cast: a cast over a third-party type is precisely
+ * what let Round 13 ship a correct policy against inputs the game never produces.
+ */
+export function mapPlayerPositions(
+  players: Record<string, unknown> | undefined,
+): Record<string, { position?: Vec3Like } | undefined> {
+  const out: Record<string, { position?: Vec3Like } | undefined> = {};
+  for (const [name, p] of Object.entries(players ?? {})) {
+    const pos = playerPosition(p);
+    out[name] = pos ? { position: pos } : undefined;
+  }
+  return out;
+}
+
+
 export class BotSession {
   private readonly deps: SessionDeps;
   private readonly scheduler = new ReconnectScheduler();
@@ -598,10 +712,12 @@ export class BotSession {
   private initiativeTimer: ReturnType<typeof setInterval> | null = null;
   /** When Elix last said something nobody asked for. Enforces minGapMs. */
   private lastInitiativeAt = 0;
-  /** Round-robin position across the four initiative shapes. */
+  /** Round-robin position across the four initiative SHAPES. */
+  private initiativeShapeTurn = 0;
+  /** Round-robin position across the drives. Separate on purpose: they were one counter. */
   private initiativeTurn = 0;
-  /** Last wellbeing reply or check-in per player, for wellbeingQuietMs. */
-  private readonly lastWellbeingAt = new Map<string, number>();
+  /** Fallback state, used only when no bridge supplies one. */
+  private readonly ownWellbeingState = new WellbeingState();
   /** Last unprompted memory callback per player, for memoryGapMs. */
   private readonly lastMemoryCallbackAt = new Map<string, number>();
   /** Unprompted lines spent this hour, against IDLE_BUDGET_PER_HOUR. */
@@ -1029,7 +1145,12 @@ export class BotSession {
              * character and an invented phone number. There is nothing left for the
              * guard to catch, and running it can only ever replace care with a joke.
              */
-            const isWellbeing = /^(wellbeing|audit)-/.test(outcome.reason ?? "");
+            // R5: recorded from the outcome reason, so it works with ANY bridge implementation and not
+  // only the one that happens to own a WellbeingState.
+  const sentLevel = this.wellbeingLevelFromReason(outcome.reason);
+  if (sentLevel && sentLevel !== "none") this.wellbeingState.noteAnswered(username, sentLevel);
+
+  const isWellbeing = /^(wellbeing|audit)-/.test(outcome.reason ?? "");
             if (isWellbeing) {
               log.info(
                 { username, reason: outcome.reason, ms: Date.now() - startedAt },
@@ -1120,6 +1241,31 @@ export class BotSession {
  * The delay is randomised, because a welcome that arrives in the same 900 ms
  * every time is indistinguishable from a script.
  */
+
+  /**
+ * The ONE wellbeing state, shared.
+ *
+ * R5: `BotSession` used to keep its own `lastWellbeingAt` map, which the poll read on every
+ * tick and which nothing ever wrote to — so five seconds after a crisis reply Elix asked
+ * the player how their day was going.
+ *
+ * The bridge's `WellbeingState` is used when there is one, because the bridge owns the
+ * regex floor, the audit, the background release and the gated scripted reply, and each of
+ * those writes to it. The session writes the one thing only it can see: the fact that a
+ * reply which left the session was a wellbeing reply at all, which it learns from the
+ * outcome reason. Same object either way, so there is no second map to drift.
+ */
+private get wellbeingState(): WellbeingState {
+  return this.deps.chatBridge?.wellbeingState ?? this.ownWellbeingState;
+}
+
+/** Level implied by a bridge outcome reason, or null when it is an ordinary reply. */
+private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | null {
+  if (!reason) return null;
+  const m = /^(?:wellbeing|audit)-(none|concern|safeguarding|crisis)$/.exec(reason);
+  return m ? (m[1] as WellbeingLevel) : null;
+}
+
   /**
    * B: the five-second poll. A thin adapter over decideInitiative().
    *
@@ -1137,29 +1283,47 @@ export class BotSession {
     const { log } = this.deps;
     const bridge = this.deps.chatBridge;
     const busy = (bridge?.inFlightCount ?? 0) > 0 || this.say?.hasPending === true;
+    // Who is closest, read the way mineflayer actually stores it. Computed once because the
+    // audit check below is about THAT player, not about the room.
+    const thresholds = this.deps.config.initiative ?? DEFAULT_INITIATIVE;
+    const players = mapPlayerPositions(bot.players);
+    const nearest = nearestPlayerName(players, this.deps.profile.username, bot.entity?.position);
+    // R5: from WellbeingState, which every reply path writes. The map this replaces was
+    // read on every poll and written by nothing, so five seconds after a crisis reply
+    // Elix asked how the player's day was going.
+    const lastWellbeingAt = new Map<string, number>();
+    const contact = nearest ? this.wellbeingState.lastContact(nearest) : null;
+    if (nearest !== null && contact !== null) lastWellbeingAt.set(nearest, contact);
+
     const ctx = {
-      thresholds: this.deps.config.initiative ?? DEFAULT_INITIATIVE,
-      players: (bot.players ?? {}) as Record<
-        string,
-        { position?: { x: number; y: number; z: number } } | undefined
-      >,
+      thresholds,
+      // R4: mineflayer puts the position on `player.entity.position`, and `entity` is
+      // undefined when the player is out of range. Positions are mapped explicitly here
+      // rather than cast into a shape that reads a property mineflayer does not have.
+      players,
       selfName: this.deps.profile.username,
       selfPosition: bot.entity?.position,
       now: Date.now(),
       busy,
-      // An audit in flight anywhere means an unprompted line could overtake a safety
-      // decision. This is the Round 13 ordering bug one layer down, and it is the whole
-      // reason initiative goes through the gate rather than straight to SayQueue.
-      pendingAuditNearby: bridge?.hasPendingAudits?.() ?? false,
+      // R1: the TARGET'S unsettled audits, not everyone's. `hasPendingAudits()` was
+      // correct once but was read as "any audit anywhere, ever retained", so one ambient
+      // line from a passer-by muted Elix for the rest of the session.
+      pendingAuditNearby: nearest !== null && (bridge?.hasUnsettledAudits?.(nearest) ?? false),
       lastInitiativeAt: this.lastInitiativeAt,
-      lastWellbeingAt: this.lastWellbeingAt,
+      lastWellbeingAt,
       lastMemoryCallbackAt: this.lastMemoryCallbackAt,
       idleBudgetUsed: this.idleBudgetUsed,
       shutdown: this.shutdownRequested || this.ended,
-      recallImportant: this.deps.memory?.recallImportant?.bind(this.deps.memory) ?? undefined,
+      // Memory callbacks stay disabled: recallImportant is not implemented anywhere, and
+      // when it is, wellbeing, safeguarding and exploitation episodes must never be
+      // eligible. Chat is public, and those episodes are stored at importance 9.
+      recallImportant: undefined,
     };
 
-    const shape = nextShape(this.initiativeTurn, this.deps.memory !== undefined);
+    // Separate counters: shape and drive used to share one, and both were incremented on
+    // every poll as well as on success, so the two walked in lockstep and the "variety"
+    // was an illusion.
+    const shape = nextShape(this.initiativeShapeTurn, false);
     const drive = this.nextDrive();
     const decision = decideInitiative(ctx, shape, drive);
     if (!decision.speak || !decision.target || !decision.line) {
@@ -1170,7 +1334,10 @@ export class BotSession {
     }
 
     this.lastInitiativeAt = ctx.now;
-    this.initiativeTurn += 1;
+    this.initiativeShapeTurn += 1;
+    // The budget is only spent when something is actually said. An unprompted line
+    // answers IDLE_BUDGET_PER_HOUR; a declined poll costs nothing.
+    this.idleBudgetUsed += 1;
 
     const target = decision.target;
     const line = decision.line;
@@ -1181,16 +1348,15 @@ export class BotSession {
       log.info({ target, shape: decision.shape, drive }, "initiative: spoke first");
     };
 
-    // The same gate every other reply passes. An unprompted line is still a reply, so it
-    // waits on the audit and a blocking verdict suppresses it — otherwise initiative is
-    // a way to put a lighthearted line in front of a child the classifier is still
-    // thinking about.
-    if (bridge?.gateScriptedReply) {
+    // R3: gateOwnLine, NOT gateScriptedReply. The line about to be sent is Elix's own,
+    // and classifying it would file an audit against the PLAYER for words they never said.
+    // This only waits for what that player is already owed.
+    if (bridge?.gateOwnLine) {
       void bridge
-        .gateScriptedReply(target, line, this.say ?? undefined)
+        .gateOwnLine(target)
         .then((suppressed) => {
           if (suppressed) {
-            log.info({ target, shape: decision.shape }, "initiative suppressed by the wellbeing gate");
+            log.info({ target, shape: decision.shape }, "initiative suppressed: live safety decision");
             return;
           }
           sayIt();

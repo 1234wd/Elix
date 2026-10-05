@@ -193,6 +193,17 @@ interface PendingAudit {
   settled: boolean;
   verdict: ClassifierVerdict | null;
   claimed: boolean;
+  /**
+   * R6: when this audit's wellbeing reply actually went out, or null if it never did.
+   *
+   * The whole of R6 in one field. A retained audit blocks a reply ONLY when that reply is
+   * to a line which arrived BEFORE the audit answered — which is Round 13's P3 and is
+   * still correct. Once the answer has been sent, the audit stops blocking anything else,
+   * because Round 14 measured the alternative: for sixty seconds after a crisis reply,
+   * every addressed line was replaced by a template, so "can we build a house now" got
+   * "please reach out to a trusted adult if you haven't yet".
+   */
+  repliedAt: number | null;
   startedAt: number;
   expiresAt: number;
 }
@@ -211,12 +222,30 @@ interface PendingAudit {
  */
 const AUDIT_RETENTION_MS = 60_000;
 
+/** Hard cap on retained audits, so the map cannot grow without bound on a long session. */
+const AUDIT_MAP_CAP = 256;
+
+/**
+ * R6: how long after a wellbeing reply a player's later lines are answered GENTLY rather
+ * than with a template.
+ *
+ * Sixty seconds, matching the crisis cooldown. Inside it a new line gets a real model
+ * reply with the gentle-mode flag set: no jokes, no teasing, no pivot to the game unless
+ * they lead, and never contradicting the advice already given.
+ *
+ * The distinction from the cooldown is the point. The cooldown shortens the WELLBEING
+ * reply. This changes how ORDINARY chat is answered. Before Round 14 they were the same
+ * thing, and the result was a bot that answered "thanks, i talked to my mum" by telling
+ * them not to stop talking to someone they trust.
+ */
+export const GENTLE_MODE_MS = 60_000;
+
 export class ChatBridge {
   private readonly opts: ChatBridgeOptions;
   private readonly persona: string;
   private readonly blockedRecent: string[] = [];
   /** C5: per-player crisis cooldown, and the once-per-session memory note. */
-  private readonly wellbeingState = new WellbeingState();
+  private readonly wellbeingState_ = new WellbeingState();
 
   /**
    * A2: the audit's rate limit and its memo.
@@ -241,14 +270,7 @@ export class ChatBridge {
   private readonly pendingAudits = new Map<string, Set<PendingAudit>>();
 
   /**
-   * H3: the last level this player was given a wellbeing reply at.
-   *
-   * Needed to tell an ESCALATION from a repeat. `WellbeingState` knows only that it
-   * answered recently, not how severely, and without the severity the cooldown cannot be
-   * allowed to shorten a crisis into a concern-length sentence.
-   */
-  private readonly lastWellbeingLevel = new Map<string, WellbeingLevel>();
-  /** C5: seedable, so the template pool is reproducible in a test. */
+   /** C5: seedable, so the template pool is reproducible in a test. */
   private readonly random: () => number;
   /** C3: one typo per ~15 replies. Session state, never persisted. */
   private readonly typingState = newTypingState();
@@ -277,16 +299,59 @@ export class ChatBridge {
 
   /** How many replies are currently being generated. */
   /**
-   * Is any audit still in flight, for anybody?
+   * Is any audit STILL IN FLIGHT, for anybody?
    *
-   * B's poll reads this before every unprompted line. An initiative line IS a reply, and a
-   * reply may overtake a safety decision — which is exactly the Round 13 bug, one layer
-   * down. The whole map is checked rather than one player: the audit in flight may belong
-   * to the person being spoken to OR to someone else in earshot, and in both cases waiting
-   * a few hundred milliseconds is the polite thing to do.
+   * UNSETTLED ONLY, and that word is the whole point of this existing separately from the
+   * retained map. The two answer different questions:
+   *
+   *  - `hasPendingAudits` asks "is a safety decision still being made right now?", which is
+   *    what B's poll needs before it says anything unprompted. A verdict that already
+   *    landed is not in flight, and waiting on it would be pointless.
+   *  - the retained entries are what the send gate needs: a line that arrived before a
+   *    crisis was sent must still be answered, which is Round 13's P3.
+   *
+   * The previous version conflated them and therefore returned true for a full minute
+   * after every line, forever disabling initiative.
    */
   hasPendingAudits(): boolean {
-    return this.pendingAudits.size > 0;
+    this.pruneAudits();
+    for (const set of this.pendingAudits.values()) {
+      for (const audit of set) if (!audit.settled) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Is THIS player waiting on a safety decision?
+   *
+   * The narrower question, and the one B should be asking. An audit in flight for someone
+   * else in earshot is a much weaker reason to stay quiet than one in flight for the
+   * person standing next to Elix, and using the global flag meant a stranger's ambient
+   * line could mute Elix for everyone.
+   */
+  hasUnsettledAudits(sender: string): boolean {
+    this.pruneAudits();
+    const set = this.pendingAudits.get(sender);
+    if (!set) return false;
+    for (const audit of set) if (!audit.settled) return true;
+    return false;
+  }
+
+  /** Per-player wellbeing contact, for B's quiet window. The single source of truth. */
+  lastWellbeingContact(sender: string): number | null {
+    return this.wellbeingState_.lastContact(sender);
+  }
+
+  /**
+   * The shared wellbeing state.
+   *
+   * Exposed so `BotSession` records into the SAME object rather than keeping a second map.
+   * R5 measured what happens when they disagree: a crisis reply goes out, the session's
+   * map stays empty because nothing wrote it, and five seconds later Elix asks how the
+   * player's day is going.
+   */
+  get wellbeingState(): WellbeingState {
+    return this.wellbeingState_;
   }
 
   get inFlightCount(): number {
@@ -456,31 +521,31 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
   // Online exploitation gets its own words, and never the model's: believe them
   // first, then do-not-send, then not-your-fault, then block-and-tell-someone-now.
   if (regexSignal.level === "safeguarding" && isExploitation(regexSignal.rule)) {
-    if (this.wellbeingState.mayRecord(sender)) {
+    if (this.wellbeingState_.mayRecord(sender)) {
       this.opts.memory?.recordWellbeing?.({
         player: sender,
         text: `${sender} had an older person online asking them for pictures and to keep it secret`,
       });
     }
-    this.wellbeingState.noteAnswered(sender);
+    this.wellbeingState_.noteAnswered(sender);
     return EXPLOITATION_REPLY;
   }
 
   if (urgent) {
-    if (this.wellbeingState.mayRecord(sender)) {
+    if (this.wellbeingState_.mayRecord(sender)) {
       this.opts.memory?.recordWellbeing?.({
         player: sender,
         text: wellbeingEpisodeText(sender, "crisis"),
       });
     }
-    this.wellbeingState.noteAnswered(sender);
+    this.noteWellbeingAnswered(sender, "crisis");
     // No phrasing pass: the one reply that must never be reworded by a model is the
     // one for someone who has already taken something.
     return IMMINENT_REPLY;
   }
 
   // Once per session, and redacted. Importance 9 so it survives consolidation.
-  if (this.wellbeingState.mayRecord(sender)) {
+  if (this.wellbeingState_.mayRecord(sender)) {
     this.opts.memory?.recordWellbeing?.({
       player: sender,
       text: wellbeingEpisodeText(sender, level),
@@ -488,14 +553,20 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
     this.opts.log?.info({ player: sender, level }, "wellbeing note stored");
   }
 
-  const already = this.wellbeingState.recentlyAnswered(sender);
+  const already = this.wellbeingState_.recentlyAnswered(sender);
+  // R2: the regex path records through the SAME writer as the audit path, so an
+  // escalation is visible to both. Before Round 14 it recorded nothing here, and the
+  // audit path kept a private map, so the two disagreed about whether a crisis was new.
+  const escalation = already && level === "crisis" && this.wellbeingState_.lastLevel(sender) !== "crisis";
+  const escalated = escalation || this.noteWellbeingAnswered(sender, level).escalation;
   const template = buildWellbeingReply({
     level,
     helplineText: this.opts.helplineText ?? "",
-    alreadyAnswered: already,
+    // The cooldown SHORTENS. It does not veto, and it certainly does not shorten an
+    // escalation: the short form drops the emergency guidance.
+    alreadyAnswered: already && !escalated,
     random: this.random,
   });
-  this.wellbeingState.noteAnswered(sender);
 
   // The template is already safe, so this can only improve it, never worsen it.
   const phrasing = await this.phraseWellbeing(level, template);
@@ -537,6 +608,7 @@ private startAudit(sender: string, message: string): PendingAudit | null {
     settled: false,
     verdict: null,
     claimed: false,
+    repliedAt: null,
     startedAt: Date.now(),
     expiresAt: Date.now() + AUDIT_RETENTION_MS,
   };
@@ -586,21 +658,56 @@ private startAudit(sender: string, message: string): PendingAudit | null {
 }
 
 /**
- * Track an audit against its SENDER until its retention window closes.
- *
- * Registration happens before any early return, so a line that returns early still
- * leaves its verdict on the record for the player's next reply. Entries are pruned by
- * age rather than by settlement — see AUDIT_RETENTION_MS for why settlement is the wrong
- * boundary.
- */
-private registerAudit(audit: PendingAudit): void {
-  let set = this.pendingAudits.get(audit.sender);
-  if (!set) {
-    set = new Set<PendingAudit>();
-    this.pendingAudits.set(audit.sender, set);
+   * Track an audit against its SENDER until its retention window closes.
+   *
+   * Registration happens before any early return, so a line that returns early still
+   * leaves its verdict on the record for the player's next reply.
+   *
+   * PRUNED ON EVERY WRITE AND EVERY READ. Round 14 measured the previous version pruning
+   * only inside the same sender's next addressed reply: one ambient line from a player who
+   * never spoke to Elix again left `hasPendingAudits()` true for the rest of the session,
+   * which silently disabled initiative forever and grew the map without limit.
+   */
+  private registerAudit(audit: PendingAudit): void {
+    this.pruneAudits();
+    let set = this.pendingAudits.get(audit.sender);
+    if (!set) {
+      set = new Set<PendingAudit>();
+      this.pendingAudits.set(audit.sender, set);
+    }
+    set.add(audit);
+    // The hard cap. A busy server produces a lot of audits and this map lives for the
+    // whole session; when it is full the OLDEST are dropped, because the newest are the
+    // ones a reply in flight could still be waiting on.
+    if (this.auditCount() >= AUDIT_MAP_CAP) {
+      const oldest = [...this.pendingAudits.values()]
+        .flatMap((s) => [...s])
+        .sort((a, b) => a.startedAt - b.startedAt)[0];
+      if (oldest) this.pendingAudits.get(oldest.sender)?.delete(oldest);
+    }
   }
-  set.add(audit);
-}
+
+  /** Every audit currently held, across all senders. */
+  private auditCount(): number {
+    let n = 0;
+    for (const set of this.pendingAudits.values()) n += set.size;
+    return n;
+  }
+
+  /**
+   * Drop everything past its retention window, and any empty sender.
+   *
+   * Called on write, on read, and from a timer. Cheap by construction: it walks a map of
+   * small sets that is capped at AUDIT_MAP_CAP, and almost always finds nothing to do.
+   */
+  private pruneAudits(now: number = Date.now()): void {
+    for (const [sender, set] of this.pendingAudits) {
+      for (const audit of set) {
+        if (audit.expiresAt <= now) set.delete(audit);
+      }
+      if (set.size === 0) this.pendingAudits.delete(sender);
+    }
+  }
 
 /**
  * Speak a verdict whose line never reached a gate, if it is still unclaimed.
@@ -616,6 +723,7 @@ private releaseAuditInBackground(audit: PendingAudit | null, sayQueue: SayQueue 
     .then((verdict) => {
       if (audit.claimed) return;
       if (!this.auditBlocksReply(verdict)) return;
+      audit.repliedAt = Date.now();
       this.speakIfAuditFinds(audit.sender, audit.message, verdict, sayQueue);
     })
     .catch(() => {
@@ -682,6 +790,9 @@ private async awaitSenderAudits(
   let best: ClassifierVerdict | null = null;
   let bestAudit: PendingAudit | null = null;
   for (const audit of set) {
+    // R6: an audit whose answer has ALREADY gone out does not block a line that arrived
+    // afterwards. Only an answer still owed is blocking.
+    if (audit.repliedAt !== null && audit.repliedAt <= arrivedAt) continue;
     const verdict = await this.settleAudit(audit, Math.min(audit.startedAt, arrivedAt));
     if (!verdict || verdict.level === "none") continue;
     // Claimed here rather than at speak time: the claim is what stops a second request
@@ -698,6 +809,8 @@ private async awaitSenderAudits(
     }
   }
   if (bestAudit) {
+    // Stamp it, so the NEXT line is not blocked by an answer that has already been given.
+    if (bestAudit.repliedAt === null) bestAudit.repliedAt = Date.now();
     this.opts.log?.debug?.(
       { sender, audits: set.size, level: best?.level },
       "wellbeing gate dropped a reply for this sender",
@@ -784,10 +897,14 @@ private speakIfAuditFinds(
         : "concern";
 
   // Has this player had a wellbeing reply recently, and was it at a lower level?
-  const previous = this.lastWellbeingLevel.get(sender);
-  const already = this.wellbeingState.recentlyAnswered(sender);
-  const escalated =
-    already && (verdict?.imminent === true || (previous !== undefined && LEVEL_ORDER[level] > LEVEL_ORDER[previous]));
+  const already = this.wellbeingState_.recentlyAnswered(sender);
+  // R2: escalation is decided in ONE place, WellbeingState, and both this path and the
+  // regex path write to it. Before Round 14 the audit path kept its own record of the last
+  // level, so a regex-caught concern followed by an audit-caught crisis produced the SHORT
+  // crisis form - which drops the emergency guidance, the one thing a crisis reply must
+  // carry.
+  const escalation = already && verdict?.imminent === true && this.wellbeingState_.lastLevel(sender) !== "crisis";
+  const escalated = escalation || this.noteWellbeingAnswered(sender, level).escalation;
   // The cooldown shortens. It does not veto.
   const alreadyAnswered = already && !escalated;
 
@@ -801,14 +918,12 @@ private speakIfAuditFinds(
           random: this.random,
         });
 
-  this.wellbeingState.noteAnswered(sender);
-  this.lastWellbeingLevel.set(sender, level);
   logWellbeing(this.opts.log, level, sender);
   this.opts.log?.warn(
     { source: "audit", level, reason: verdict?.reason, escalated, alreadyAnswered },
     "wellbeing found by the second layer only",
   );
-  if (this.wellbeingState.mayRecord(sender)) {
+  if (this.wellbeingState_.mayRecord(sender)) {
     this.opts.memory?.recordWellbeing?.({
       player: sender,
       text: `${sender} seemed like they needed help, and only the second layer caught it`,
@@ -819,7 +934,32 @@ private speakIfAuditFinds(
 }
 
 /**
- * The send gate for a SCRIPTED reply — the C4 honesty answer and the B6 greeting.
+   * R2/R5: the ONE place a wellbeing reply is recorded.
+   *
+   * Every path that speaks a wellbeing reply comes through here — the regex floor, the
+   * audit, the background release, a gated scripted reply — and every one of them reports
+   * to the same `WellbeingState`. Before Round 14 the audit path kept a private map of the
+   * last level answered and the regex path kept nothing, so escalation was detected on one
+   * path and invisible on the other: a regex-caught concern followed by an audit-caught
+   * crisis produced the SHORT form, which drops the emergency guidance.
+   *
+   * This is also what makes R5 fall out for free. `noteAnswered` sets the contact
+   * timestamp and `lastContact` reads it, so B's quiet window learns about every reply
+   * from every path without a second map — in Round 13 the map the initiative poll read
+   * was written by nothing at all.
+   */
+  private noteWellbeingAnswered(
+    player: string,
+    level: Exclude<WellbeingLevel, "none">,
+  ): { escalation: boolean } {
+    // R5 falls out of this being the only writer: `noteAnswered` sets the contact
+    // timestamp, and `lastContact` reads it. In Round 13 nothing called this on the regex
+    // path, so `lastWellbeingAt` in BotSession was read forever and written never.
+    return this.wellbeingState_.noteAnswered(player, level);
+  }
+
+  /**
+   * The send gate for a SCRIPTED reply — the C4 honesty answer and the B6 greeting.
  *
  * Those two send without going through `handle`, so before Round 13 they bypassed the
  * audit completely: "elix do you care if i kill myself" matched the honesty shortcut and
@@ -845,6 +985,48 @@ async gateScriptedReply(
   }
   const said = this.speakIfAuditFinds(sender, message, verdict, sayQueue);
   return said !== null;
+}
+
+/**
+ * R3: the gate for a line ELIX is about to say himself.
+ *
+ * Deliberately NOT `gateScriptedReply`. That method classifies the line it is given, and
+ * for initiative the line given is Elix's own — so Round 14 caught the bot spending
+ * classifier quota re-reading his own unprompted line, and filing an audit against the
+ * PLAYER for words they never said. In a safety module, inventing a crisis attributed to
+ * someone is worse than wasting a call.
+ *
+ * So this only WAITS for what that player is already owed: their unsettled audits. If one
+ * of those blocks, the wellbeing reply has already gone or is going, and the initiative
+ * line is dropped. Nothing is classified, because there is nothing to classify.
+ *
+ * @returns true when the caller must NOT speak its line.
+ */
+async gateOwnLine(sender: string): Promise<boolean> {
+  if (!this.hasUnsettledAudits(sender)) return false;
+  const verdict = await this.awaitSenderAudits(sender, Date.now());
+  if (!this.auditBlocksReply(verdict)) return false;
+  this.opts.log?.info({ sender }, "initiative line dropped: that player has a live safety decision");
+  return true;
+}
+
+/**
+ * R6: are we inside the quiet window after answering this player?
+ *
+ * Used by the send paths to decide between a TEMPLATE and a normal model reply in gentle
+ * mode. The distinction matters and Round 14 measured what went wrong without it: for 60
+ * seconds after a crisis reply, EVERY addressed line was replaced by a template, so
+ * "thanks, i talked to my mom" got "please don't stop talking to someone you trust" and
+ * "can we build a house now" got "still here". Both logged as new interventions, which
+ * makes the intervention count meaningless.
+ *
+ * A retained audit still blocks the lines that arrived BEFORE its reply was sent — that
+ * is Round 13's P3 and it is unchanged. Only lines that arrive AFTER get the normal
+ * treatment, gently.
+ */
+isGentleWindow(sender: string): boolean {
+  const at = this.wellbeingState_.lastContact(sender);
+  return at !== null && Date.now() - at < GENTLE_MODE_MS;
 }
 
 private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
@@ -1019,7 +1201,16 @@ private async phraseWellbeing(
 
     try {
       const result = await this.opts.router.complete({
-        messages: buildChatMessages(sender, message, this.persona, memoryBlock),
+        messages: buildChatMessages(
+          sender,
+          message,
+          this.persona,
+          memoryBlock,
+          // R6: a normal model reply in gentle mode, rather than replacing the line with a
+          // template. The template path is for a line the gate BLOCKED; a line that simply
+          // arrived after the wellbeing reply is answered normally, gently.
+          this.isGentleWindow(sender),
+        ),
         role: "fast",
         // A4: reasoning models need room to think or they return nothing. The
         // router clamps this up to its per-model floor.
