@@ -205,8 +205,30 @@ interface Tester {
   quit: () => void;
 }
 
+/**
+ * C: owners for an e2e run ONLY, from --owners or ELIX_E2E_OWNERS.
+ *
+ * Module scope and computed once, so join() can read it without re-parsing argv. Never
+ * written back to elix.yaml: a command list a test run can grant itself is no list at all.
+ */
+function e2eOwners(): string[] {
+  const flag = process.argv.includes("--owners")
+    ? process.argv[process.argv.indexOf("--owners") + 1]
+    : undefined;
+  return (flag ?? process.env.ELIX_E2E_OWNERS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 async function join(): Promise<Tester> {
-  const config = await loadElixConfig();
+  const loaded = await loadElixConfig();
+  const owners = e2eOwners();
+  if (owners.length > 0) {
+    console.log(`[e2e] owners granted for this run only: ${owners.join(", ")}`);
+  }
+  // A COPY. The file on disk is untouched by the test run.
+  const config = owners.length > 0 ? { ...loaded, owners } : loaded;
   // Same server, same data, same offline rules as Elix — only the username differs.
   const profile = getActiveProfile(config, { username: TESTER });
 
@@ -1061,6 +1083,7 @@ function r7Done(results: Result[]): boolean {
 
 async function main(): Promise<void> {
   const afterRestart = process.argv.includes("--after-restart");
+
   const welcomeBack = process.argv.includes("--welcome-back");
 
   console.log("Elix in-game chat test (Part C)");

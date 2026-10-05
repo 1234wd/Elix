@@ -7,7 +7,68 @@ like a warm, funny, loyal friend.
 The full design — memory, emotions, his own mind, and the honesty rules — is in
 **[docs/VISION.md](docs/VISION.md)**. This file is how to run and build it.
 
-## Status — Phase 5 complete (memory, social, emotions)
+## Commands (follow / come / stop)
+
+Elix answers a short, fixed list of movement commands, in English and in Roman Urdu.
+Nothing about them is model-generated — the parser is a lookup and the controller is
+deterministic, because the moment someone needs Elix to stop is a bad moment to be waiting
+on a network call.
+
+| Command | Also accepted | What it does |
+| --- | --- | --- |
+| follow me | come with me, stick with me, tag along, `mere peeche aao`, `mere peeche`, `peeche aao`, `mere saath aao`, `saath chalo` | Follows you, keeping 2–3 blocks back, on your live entity |
+| come here | come to me, come over here, `idhar aao`, `yahan aao`, `mere paas aao`, `aao yahan` | Walks to where you were when you asked, then stops |
+| stop | stay, wait, `ruk`, `ruko`, `ruk jao`, `same reh jao`, `yahi ruko` | Stops within one tick (~50 ms). Never waits for anything |
+
+The whole list lives in `src/actions/commands.ts` as one flat table, so it can be read and
+audited in one screen. There is no free-text argument: no form can express "go to block
+12 -4 300", which is deliberate.
+
+**Safety rules that are not configurable, because they should not be:**
+
+- `stop` / `stay` / `wait` are synchronous and unconditional. They never wait for a model,
+  the wellbeing classifier, or the send queue, and they are never gated.
+- A line the wellbeing detector matches **never** runs a command. If a child says
+  "follow me, I want to die", Elix answers the distress and does not move.
+- Hazards beat following. If the block under Elix becomes lava, the follow is cancelled on
+  the next tick without a command.
+- Following gives up by itself when you leave, die, or go untracked for 10 seconds.
+- Initiative does not speak while Elix is following or walking somewhere.
+
+### `owners` — and what it is worth
+
+Movement commands are accepted only from names in `owners` in `elix.yaml`. **The list is
+empty by default**, so nobody can move Elix until you add yourself.
+
+```yaml
+owners:
+  - ElixOwner
+```
+
+**Read this before adding a name.** In offline mode the server accepts any username, so a
+name in this list can be typed by *anyone* — no password, no session. `whitelist off` plus
+a guessed name is enough to impersonate an owner, and guessed names are not hard: they are
+the names of everyone else in the tab list.
+
+So this list is only as safe as the server's login and firewall. On a cracked server with
+no authentication there are no real owners and this is a speed bump, not a lock. If being
+followed by a stranger is unacceptable, the answer is an authenticated server (and a
+whitelist) rather than a longer list.
+
+### Trying the e2e commands without editing config
+
+`scripts/e2e-chat.ts --owners` treats the tester's name as an owner **for that run only**,
+so the commands can be exercised against a live server without `owners` ever being
+committed:
+
+```
+pnpm exec tsx scripts/e2e-chat.ts --owners ElixTester
+```
+
+The same can be set without a flag: `ELIX_E2E_OWNERS="ElixTester"`. Neither is read by
+`elix.yaml`, so neither can leak into a real session.
+
+## Status - Phase 5 complete (memory, social, emotions)
 
 - [x] **Phase 1 — Skeleton:** repo, zod-validated config, CLI, logging, `elix doctor`
 - [x] **Phase 2 — Connection:** mineflayer → 26.2 server, reconnect, safe behaviour

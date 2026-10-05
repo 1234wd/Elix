@@ -117,6 +117,10 @@ const CONFIG: ElixConfig = {
     memoryGapMs: 20 * 60_000,
     enabled: true,
   },
+  // C: EMPTY by default, which is the point - nobody can move the bot until the owner
+  // names themselves. Spelled out so a change to the default is a visible diff here.
+  owners: [] as string[],
+
   skillCap: "normal",
   persona: "config/persona.md",
   dataDir: "data",

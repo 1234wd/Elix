@@ -141,6 +141,22 @@ export const elixConfigSchema = z.object({
   /** Phase 6: reflex + skill layer cap. */
   skillCap: skillCapSchema.default("normal"),
   /**
+   * C: who may command Elix to move.
+   *
+   * EMPTY BY DEFAULT, so nobody can move the bot until the owner says so. That default is
+   * the whole point: a companion in a public server that follows a stranger's "follow me"
+   * is not a companion, it is a way for someone else to aim it.
+   *
+   * READ THIS BEFORE ADDING A NAME. In offline mode the server accepts any username, so a
+   * name here can be typed by anyone at all — `whitelist off` plus a guessed name is enough
+   * to impersonate an owner. This list is therefore only as safe as the server's firewall
+   * and its login plugin; a cracked server with no authentication has no real owners. If
+   * that is unacceptable, the answer is an authenticated server, not a longer list.
+   *
+   * Matched case-insensitively against the chat name, which is what mineflayer reports.
+   */
+  owners: z.array(z.string().min(1).max(32)).default([]),
+  /**
    * B: initiative. Everything the self-starting logic measures lives here rather than as
    * constants in the code, because every one of them is a judgement about how intrusive a
    * bot should be in a server full of children — and that is the owner's call, not a

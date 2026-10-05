@@ -23,6 +23,8 @@ import { SayQueue } from "../social/say.js";
 import { WellbeingState, detectWellbeing, type WellbeingLevel } from "../social/wellbeing.js";
 import { DEFAULT_INITIATIVE, type Drive } from "../social/manners.js";
 import { decideInitiative, nextShape } from "./initiative.js";
+import { ACKNOWLEDGEMENTS, NOT_AN_OWNER, parseCommand } from "../actions/commands.js";
+import { COME_RADIUS, FollowController, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
@@ -213,6 +215,9 @@ export const GREET_COOLDOWN_MS = 90_000;
  * Two seconds is fast enough that a greeting does not feel late, and slow enough
  * to be free: this is a keyset read on a map mineflayer already holds.
  */
+/** C: the follow tick. One tick, so a stop takes effect inside 50 ms. */
+export const FOLLOW_TICK_MS = 50;
+
 export const PRESENCE_POLL_MS = 2_000;
 
 export interface ChatBridgeLike {
@@ -514,6 +519,27 @@ export function toVec3(p: Vec3Like): Vec3Like {
   return new Vec3(p.x, p.y, p.z);
 }
 
+/**
+ * C: is Elix standing somewhere he should not be right now?
+ *
+ * The existing hazard checks WIN over following, and this is where that is enforced: the
+ * follow tick asks before it keeps a goal, and a `true` here cancels it with
+ * `endedBecause: "hazard"`.
+ *
+ * Only the block at Elix's own feet is checked, not the whole path. The pathfinder already
+ * refuses to dig and already avoids hazards through the Movements in `makeSafeMovements`;
+ * this is the cheap last check for "the ground turned to lava under him", which is the case
+ * no amount of re-pathing fixes.
+ */
+export function stopForHazard(bot: BotLike): boolean {
+  const pos = bot.entity?.position;
+  if (!pos) return true; // no position is not a safe place to keep walking
+  const feet = bot.blockAt(toVec3(pos));
+  if (feet && HAZARD_BLOCKS.has(blockName(feet))) return true;
+  const floor = bot.blockAt(toVec3({ x: pos.x, y: pos.y - 1, z: pos.z }));
+  return floor !== null && !isSafeFloor(floor);
+}
+
 /** A10: is this block safe to stand on? Needs a full solid box and no hazard. */
 export function isSafeFloor(block: BlockLike | null): boolean {
   if (!block) return false;
@@ -670,6 +696,35 @@ function nearestPlayerName(
  * function with a loop in it and not a cast: a cast over a third-party type is precisely
  * what let Round 13 ship a correct policy against inputs the game never produces.
  */
+/**
+ * C: the pathfinder object, read through a narrow structural check.
+ *
+ * A cast here would be the same mistake R4 was about, so the shape is VERIFIED rather
+ * than assumed: setGoal and stop are what the controller calls, and if either is missing
+ * there is no pathfinder and no goal is ever set.
+ */
+export function pathfinderOf(bot: BotLike): PathfinderLike | null {
+  const raw = (bot as { pathfinder?: unknown }).pathfinder;
+  if (raw === null || typeof raw !== "object") return null;
+  const p = raw as { setGoal?: unknown; stop?: unknown };
+  return typeof p.setGoal === "function" && typeof p.stop === "function"
+    ? (raw as unknown as PathfinderLike)
+    : null;
+}
+
+/**
+ * C: the LIVE entity reference for a player, or null.
+ *
+ * The entity object itself is what GoalFollow holds onto, so it is passed through rather
+ * than re-derived from coordinates — a follow on a snapshot of a position walks to where
+ * the player used to be. Checked for null only: this is mineflayer's own entity, not input.
+ */
+export function liveEntityOf(bot: BotLike, name: string): unknown | null {
+  const raw = bot.players?.[name] as { entity?: unknown } | undefined;
+  const entity = raw?.entity;
+  return entity === null || entity === undefined ? null : entity;
+}
+
 export function mapPlayerPositions(
   players: Record<string, unknown> | undefined,
 ): Record<string, { position?: Vec3Like } | undefined> {
@@ -722,6 +777,10 @@ export class BotSession {
   private readonly lastMemoryCallbackAt = new Map<string, number>();
   /** Unprompted lines spent this hour, against IDLE_BUDGET_PER_HOUR. */
   private idleBudgetUsed = 0;
+  /** C: follow / come / stop. Null until a pathfinder exists. */
+  private follow: FollowController | null = null;
+  /** C: the follow tick, so a stop takes effect inside one tick. */
+  private followTimer: ReturnType<typeof setInterval> | null = null;
   /** C3: the presence diff timer. Cleared with every other timer. */
   private presenceTimer: ReturnType<typeof setInterval> | null = null;
   private bot: BotLike | null = null;
@@ -867,6 +926,20 @@ export class BotSession {
     // those want different cadences. Sharing a timer would mean initiative could only
     // ever be considered at the presence cadence, which is either too eager or too slow
     // depending on a setting that has nothing to do with it.
+    // C: the follow tick. FAST — one tick, not five seconds — because "stop" has to take
+    // effect inside ONE TICK and the give-up checks have to notice a dead or departed
+    // target while it still matters. It reads state and calls the pathfinder; it never
+    // awaits anything, so nothing in it can be delayed by a provider.
+    this.follow = new FollowController(pathfinderOf(bot));
+    this.followTimer = setInterval(() => {
+      if (this.shutdownRequested || this.ended) return;
+      this.follow?.tick(this.followTarget(bot), stopForHazard(bot));
+      // "come" ends itself once it is standing where it was asked to stand.
+      const goal = this.comeTargetReached(bot);
+      if (goal) this.follow?.arrive();
+    }, FOLLOW_TICK_MS);
+    this.followTimer.unref?.();
+
     // The 5 s poll, and only if initiative is switched on.
     //
     // `?? DEFAULT_INITIATIVE` is deliberate rather than defensive noise: zod always fills
@@ -1009,6 +1082,16 @@ export class BotSession {
     if (detectWellbeing(message).level !== "none") {
       log.warn({ username }, "wellbeing detected in handleChat: taking priority over shortcuts");
       this.routeToBridge(username, message, true);
+      return;
+    }
+
+    // C: a command, if the line is one and the speaker is allowed to give it. AFTER the
+    // wellbeing check, so a line that matched the floor can never move the bot, and BEFORE
+    // the honesty and greeting shortcuts, so "are you a bot, follow me" follows rather
+    // than arguing about being a machine.
+    const command = parseCommand(message);
+    if (command) {
+      void this.runCommand(bot, username, message);
       return;
     }
 
@@ -1290,6 +1373,124 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
 }
 
   /**
+   * C: run a parsed command, or answer why not.
+   *
+   * The order here is the safety order and it is not negotiable:
+   *
+   *  1. the wellbeing reply is already gone if the floor matched — handleChat returns
+   *     before this is ever reached, so a crisis line can never move the bot;
+   *  2. authorisation: not an owner, one short refusal, nothing moves;
+   *  3. "stop" runs SYNCHRONOUSLY and is never gated, because a stop that can be delayed
+   *     is not a stop;
+   *  4. everything else goes through the same sender gate as any other reply, and the
+   *     ACTION STILL RUNS if the gate blocks — the acknowledgement is dropped, not the
+   *     behaviour. Silently not following is worse than following without saying so.
+   *
+   * @returns true when the line was handled as a command, so no chat reply follows it.
+   */
+  private async runCommand(
+    bot: BotLike,
+    username: string,
+    message: string,
+  ): Promise<boolean> {
+    const { log } = this.deps;
+    const command = parseCommand(message);
+    if (!command) return false;
+
+    const owners = this.deps.config.owners ?? [];
+    const isOwner = owners.some((o) => o.toLowerCase() === username.toLowerCase());
+    if (!isOwner) {
+      // One short refusal, and no reason given: explaining the rule tells a stranger
+      // exactly which rule to look for.
+      this.say?.say(NOT_AN_OWNER);
+      log.info({ username }, "command refused: not an owner");
+      return true;
+    }
+
+    // stop / stay / wait: synchronous, unconditional, never gated.
+    if (command.action === "stop") {
+      this.follow?.stop();
+      log.info({ username, matched: command.matched }, "command: stop");
+      this.say?.say(ACKNOWLEDGEMENTS.stop);
+      return true;
+    }
+
+    const started =
+      command.action === "follow"
+        ? this.startFollow(bot, username)
+        : this.startCome(bot);
+
+    const ack = ACKNOWLEDGEMENTS[command.action];
+    const bridge = this.deps.chatBridge;
+    // The SAME sender gate as any reply. If it blocks, the action has already happened and
+    // only the acknowledgement is dropped.
+    if (bridge?.gateScriptedReply) {
+      try {
+        const suppressed = await bridge.gateScriptedReply(username, ack, this.say ?? undefined);
+        if (suppressed) {
+          log.info({ username, action: command.action }, "command: ack suppressed by the gate");
+          return true;
+        }
+      } catch {
+        // A failed gate must not swallow a command.
+      }
+    }
+    if (!started.ok) {
+      log.info({ username, action: command.action, reason: started.reason }, "command: not started");
+    }
+    this.say?.say(ack);
+    return true;
+  }
+
+  /** C: GoalFollow on the target's LIVE entity, read through playerPosition(). */
+  private startFollow(bot: BotLike, target: string): { ok: boolean; reason?: string } {
+    if (!this.follow) return { ok: false, reason: "no-pathfinder" };
+    const entity = liveEntityOf(bot, target);
+    if (!entity) return { ok: false, reason: "target-not-tracked" };
+    return this.follow.follow(entity, target);
+  }
+
+  /** C: GoalNear at the position AT THE MOMENT of the command, then stop. */
+  private startCome(bot: BotLike): { ok: boolean; reason?: string } {
+    const me = bot.entity?.position;
+    if (!me) return { ok: false, reason: "no-position" };
+    const target = nearestPlayerName(mapPlayerPositions(bot.players), this.deps.profile.username, me);
+    if (target === null) return { ok: false, reason: "nobody-nearby" };
+    const pos = playerPosition(bot.players?.[target]);
+    if (!pos) return { ok: false, reason: "target-not-tracked" };
+    return this.follow?.come(pos) ?? { ok: false, reason: "no-pathfinder" };
+  }
+
+  /** The follow tick's view of the target, built from live data. */
+  private followTarget(bot: BotLike): FollowTarget | null {
+    const mode = this.follow?.current;
+    if (!mode || mode.mode !== "follow" || !mode.target) return null;
+    const raw = bot.players?.[mode.target] as
+      | { entity?: unknown; health?: number }
+      | undefined;
+    if (raw === undefined) return null;
+    return {
+      name: mode.target,
+      // Read through the guard, never cast: mineflayer has no player.position.
+      position: playerPosition(raw),
+      alive: (raw.health ?? 20) > 0,
+    };
+  }
+
+  /** Has "come" arrived? Within COME_RADIUS of where it was asked to go. */
+  private comeTargetReached(bot: BotLike): boolean {
+    const state = this.follow?.current;
+    if (!state || state.mode !== "come" || !state.comeTarget) return false;
+    const me = bot.entity?.position;
+    if (!me) return false;
+    return Math.hypot(
+      me.x - state.comeTarget.x,
+      me.y - state.comeTarget.y,
+      me.z - state.comeTarget.z,
+    ) <= COME_RADIUS;
+  }
+
+  /**
    * B: the five-second poll. A thin adapter over decideInitiative().
    *
    * Every condition and every word lives in src/connection/initiative.ts, because the
@@ -1306,6 +1507,7 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     const { log } = this.deps;
     const bridge = this.deps.chatBridge;
     const busy = (bridge?.inFlightCount ?? 0) > 0 || this.say?.hasPending === true;
+    // Wandering is paused while a command is running, and resumes after stop().
     // Who is closest, read the way mineflayer actually stores it. Computed once because the
     // audit check below is about THAT player, not about the room.
     const thresholds = this.deps.config.initiative ?? DEFAULT_INITIATIVE;
@@ -1327,7 +1529,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
       selfName: this.deps.profile.username,
       selfPosition: bot.entity?.position,
       now: Date.now(),
-      busy,
+      // C: following or walking somewhere is a task. "He doesn't wait to be told" also
+      // has to mean "he doesn't talk while he is doing something you asked for".
+      busy: busy || (this.follow?.busy ?? false),
       // R1: the TARGET'S unsettled audits, not everyone's. `hasPendingAudits()` was
       // correct once but was read as "any audit anywhere, ever retained", so one ambient
       // line from a passer-by muted Elix for the rest of the session.
