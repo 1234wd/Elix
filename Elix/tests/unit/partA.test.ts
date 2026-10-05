@@ -123,7 +123,6 @@ describe("A1 — the brain's store stays open for the whole session", () => {
   it("still answers after runBot() has resolved (the reported failure)", async () => {
     const h = harness();
     const bridge = new ChatBridge({
-    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,
@@ -373,7 +372,6 @@ describe("A3 — answering someone who spoke to Elix never spends the idle budge
       ],
     });
     const bridge = new ChatBridge({
-    typingRandom: () => 0.99,
       router: h.router,
       username: "Elix",
       log: noLog as never,

@@ -144,6 +144,45 @@ const SAFEGUARDING_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bpurge after (?:i |every|each)\b/, "purging"],
   [/\bpurging after (?:i |eating|every)\b/, "purging"],
   [/\bmake myself (?:sick|throw up) after\b/, "purging"],
+
+  // ---- A2: online exploitation, the one safeguarding kind with no injury --------
+  //
+  // A child being groomed online is being harmed, and there may be nothing to see:
+  // no bruise, no missed meal, and every adult in the story begins by believing the
+  // older player. So the reply has to believe them first, and the floor has to catch
+  // it without waiting for a model.
+  //
+  // Each rule needs an older-player or secrecy cue as well as its own words, because
+  // asking for pictures is ordinary chat between peers.
+  [/\b(?:older|old) (?:guy|man|gal|woman|girl|player|one|person)\b[^.]{0,40}?\b(?:pic|pics|picture|pictures|photo|photos|nude|nudes|selfie|cam|skins?)\b/, "exploitation-pics"],
+  [/\b(?:want|wanna|send|sending|show|showing|take|taking|gimme|lemme see)\s+(?:me\s+)?(?:some\s+|your\s+|a\s+)?(?:nudes?|pics?|pictures|photos?|selfie|selfies|boobs?)\b(?!.*\b(?:build|farm|base|house|screenshot|render|server|map|plan)\b)/, "exploitation-pics"],
+  [/\bwithout (?:your|my|any|all|his|her|their) clothes\b/, "exploitation-pics"],
+  [/\b(?:send|show|take) (?:me )?(?:a )?(?:nude|nudes|pic of your|pics of your)\b(?!\s+(?:build|farm|base|house|render|screenshot|map|plan|server)\b)/, "exploitation-pics"],
+
+  // Secrecy from an older player. Not telling anyone is the load-bearing part, and it
+  // is usually phrased as an instruction ABOUT the child rather than by them — "he
+  // told me not to tell anyone" is the same request as "don't tell anyone".
+  [/\bkeep (?:this |it |this a )?(?:a )?secret\b/, "exploitation-secret"],
+  [/\b(?:promise|swear) (?:you )?(?:won't|will not|not to) (?:tell|say)\b/, "exploitation-secret"],
+  [/\b(?:told|tells|telling|asked|asks) me (?:not to |n't |never to )?(?:tell|say|show)\b/, "exploitation-secret"],
+  [/\bnot to tell (?:anyone|nobody|your (?:mum|mom|moms|mother|dad|father|parents|guardian|teacher)|an adult)\b/, "exploitation-secret"],
+  [/\bdon't tell (?:anyone|nobody|your (?:mum|mom|moms|mother|dad|father|parents|guardian|teacher)|an adult)\b/, "exploitation-secret"],
+  [/\b(?:never|do not) tell (?:anyone|nobody|your (?:mum|mom|mother|dad|father|parents|guardian|teacher))\b/, "exploitation-secret"],
+
+  // Meeting in real life, or an offer of gifts in exchange for pictures. A pronoun
+  // between the verb and "in real life" is normal ("wants to meet ME in real life"),
+  // so it is allowed rather than enumerated.
+  [/\b(?:meet|meeting|hang ?out|hangout)\s+(?:up\s+)?(?:\w+\s+)?(?:in real life|irl|offline|for real)\b/, "exploitation-meet"],
+  [/\b(?:in real life|irl)\b[^.]{0,30}?\b(?:meet|come over|visit)\b/, "exploitation-meet"],
+  [/\bwhere do you live\b|\bwhich school do you (?:go to|attend)\b/, "exploitation-meet"],
+  [/\b(?:send|give|trade|gift) (?:me )?(?:robutx|robux|gifts?|skins?|a skin|minecraft (?:skins?|accounts?))\b[^.]{0,30}?\b(?:pic|pics|picture|pictures|photo|selfie|nudes?)\b/, "exploitation-grooming"],
+  [/\b(?:skins?|robutx|robux|gifts?|money)\b[^.]{0,25}?\b(?:for|if|in exchange for) (?:some )?(?:pics?|pictures|photos?|nudes?)\b/, "exploitation-grooming"],
+  [/\b(?:im|i am|i'm) (?:like )?(?:1[6-9]|[2-9]\d)\b[^.]{0,30}?\b(?:pic|pics|picture|pictures|photo|selfie|nudes?)\b/, "exploitation-grooming"],
+
+  // A parent keeping a child in and out of food. Safeguarding rather than crisis: the
+  // harm is being done to them, and the advice is about getting an adult involved.
+  [/\b(?:locked|locked me|they locked) (?:me )?(?:in|up) (?:my |the |a |their )?(?:room|house|home|upstairs)\b/, "locked-in"],
+  [/\bno food (?:in|at) (?:the house|home|my house)\b|\b(?:mum|mom|dad|parent)s? (?:doesn't|dont|does not) (?:feed|give) me\b/, "locked-in"],
 ];
 
 /**
@@ -172,8 +211,18 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bhang(?:ing)? myself\b/, "self-harm"],
   [/\boverdos(?:e|ing)\b/, "self-harm"],
   [/\bbetter off (?:without me|dead|if i (?:was|were) gone)\b/, "better-off-gone"],
-  [/\b(?:nobody|no one|none of them) would (?:ever )?(?:care|notice|miss|remember|even notice)\b/, "nobody-would-notice"],
-  [/\b(?:nobody|no one) (?:would )?(?:even )?(?:care|notice|miss) (?:if|whether)\b/, "nobody-would-notice"],
+  // "nobody would even notice" and "no one would remember me" are real crisis
+  // signals, so the UNCONDITIONAL form stays. What has to go is the sibling rule
+  // that matched any conditional clause at all, because that turned "nobody would
+  // notice if i built here" into a crisis reply.
+  //
+  // Three outcomes, and all three are needed:
+  //   no clause at all                        -> crisis  (nobody would even notice)
+  //   a clause that IS an absence            -> crisis  (if i was gone)
+  //   a clause that is about something else   -> nothing (if i built here)
+  // The lookahead is what keeps the first from swallowing the third.
+  [/\b(?:nobody|no one|none of them) would (?:ever |even )?(?:care|notice|miss|remember|even notice)(?! if\b)(?! when\b)(?! while\b)\b/, "nobody-would-notice"],
+  [/\b(?:nobody|no one|none of them) would (?:ever )?(?:care|notice|miss|remember|even notice) if i (?:was |were )?(?:gone|dead|disappeared|not here|wasn't here|weren't here|died|left)\b/, "nobody-would-notice"],
   [/\beveryone would be better off without me\b/, "better-off-gone"],
   [/\bi(?:'m| am) better off dead\b/, "better-off-dead"],
   [/\bdon'?t want to (?:be here|exist|be alive|live)\b/, "dont-want-to-live"],
@@ -249,6 +298,19 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\b(?:have been|i'?ve been|i have been) (?:cutting|burning|hitting|starving) (?:myself|my ?self|for a while|for years|since)\b/, "self-harm-past"],
   [/\bbeen cutting\b/, "self-harm-past"],
   [/\bused to cut myself\b/, "self-harm-past"],
+
+  // ---- A2: distress that never says a distress word ------------------------------
+  //
+  // Six of ten unseen phrasings contained no word from the classifier's list at all,
+  // which is the argument for classifying every line rather than trusting a gate to
+  // decide what is worth reading. These are in the floor as well, because the floor
+  // is what still works with no API key.
+  [/\btired of being alive\b|\bso tired of (?:being alive|living|existing|everything)\b/, "weary-alive"],
+  [/\bdon't deserve to live\b|\bdeserve to die\b|\bdon't deserve (?:to be alive|this life)\b/, "deserve"],
+  [/\b(?:wrote|writing|typed) (?:a |my |the )?(?:goodbye|farewell|last|final) (?:letter|note|message|words)\b/, "goodbye-letter"],
+  [/\b(?:goodbye|farewell) (?:letter|note)\b/, "goodbye-letter"],
+  [/\bi (?:should|will|want to) just go\b|\bshould just (?:go|leave|disappear|not be here)\b/, "should-just-go"],
+  [/\b(?:nobody|no one) (?:would )?care if i (?:was |were )?(?:gone|dead|disappeared|not here|wasn't here)\b/, "nobody-would-notice"],
   [/(?:hope|hope to|pray|pray to|want) (?:to )?i (?:don'?t|do not|never|won'?t|wouldn'?t) wake up\b/, "not-worth-living"],
   [/\bwake up (?:tomorrow|without me|and not be here)\b/, "not-worth-living"],
 
@@ -300,7 +362,7 @@ const CRISIS_PATTERNS: ReadonlyArray<[RegExp, string]> = [
  * life" is treated as real. Under-treating this is how a kid gets no help.
  */
 const CONCERN_PATTERNS: ReadonlyArray<[RegExp, string]> = [
-  [/\b(?:nobody|no ?one|no-?body) cares about me\b/, "nobody-cares-about-me"],
+  [/\b(?:nobody|no ?one|no-?body) (?:would |will |wants to |wanna )?cares? about me\b/, "nobody-cares-about-me"],
   [/\b(?:nobody|no ?one) cares\b/, "nobody-cares"],
   [/\bno ?one (?:ever )?(?:cares|loves|wants)(?: about)? me\b/, "nobody-cares"],
   [/\b(?:nobody|no ?one) (?:would )?(?:even )?(?:remember|notice|see) me\b/, "nobody-sees-me"],
@@ -536,6 +598,49 @@ export const SAFEGUARDING_LINES: readonly string[] = [
  * is still answered properly.
  */
 export const CRISIS_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * What Elix says when someone is grooming a child online.
+ *
+ * A dedicated reply rather than a safeguarding template, because the advice for this
+ * kind is specific, and being wrong in the safe direction is still wrong: a
+ * safeguarding template tells a child to consider blocking someone and to tell an
+ * adult if they can, and leaves the two most important things unsaid.
+ *
+ * The four things this MUST do, each one a decision rather than a courtesy:
+ *
+ *  1. BELIEVE THEM, immediately and without conditions. The adults in this story
+ *     begin by trusting the older player, so "are you sure" is the sentence that
+ *     costs the most time. It is not in here.
+ *  2. SAY DO NOT SEND ANYTHING. Whatever was asked for — pictures, a video, a
+ *     selfie — not sending it is the one instruction that still protects them.
+ *  3. NOT THEIR FAULT. Grooming works on children precisely because they come to
+ *     believe they caused it.
+ *  4. BLOCK AND TELL SOMEONE NOW. Not "when you feel ready".
+ *
+ * And one thing it must NOT do: ask for any detail. Never ask what was sent, who it
+ * was, or whether it happened at all. A question invites a disclosure a child is not
+ * ready to make, and the answer is not needed in order to give the advice.
+ *
+ * A constant rather than an LLM output, for the same reason as IMMINENT_REPLY: this
+ * is a safety instruction with required content, and a model that drops a clause is
+ * worse than a robot.
+ */
+export const EXPLOITATION_REPLY =
+  "i believe you, and this is not your fault. please do not send them anything, " +
+  "not pictures and not a video. please block them now, and please tell a trusted " +
+  "adult today - a parent, a teacher, someone at school. you do not have to explain " +
+  "anything to make that happen.";
+
+/**
+ * Does this signal mean online exploitation rather than some other safeguarding kind?
+ *
+ * Rule-prefix matching rather than a level match, because exploitation and abuse are
+ * both `safeguarding` and they get different advice.
+ */
+export function isExploitation(rule: string): boolean {
+  return rule.startsWith("exploitation-");
+}
 
 export interface WellbeingReplyOptions {
   level: Exclude<WellbeingLevel, "none">;

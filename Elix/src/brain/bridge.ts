@@ -27,11 +27,20 @@ import {
   type ClassifierVerdict,
 } from "../social/wellbeingClassifier.js";
 import {
+  ClassifierBudget,
+  VerdictCache,
+  auditKey,
+  auditShouldSpeak,
+  shouldAudit,
+} from "../social/wellbeingAudit.js";
+import {
+  EXPLOITATION_REPLY,
   WELLBEING_SYSTEM_PROMPT,
   WellbeingState,
   buildWellbeingReply,
   checkWellbeingReply,
   detectWellbeing,
+  isExploitation,
   logWellbeing,
   wellbeingEpisodeText,
 } from "../social/wellbeing.js";
@@ -166,6 +175,16 @@ export class ChatBridge {
   private readonly blockedRecent: string[] = [];
   /** C5: per-player crisis cooldown, and the once-per-session memory note. */
   private readonly wellbeingState = new WellbeingState();
+
+  /**
+   * A2: the audit's rate limit and its memo.
+   *
+   * Both are per-bridge, so a restart clears them — which is correct, because the
+   * budget is about not spending money in one minute and the cache is about not
+   * paying twice for the same sentence in one session.
+   */
+  private readonly auditBudget = new ClassifierBudget();
+  private readonly auditCache = new VerdictCache();
   /** C5: seedable, so the template pool is reproducible in a test. */
   private readonly random: () => number;
   /** C3: one typo per ~15 replies. Session state, never persisted. */
@@ -358,6 +377,19 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
 
   logWellbeing(this.opts.log, level, sender);
 
+  // Online exploitation gets its own words, and never the model's: believe them
+  // first, then do-not-send, then not-your-fault, then block-and-tell-someone-now.
+  if (regexSignal.level === "safeguarding" && isExploitation(regexSignal.rule)) {
+    if (this.wellbeingState.mayRecord(sender)) {
+      this.opts.memory?.recordWellbeing?.({
+        player: sender,
+        text: `${sender} had an older person online asking them for pictures and to keep it secret`,
+      });
+    }
+    this.wellbeingState.noteAnswered(sender);
+    return EXPLOITATION_REPLY;
+  }
+
   if (urgent) {
     if (this.wellbeingState.mayRecord(sender)) {
       this.opts.memory?.recordWellbeing?.({
@@ -410,6 +442,108 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
  * Never throws. A failure means "use the regex", which is the whole reason the
  * regex stays.
  */
+/**
+ * The second detection layer, running alongside the normal reply.
+ *
+ * Three properties make calling a model on every line affordable, and all three are
+ * tested rather than assumed:
+ *
+ *  - CACHED by normalised text, because a public server repeats itself, and a kid
+ *    typing the same sentence twice is one event rather than two.
+ *  - CAPPED at 30 calls a minute, with vocabulary-gated lines jumping the queue when
+ *    the cap is reached. A plain counter would let a busy minute drop exactly the
+ *    line that mattered.
+ *  - NOT AWAITED. `handle()` returns without waiting, so ordinary chat is no slower
+ *    because of it.
+ *
+ * When it finds something the regex floor missed, it speaks. It never adds a second
+ * reply about a line the floor already handled.
+ */
+private auditInBackground(sender: string, message: string, sayQueue?: SayQueue): void {
+  // Two words cannot be judged and is not worth a call: it is almost always a
+  // greeting or a command.
+  if (!shouldAudit(message)) return;
+  const key = auditKey(message);
+  if (key.length < 8) return;
+
+  // Already judged once. A repeated line is answered from the cache, with no call.
+  const cached = this.auditCache.get(key);
+  if (cached) {
+    this.speakIfAuditFinds(sender, message, cached, sayQueue);
+    return;
+  }
+
+  // The floor handles this line synchronously if it matches, and a second opinion has
+  // nothing to add when the floor already spoke.
+  if (detectWellbeing(message).level !== "none") return;
+
+  const gated = needsSecondLook(message);
+  if (!this.auditBudget.tryAcquire(gated)) {
+    this.opts.log?.debug(
+      "wellbeing audit: over the per-minute cap and not gated, skipped",
+    );
+    return;
+  }
+
+  void (async () => {
+    const verdict = await this.classifyWellbeing(message);
+    if (verdict) this.auditCache.set(key, verdict);
+    this.speakIfAuditFinds(sender, message, verdict, sayQueue);
+  })().catch(() => {
+    // Never unhandled. A failure here means the regex floor stands, which is the
+    // whole reason the floor exists.
+  });
+}
+
+/**
+ * Speak only if this verdict is a genuine NEW detection.
+ *
+ * Every early return below is a case where speaking would be wrong rather than merely
+ * noisy, so each one is commented with what it prevents.
+ */
+private speakIfAuditFinds(
+  sender: string,
+  message: string,
+  verdict: ClassifierVerdict | null,
+  sayQueue: SayQueue | undefined,
+): void {
+  if (!sayQueue) return;
+  if (this.opts.signal?.aborted) return;
+  // A line the floor already spoke about does not get a second wellbeing reply.
+  if (!auditShouldSpeak(verdict, detectWellbeing(message).level)) return;
+  if (this.wellbeingState.recentlyAnswered(sender)) return;
+
+  const level: Exclude<WellbeingLevel, "none"> =
+    verdict?.imminent === true
+      ? "crisis"
+      : verdict?.level && verdict.level !== "none"
+        ? verdict.level
+        : "concern";
+  const text =
+    verdict?.imminent === true
+      ? IMMINENT_REPLY
+      : buildWellbeingReply({
+          level,
+          helplineText: this.opts.helplineText ?? "",
+          alreadyAnswered: false,
+          random: this.random,
+        });
+
+  this.wellbeingState.noteAnswered(sender);
+  logWellbeing(this.opts.log, level, sender);
+  this.opts.log?.warn(
+    { source: "audit", level, reason: verdict?.reason },
+    "wellbeing found by the second layer only",
+  );
+  if (this.wellbeingState.mayRecord(sender)) {
+    this.opts.memory?.recordWellbeing?.({
+      player: sender,
+      text: `${sender} seemed like they needed help, and only the second layer caught it`,
+    });
+  }
+  sayQueue.say(text, true, true);
+}
+
 private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), this.opts.classifierTimeoutMs ?? 2000);
@@ -502,6 +636,15 @@ private async phraseWellbeing(
     if (this.opts.signal?.aborted) {
       return { replied: false, reason: "shutting-down" };
     }
+
+    // A2: the BACKGROUND AUDIT. Started here and deliberately not awaited.
+    //
+    // The vocabulary gate was the hole: six of ten unseen phrasings contained none
+    // of its words, so the classifier never saw them at all. The gate is now only a
+    // priority hint, and every line of three or more words gets classified. Not
+    // awaiting it is what makes that affordable — ordinary chat gains no latency,
+    // because the normal reply does not wait for this.
+    this.auditInBackground(sender, message, sayQueue);
     if (this.opts.maxReplies !== undefined && this.replies >= this.opts.maxReplies) {
       return { replied: false, reason: "max-replies" };
     }

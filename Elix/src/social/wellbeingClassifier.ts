@@ -81,16 +81,43 @@ export function needsSecondLook(text: string): boolean {
  */
 const IMMINENT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // Already taken, or believes they have.
-  [/\b(?:took|have taken|i took|just took|taking)\s+(?:a bunch of |a whole bunch of |a load of |my |the )?pills?\b/, "pills-taken"],
+  //
+  // ...and the same lesson again about the words in between: "all my moms pills",
+  // "her tablets" and "my mums medicine" all put two or three words between the verb
+  // and the pill. An enumeration of possessives kept missing them, so the filler is
+  // allowed to be anything, briefly.
+  //
+  // The verb list is the other half. Round 11 measured "i swallowed all of my moms
+  // pills" reaching the classifier as merely GATED — the line was worth a second look
+  // and the imminent flag stayed off, which is the wrong way round. The rule knew
+  // "took" and nothing else.
+  // "too many" is checked BEFORE the general rule, so the more specific label still
+  // wins. Ordering is load-bearing here: these two overlap completely.
   [/\b(?:took|have taken|i took)\s+(?:too many|a lot of|a whole load of)\s+pills\b/, "pills-overdose"],
+  [
+    /\b(?:took|swallow(?:ed|ing)?|ate|eaten|downed|popped|gotten|had)\s+(?:\w+\s+){0,3}?(?:pills?|tablets?|medicine|meds?)\b/,
+    "pills-taken",
+  ],
   [/\bi (?:think i )?(?:overdosed|took too many)\b/, "overdose"],
   [/\boverdos(?:e|ed|ing)\b/, "overdose"],
+
+  // A goodbye letter, written or left. One of the most reliable written signals
+  // there is. "writing" counts as well as "wrote": someone part-way through one
+  // has still written it.
+  [/\b(?:wrote|writing|write|typed|left|sending)\s+(?:a |my |the )?(?:goodbye|farewell|final|last)\s+(?:letter|note|message|mail|words)\b/, "goodbye-letter"],
+  [/\b(?:goodbye|farewell|final)\s+(?:letter|note|message)\b/, "goodbye-letter"],
+  [/\b(?:wrote|writing|typed)\s+(?:everyone|you all|them)\s+(?:a )?(?:goodbye|last words|final message)\b/, "goodbye-letter"],
+
   // In progress, right now.
   [/\b(?:doing it|going to do it|about to do it) (?:now|tonight|today)\b/, "doing-it-now"],
   [/\b(?:i'?m|i am) doing it\b/, "doing-it-now"],
   [/\bright now\b.*\b(?:pills|overdose|hurt myself|cut myself)\b/, "method-and-time"],
   // A method plus a time.
-  [/\b(?:pills|overdose|hurt myself|cut myself|hang myself)\b.*\b(?:now|tonight|today|when i get home)\b/, "method-and-time"],
+  [/\b(?:pills|overdose|hurt myself|cut myself|hang myself|razor|blade)\b.*\b(?:now|tonight|today|when i get home)\b/, "method-and-time"],
+
+  // The general form: a method and a time in the same breath. Last in the list, so
+  // every more specific rule above wins first — ordering is load-bearing here.
+  [/\b(?:kill|killing|hurt|harm|cut|hanging|end|ending|stop)\s+(?:myself|it|this)\b.*\b(?:now|tonight|today|after school|when i get home)\b/, "method-and-time"],
 ];
 
 /**
@@ -157,7 +184,30 @@ GAME CHAT IS NOT DISTRESS. All of these are "none":
 
 Being specific and literal. "i want to die" is crisis. "i want to die in hardcore lol" is none.
 A statement about a game death is not about a real death. A statement about real
-harm to a person is.`;
+harm to a person is.
+
+DISTRESS THAT NEVER SAYS A DISTRESS WORD. Judge the meaning, not the spelling. These
+are real and must not be "none" just because no word from the list appears:
+- "tired of being alive", "dont deserve to live", "nobody would care if i was gone"
+- "wrote a goodbye letter", "wrote everyone a last message"
+- "everyone hates me, i should just go", "i should just not be here"
+- a parent locking a child in a room, or not giving them food
+- "im so tired of everything", "theres no point in me"
+
+ONLINE EXPLOITATION is safeguarding, always, whatever the tone. An adult or an older
+player who:
+- asks for pictures, photos or "pics", or asks to see someone without clothes
+- asks the child to keep it a secret, not tell their parents, or says "promise"
+- wants to meet in real life or IRL, or asks where the child lives or which school
+- offers Robux, gifts, skins or a skin in exchange for pictures
+- says they are older, or pressures for nudes in any wording at all
+It does not matter that the older player seems kind, seems joking, or is a friend of
+the family. Being believed about this is the whole point.
+
+NOT DISTRESS, even though these words look like the ones above:
+- "nobody would notice if i built here" — a building site, not an absence
+- "im done with this build / game / server", "that grind is brutal"
+- "this creeper killed me", "im starving, got any food?"`;
 
 export interface ClassifierDeps {
   /** Runs the `guard` role. Injected so tests never touch the network. */
