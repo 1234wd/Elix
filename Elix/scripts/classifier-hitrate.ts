@@ -84,6 +84,10 @@ async function ask(provider: GroqProvider, phrase: string): Promise<Ask> {
         ],
         maxTokens: 120,
         temperature: 0,
+        // The same role the bridge uses, so this measures the real path and so the
+        // call is attributed to guard in elix usage like any other.
+        role: "guard",
+        source: "wellbeing-hitrate",
       }, MODEL);
       return { text: res.text ?? "", ms: Date.now() - started };
     } catch (err) {
