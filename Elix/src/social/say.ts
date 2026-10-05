@@ -352,6 +352,17 @@ export class SayQueue {
   }
 
   /** Test helper: number of messages still waiting. */
+  /**
+   * Is anything still waiting to be typed out?
+   *
+   * B's poll reads this. Talking over a half-sent reply is the most obvious way for an
+   * autonomous bot to sound like two people at once, and it is invisible in a transcript
+   * unless you are looking for it.
+   */
+  get hasPending(): boolean {
+    return this.pending > 0;
+  }
+
   get pending(): number {
     return this.queue.length;
   }

@@ -47,6 +47,7 @@ import {
   shouldInitiate,
   shouldSpeak,
   wellbeingHint,
+  DEFAULT_INITIATIVE,
 } from "../../src/social/manners.js";
 import { PROJECT_ROOT } from "../../src/core/config.js";
 import { ChatBridge, extractRemembered, pickGreetingMemory } from "../../src/brain/bridge.js";
@@ -341,7 +342,21 @@ describe("C3 — manners: when he speaks and when he does not", () => {
 });
 
 describe("C3 — initiative: he does not wait to be told", () => {
-  const base = { budgetRemaining: 30, now: 10 * 60_000, lastInitiativeAt: 0 };
+  // Round 13 added three conditions (idle, nearby, no recent wellbeing contact) and a
+  // fourth (no audit in flight). The Round 8 assertions are still correct about budget,
+  // gap and pull, so the base gains the new fields as satisfied conditions rather than
+  // the assertions being loosened.
+  const base = {
+    ...DEFAULT_INITIATIVE,
+    budgetRemaining: 30,
+    now: 10 * 60_000,
+    lastInitiativeAt: 0,
+    busy: false,
+    nearestPlayerBlocks: 4,
+    nearestPlayer: "Steve",
+    lastWellbeingReplyAt: null,
+    pendingAuditNearby: false,
+  };
 
   it("can start something when a drive pulls and there is budget", () => {
     expect(shouldInitiate({ ...base, drive: "curiosity", pull: 0.8 })).toBe(true);

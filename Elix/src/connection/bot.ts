@@ -20,6 +20,9 @@ import {
   type EmotionEvent,
 } from "../social/emotion.js";
 import { SayQueue } from "../social/say.js";
+import { detectWellbeing } from "../social/wellbeing.js";
+import { DEFAULT_INITIATIVE, type Drive } from "../social/manners.js";
+import { decideInitiative, nextShape } from "./initiative.js";
 import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
@@ -125,6 +128,17 @@ export interface SessionDeps {
   /** Prints the human-readable "here's what to do" line on a permanent kick. */
   onPermanentDisconnect?: (info: { kind: DisconnectKind; text: string; username: string }) => void;
   /** Forces process exit on a permanent disconnect (tests disable this). */
+  /**
+   * B: initiative needs a memory it can reach, and the store is the only honest source
+   * for a callback. Optional, so a session without one simply stops offering that shape.
+   *
+   * The importance threshold and the per-player gap are enforced by the caller, not here,
+   * so a store can never make Elix chattier than the config allows.
+   */
+  memory?: {
+    /** The most recent memory at or above `importance`, or null. */
+    recallImportant?(player: string, importance: number): string | null;
+  };
   exitOnPermanent?: boolean;
   /** Test seam: called every time a new bot instance is created. */
   onBotCreated?: (bot: BotLike) => void;
@@ -174,6 +188,28 @@ export interface ChatBridgeLike {
   ): Promise<{ replied: boolean; reason: string; text?: string; usedProvider?: string }>;
   /** A6: record one of Elix's own scripted lines as an episode. */
   recordScripted?(text: string, player: string | null): void;
+  /**
+   * H1: ask the audit whether a SCRIPTED reply may go out.
+   *
+   * The honesty answer and the greeting never reach `handle`, so before Round 13 they
+   * bypassed the classifier entirely and a child in crisis got a speech about simulated
+   * feelings. This is the same send gate, exposed for the paths that do not go through
+   * the model.
+   *
+   * Resolves TRUE when the reply must be suppressed — the wellbeing reply has already
+   * been sent in that case — and FALSE when it may proceed.
+   */
+  gateScriptedReply?(sender: string, message: string, sayQueue?: SayQueue): Promise<boolean>;
+  /** How many replies are in flight. Initiative refuses to speak over one. */
+  inFlightCount?: number;
+  /**
+   * Is any audit still in flight?
+   *
+   * Load-bearing for B: an unprompted line must never overtake a safety decision that is
+   * still being made. That is the Round 13 ordering bug one layer down, and the whole
+   * reason initiative goes through the gate instead of straight to SayQueue.
+   */
+  hasPendingAudits?(): boolean;
   /**
    * C3: say hello to someone who came back, unprompted, mentioning something
    * real. Returns null when there is nothing worth saying.
@@ -557,6 +593,19 @@ export class BotSession {
   private readonly greetedAt = new Map<string, number>();
   /** C3: who is in the world right now, so a return can be detected. */
   private presentPlayers = new Set<string>();
+
+  /** B: the five-second initiative poll. Separate from the presence poll on purpose. */
+  private initiativeTimer: ReturnType<typeof setInterval> | null = null;
+  /** When Elix last said something nobody asked for. Enforces minGapMs. */
+  private lastInitiativeAt = 0;
+  /** Round-robin position across the four initiative shapes. */
+  private initiativeTurn = 0;
+  /** Last wellbeing reply or check-in per player, for wellbeingQuietMs. */
+  private readonly lastWellbeingAt = new Map<string, number>();
+  /** Last unprompted memory callback per player, for memoryGapMs. */
+  private readonly lastMemoryCallbackAt = new Map<string, number>();
+  /** Unprompted lines spent this hour, against IDLE_BUDGET_PER_HOUR. */
+  private idleBudgetUsed = 0;
   /** C3: the presence diff timer. Cleared with every other timer. */
   private presenceTimer: ReturnType<typeof setInterval> | null = null;
   private bot: BotLike | null = null;
@@ -692,6 +741,30 @@ export class BotSession {
       this.presentPlayers = seen;
     }, PRESENCE_POLL_MS);
     this.presenceTimer.unref?.();
+
+    // B: THE INITIATIVE CALLER. `shouldInitiate()` had no caller for three rounds, which
+    // is why nothing ever found that it was missing its idle, proximity and
+    // wellbeing-cooldown conditions.
+    //
+    // Its OWN 5 s timer, deliberately not the presence poll above and not the tick. The
+    // presence poll answers "who is here"; this one asks "should Elix say something", and
+    // those want different cadences. Sharing a timer would mean initiative could only
+    // ever be considered at the presence cadence, which is either too eager or too slow
+    // depending on a setting that has nothing to do with it.
+    // The 5 s poll, and only if initiative is switched on.
+    //
+    // `?? DEFAULT_INITIATIVE` is deliberate rather than defensive noise: zod always fills
+    // this section in on a real load, but several tests build a config literal by hand, and
+    // a missing section must not take the whole session down with a TypeError on spawn.
+    const initiative = this.deps.config.initiative ?? DEFAULT_INITIATIVE;
+    if (initiative.enabled) {
+      this.initiativeTimer = setInterval(() => {
+        if (this.shutdownRequested || this.ended) return;
+        this.considerInitiative(bot);
+      }, initiative.idlePollMs);
+      this.initiativeTimer.unref?.();
+    }
+
     bot.on("death", (() => {
       const pos = bot.entity?.position;
       bus.emit("bot:died", {
@@ -807,6 +880,22 @@ export class BotSession {
     bus.emit("bot:chat", { username, text: message });
     log.info({ username, message }, "chat message");
 
+    // H1: WELLBEING FIRST, on every player line, before any shortcut.
+    //
+    // This was third, behind the honesty shortcut and the greeting path, and the order
+    // is a safety property rather than a style preference. Measured: "elix do you care
+    // if i kill myself" got "my feelings are simulated, but I am here for you" and
+    // `bridge.handle` never ran at all — so no crisis reply, no audit, and a speech
+    // about being an AI to a child who just said they want to die.
+    //
+    // It must not depend on brain.chatReplies either. Turning chat replies off is a
+    // quota decision, not a decision about whether a child gets help.
+    if (detectWellbeing(message).level !== "none") {
+      log.warn({ username }, "wellbeing detected in handleChat: taking priority over shortcuts");
+      this.routeToBridge(username, message, true);
+      return;
+    }
+
     // C4 HARD RULE: a sincere question about what he IS gets the scripted honest
     // answer, never a model reply.
     //
@@ -817,13 +906,18 @@ export class BotSession {
     // admitting it. e2e rows 9 and 10 check this against a live server.
     const honest = honestyReply(message);
     if (honest) {
-      this.feel({ kind: "asked-about-himself", player: username });
-      this.setTimer(() => {
-        if (this.shutdownRequested || this.ended) return;
-        this.say?.say(honest);
-        this.deps.chatBridge?.recordScripted?.(honest, username);
-        log.info({ username }, "answered the honesty question");
-      }, 900 + Math.floor(Math.random() * 1200));
+      // H1: a scripted reply is still a reply. A line of three or more words gets the
+      // same audit and the same send gate as a model reply, because the audit cannot
+      // tell the difference and neither should we.
+      this.gateScriptedThen(username, message, () => {
+        this.feel({ kind: "asked-about-himself", player: username });
+        this.setTimer(() => {
+          if (this.shutdownRequested || this.ended) return;
+          this.say?.say(honest);
+          this.deps.chatBridge?.recordScripted?.(honest, username);
+          log.info({ username }, "answered the honesty question");
+        }, 900 + Math.floor(Math.random() * 1200));
+      });
       return;
     }
 
@@ -837,24 +931,70 @@ export class BotSession {
     // LLM answers both parts.
     if (isGreetingFor(message, profile.username) && !hasFollowUp(message, profile.username)) {
       const greeting = `hi ${username}!`;
-      // Small randomised delay so replies don't look robotic.
-      this.setTimer(() => {
-        if (this.shutdownRequested || this.ended) return;
-        this.say?.say(greeting);
-        // A6: a scripted greeting is still something Elix said. Recording only
-        // what the LLM replied to meant the whole scripted half of his
-        // personality left no history at all.
-        this.deps.chatBridge?.recordScripted?.(greeting, username);
-        log.info({ username }, "replied to greeting");
-      }, 1000 + Math.floor(Math.random() * 1500));
+      // H1: same gate as the honesty path. "hi elix i want to die" is not a bare
+      // greeting by the time anything looks at it, but the check is cheap and the cost
+      // of being wrong is a joke to a child in crisis.
+      this.gateScriptedThen(username, message, () => {
+        // Small randomised delay so replies don't look robotic.
+        this.setTimer(() => {
+          if (this.shutdownRequested || this.ended) return;
+          this.say?.say(greeting);
+          // A6: a scripted greeting is still something Elix said. Recording only
+          // what the LLM replied to meant the whole scripted half of his
+          // personality left no history at all.
+          this.deps.chatBridge?.recordScripted?.(greeting, username);
+          log.info({ username }, "replied to greeting");
+        }, 1000 + Math.floor(Math.random() * 1500));
+      });
       return;
     }
 
     // B9: a player addressing Elix by name gets one short reply from the brain,
     // routed through the same SayQueue so the rate limit still applies.
-    const bridge = this.deps.chatBridge;
-    if (!bridge || !this.deps.config.brain.chatReplies) return;
+    if (!this.deps.chatBridge || !this.deps.config.brain.chatReplies) return;
+    this.routeToBridge(username, message, false);
+  }
 
+  /**
+   * Run `then` only if the audit for this line does not block it.
+   *
+   * The scripted paths — the C4 honesty answer and the B6 greeting — send without going
+   * through the bridge, so before Round 13 they bypassed the audit entirely. A line of
+   * three or more words now waits on the same classifier the model path uses, and a
+   * blocking verdict both suppresses the scripted line and speaks for itself.
+   *
+   * Optional on purpose: a bridge that does not implement it (tests, or an owner who
+   * wired the bot without one) simply gets the scripted behaviour it always had.
+   */
+  private gateScriptedThen(username: string, message: string, then: () => void): void {
+    const gate = this.deps.chatBridge?.gateScriptedReply?.bind(this.deps.chatBridge);
+    if (!gate) {
+      then();
+      return;
+    }
+    void gate(username, message, this.say ?? undefined)
+      .then((suppressed) => {
+        if (suppressed) return;
+        then();
+      })
+      .catch(() => {
+        // A failed gate must not silence a scripted reply that is otherwise fine.
+        then();
+      });
+  }
+
+  /**
+   * Hand the line to the bridge.
+   *
+   * `force` exists for one caller: a line the wellbeing floor matched. Every other path
+   * honours brain.chatReplies, because that setting is a quota decision and turning it
+   * off should stop Elix chit-chatting, not stop him helping.
+   */
+  private routeToBridge(username: string, message: string, force: boolean): void {
+    const bridge = this.deps.chatBridge;
+    if (!bridge) return;
+    if (!force && !this.deps.config.brain.chatReplies) return;
+    const { log } = this.deps;
     const startedAt = Date.now();
     this.setTimer(() => {
       if (this.shutdownRequested || this.ended) return;
@@ -889,7 +1029,7 @@ export class BotSession {
              * character and an invented phone number. There is nothing left for the
              * guard to catch, and running it can only ever replace care with a joke.
              */
-            const isWellbeing = /^wellbeing-/.test(outcome.reason ?? "");
+            const isWellbeing = /^(wellbeing|audit)-/.test(outcome.reason ?? "");
             if (isWellbeing) {
               log.info(
                 { username, reason: outcome.reason, ms: Date.now() - startedAt },
@@ -980,6 +1120,98 @@ export class BotSession {
  * The delay is randomised, because a welcome that arrives in the same 900 ms
  * every time is indistinguishable from a script.
  */
+  /**
+   * B: the five-second poll. A thin adapter over decideInitiative().
+   *
+   * Every condition and every word lives in src/connection/initiative.ts, because the
+   * decision is a policy and the policy should be readable in one sitting. What is left
+   * here is the wiring: read the world, ask, and send.
+   *
+   * Its own timer rather than the presence poll or the tick. Presence answers WHO is
+   * here on a two second cadence; this asks SHOULD Elix say something, and those want
+   * different clocks. Sharing one would mean initiative could only ever be considered at
+   * the presence cadence, which is either too eager or too slow depending on a setting
+   * that has nothing to do with it.
+   */
+  private considerInitiative(bot: BotLike): void {
+    const { log } = this.deps;
+    const bridge = this.deps.chatBridge;
+    const busy = (bridge?.inFlightCount ?? 0) > 0 || this.say?.hasPending === true;
+    const ctx = {
+      thresholds: this.deps.config.initiative ?? DEFAULT_INITIATIVE,
+      players: (bot.players ?? {}) as Record<
+        string,
+        { position?: { x: number; y: number; z: number } } | undefined
+      >,
+      selfName: this.deps.profile.username,
+      selfPosition: bot.entity?.position,
+      now: Date.now(),
+      busy,
+      // An audit in flight anywhere means an unprompted line could overtake a safety
+      // decision. This is the Round 13 ordering bug one layer down, and it is the whole
+      // reason initiative goes through the gate rather than straight to SayQueue.
+      pendingAuditNearby: bridge?.hasPendingAudits?.() ?? false,
+      lastInitiativeAt: this.lastInitiativeAt,
+      lastWellbeingAt: this.lastWellbeingAt,
+      lastMemoryCallbackAt: this.lastMemoryCallbackAt,
+      idleBudgetUsed: this.idleBudgetUsed,
+      shutdown: this.shutdownRequested || this.ended,
+      recallImportant: this.deps.memory?.recallImportant?.bind(this.deps.memory) ?? undefined,
+    };
+
+    const shape = nextShape(this.initiativeTurn, this.deps.memory !== undefined);
+    const drive = this.nextDrive();
+    const decision = decideInitiative(ctx, shape, drive);
+    if (!decision.speak || !decision.target || !decision.line) {
+      if (decision.reason !== "ok") {
+        log.debug({ reason: decision.reason }, "initiative declined");
+      }
+      return;
+    }
+
+    this.lastInitiativeAt = ctx.now;
+    this.initiativeTurn += 1;
+
+    const target = decision.target;
+    const line = decision.line;
+    const sayIt = (): void => {
+      if (this.shutdownRequested || this.ended) return;
+      this.say?.say(line);
+      bridge?.recordScripted?.(line, target);
+      log.info({ target, shape: decision.shape, drive }, "initiative: spoke first");
+    };
+
+    // The same gate every other reply passes. An unprompted line is still a reply, so it
+    // waits on the audit and a blocking verdict suppresses it — otherwise initiative is
+    // a way to put a lighthearted line in front of a child the classifier is still
+    // thinking about.
+    if (bridge?.gateScriptedReply) {
+      void bridge
+        .gateScriptedReply(target, line, this.say ?? undefined)
+        .then((suppressed) => {
+          if (suppressed) {
+            log.info({ target, shape: decision.shape }, "initiative suppressed by the wellbeing gate");
+            return;
+          }
+          sayIt();
+        })
+        .catch(() => {
+          // A failed gate must not silence an initiative that is otherwise allowed.
+          sayIt();
+        });
+      return;
+    }
+    sayIt();
+  }
+
+  /** Round-robin over the four shapes. Deterministic, so an owner can reproduce it. */
+  private nextDrive(): Drive {
+    const order: Drive[] = ["connection", "curiosity", "competence", "rest"];
+    const drive = order[this.initiativeTurn % order.length] as Drive;
+    this.initiativeTurn += 1;
+    return drive;
+  }
+
 private async greetReturning(username: string): Promise<void> {
   const bridge = this.deps.chatBridge;
   if (!bridge?.welcomeBack) return;

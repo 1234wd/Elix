@@ -351,8 +351,20 @@ export class BrainRouter {
     const skipped: Array<{ candidate: Candidate; reason: SkipReason }> = [];
     const now = this.now();
 
-    for (const entry of preference) {
+    for (const [index, entry] of preference.entries()) {
       const candidate: Candidate = { provider: entry.provider, model: entry.model };
+
+      // Round 13: the guard role does two jobs, and only its FIRST entry is a purpose-
+      // built classifier for both. Anything past it is a degradation, and it used to be
+      // completely silent — so a fallback that cannot return the JSON verdict looked
+      // exactly like a healthy run right up until the regex floor carried everything
+      // alone.
+      if (index > 0 && role === "guard") {
+        this.opts.log?.warn(
+          { role, index, model: entry.model, provider: entry.provider },
+          "guard role fell past its first entry: safety classification is degraded",
+        );
+      }
 
       if (entry.provider === "builtin") {
         // builtin is always available; it is the terminal fallback.

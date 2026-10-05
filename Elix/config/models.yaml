@@ -35,10 +35,23 @@ roles:
     preference:
       - { provider: hf, model: "BAAI/bge-small-en-v1.5" }
       - { provider: builtin, model: "fts5-keyword-only" }
-  guard: # prompt-injection filter
+  # The guard role does TWO jobs: prompt-injection filtering, and the Round 11 wellbeing
+  # classifier, which must return the JSON verdict in CLASSIFIER_POLICY.
+  #
+  # Both fallbacks must therefore be CHAT models. `llama-prompt-guard-2-86m` used to sit
+  # in second place and it is an injection SCORER: it answers with labels, never with
+  # JSON, so every classifier call that fell past the first entry returned prose,
+  # failed parseVerdict, and silently degraded to the regex floor. `llama-3.1-8b-instant`
+  # is not available on this account - verified against GET /v1/models - so
+  # gpt-oss-20b is the fallback, and the router logs a warning whenever the guard role
+  # falls past its first entry.
+  #
+  # `keyword-regex` is last because it cannot return a verdict either. It degrades to the
+  # regex floor, which is the same safe direction as an unavailable classifier.
+  guard:
     preference:
       - { provider: groq, model: "openai/gpt-oss-safeguard-20b" }
-      - { provider: groq, model: "meta-llama/llama-prompt-guard-2-86m" }
+      - { provider: groq, model: "openai/gpt-oss-20b" }
       - { provider: builtin, model: "keyword-regex" }
 
 providers:

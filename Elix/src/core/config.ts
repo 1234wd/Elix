@@ -93,6 +93,43 @@ const skillCapSchema = z
     "Phase 6: how hard Elix plays. Affects reaction delay, aim and PvP aggression. casual is slow and passive, normal is the default, tryhard is fast and fights back.",
   );
 
+/**
+ * B: initiative thresholds.
+ *
+ * Every field is a judgement about how present a bot should be in a server with
+ * children in it, so every field is configurable and every default is the conservative
+ * one.
+ *
+ * The two that matter most:
+ *
+ *  - nearbyBlocks is 16, roughly where Elix can see someone clearly. Speaking
+ *    unprompted to someone he cannot see is how a bot becomes creepy rather than
+ *    companionable.
+ *  - wellbeingQuietMs is 20 minutes. After a check-in, silence is the kind thing to
+ *    offer; a second unprompted line thirty seconds later reads as neediness, and after
+ *    a crisis it reads as pressure.
+ */
+const initiativeSchema = z
+  .object({
+    /** How often the idle poll runs. This paces the caller, not the tick. */
+    idlePollMs: z.number().int().min(1000).max(600_000).default(5_000),
+    /** A player must be within this many blocks. */
+    nearbyBlocks: z.number().min(0).max(64).default(16),
+    /** No wellbeing reply or check-in to this player inside this window. */
+    wellbeingQuietMs: z.number().int().min(0).default(20 * 60_000),
+    /** Minimum gap between two self-started lines, to anyone. */
+    minGapMs: z.number().int().min(0).default(8 * 60_000),
+    /** How strongly a drive has to be pulling before it counts as a reason to speak. */
+    minPull: z.number().min(0).max(1).default(0.25),
+    /** A memory must be at least this important to be brought up unprompted. */
+    memoryImportance: z.number().int().min(1).max(10).default(5),
+    /** At most one memory callback per player per this window. */
+    memoryGapMs: z.number().int().min(0).default(20 * 60_000),
+    /** Master switch, so the owner can turn initiative off without deleting code. */
+    enabled: z.boolean().default(true),
+  })
+  .default({});
+
 export const elixConfigSchema = z.object({
   version: z.literal(1),
   bot: botSchema.default({}),
@@ -103,6 +140,13 @@ export const elixConfigSchema = z.object({
   safety: safetySchema.default({}),
   /** Phase 6: reflex + skill layer cap. */
   skillCap: skillCapSchema.default("normal"),
+  /**
+   * B: initiative. Everything the self-starting logic measures lives here rather than as
+   * constants in the code, because every one of them is a judgement about how intrusive a
+   * bot should be in a server full of children — and that is the owner's call, not a
+   * developer's.
+   */
+  initiative: initiativeSchema.default({}),
   persona: z.string().default("config/persona.md"),
   dataDir: z.string().default("data"),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),

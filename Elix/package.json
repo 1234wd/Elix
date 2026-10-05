@@ -1,6 +1,7 @@
 {
   "name": "elix",
   "version": "0.1.0",
+  "packageManager": "pnpm@12.8.1",
   "description": "Elix — an autonomous Minecraft Java Edition companion that plays like a friend.",
   "private": true,
   "type": "module",

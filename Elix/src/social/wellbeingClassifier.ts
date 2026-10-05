@@ -318,6 +318,16 @@ const ORDER: Record<WellbeingLevel, number> = {
 };
 
 /**
+ * The same ordering, exported.
+ *
+ * Two places need it and neither is the merge: the bridge needs it to decide whether a
+ * second verdict is an ESCALATION - new information, worth interrupting for - or a
+ * repeat, which only needs shortening. That is a safety decision, so the numbers live
+ * next to the merge that first needed them.
+ */
+export const LEVEL_ORDER: Record<WellbeingLevel, number> = ORDER;
+
+/**
  * Explicit game context: a game NOUN and a game VERB.
  *
  * Both are required, because either alone misfires. "die" is a game noun and a life

@@ -105,6 +105,18 @@ const CONFIG: ElixConfig = {
   },
   voice: { enabled: false, textOnlyFallback: true },
   safety: { contentLevel: "kid-safe", chatRateLimitPer2s: 1, helplineText: "", allowEmoji: false },
+  // B: initiative defaults, spelled out so a change to any of them is a visible diff
+  // here rather than a silent behaviour change in the fixture.
+  initiative: {
+    idlePollMs: 5000,
+    nearbyBlocks: 16,
+    wellbeingQuietMs: 20 * 60_000,
+    minGapMs: 8 * 60_000,
+    minPull: 0.25,
+    memoryImportance: 5,
+    memoryGapMs: 20 * 60_000,
+    enabled: true,
+  },
   skillCap: "normal",
   persona: "config/persona.md",
   dataDir: "data",

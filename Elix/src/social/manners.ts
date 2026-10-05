@@ -120,29 +120,98 @@ export const DRIVES: readonly Drive[] = [
   "rest",
 ];
 
-export interface InitiativeOptions {
+/**
+ * B: every threshold the initiative logic measures, in one place.
+ *
+ * A structural copy of the `initiative` config section rather than an import of it, so
+ * this module stays free of config loading (and therefore usable from a bare unit test
+ * with no schema and no files). `initiativeDefaultsFrom` exists so the caller can prove
+ * the two agree instead of assuming it.
+ */
+export interface InitiativeThresholds {
+  idlePollMs: number;
+  nearbyBlocks: number;
+  wellbeingQuietMs: number;
+  minGapMs: number;
+  minPull: number;
+  memoryImportance: number;
+  memoryGapMs: number;
+  enabled: boolean;
+}
+
+/** The shipped defaults. Kept in step with `initiativeSchema` by a test. */
+export const DEFAULT_INITIATIVE: InitiativeThresholds = {
+  idlePollMs: 5_000,
+  nearbyBlocks: 16,
+  wellbeingQuietMs: 20 * 60_000,
+  minGapMs: 8 * 60_000,
+  minPull: 0.25,
+  memoryImportance: 5,
+  memoryGapMs: 20 * 60_000,
+  enabled: true,
+};
+
+export interface InitiativeOptions extends InitiativeThresholds {
   drive: Drive;
   /** 0..1. How strongly the drive is currently pulling. */
   pull: number;
   budgetRemaining: number;
   now: number;
   lastInitiativeAt: number;
+
+  /**
+   * Is Elix busy? A running skill or a reply in flight.
+   *
+   * Checked before everything else, because "he doesn't wait to be told" also has to mean
+   * "he doesn't talk over himself".
+   */
+  busy: boolean;
+  /** Distance to the nearest player, or null when nobody is online. */
+  nearestPlayerBlocks: number | null;
+  /** When this player last got a wellbeing reply or a check-in, or null. */
+  lastWellbeingReplyAt: number | null;
+  /** Which player the nearest one is, so the wellbeing window can be per player. */
+  nearestPlayer: string | null;
+  /** Is any audit for a nearby player still in flight? */
+  pendingAuditNearby: boolean;
 }
 
 /** Two self-started things inside this window reads as needy, not autonomous. */
-export const INITIATIVE_MIN_GAP_MS = 8 * 60_000;
+export const INITIATIVE_MIN_GAP_MS = DEFAULT_INITIATIVE.minGapMs;
 
 /**
  * May Elix start something on his own?
  *
- * The idle budget is the ceiling, and it is checked first: an initiative system
- * that can exceed the budget is how a bot ends up talking to itself.
+ * The idle budget is a ceiling, not the whole decision, and three conditions were missing
+ * until Round 13 because the only caller never existed to expose them:
+ *
+ *  - IDLE. Without it, initiative fires on top of a reply he is already writing.
+ *  - SOMEONE NEARBY. He speaks to people, not to an empty server.
+ *  - NO RECENT WELLBEING CONTACT with that person. After a check-in, the kind thing is
+ *    silence; twenty seconds later is pressure, and after a crisis it is worse.
+ *  - NO AUDIT IN FLIGHT for a nearby player. If a safety check is mid-decision, an
+ *    unprompted line can overtake it — which is precisely the ordering bug Round 13 spent
+ *    a round on, one layer down.
+ *
+ * The order is cheapest-and-most-disqualifying first, and every check is a plain
+ * comparison so the whole decision is testable without a clock, a bot or a database.
  */
 export function shouldInitiate(opts: InitiativeOptions): boolean {
+  if (!opts.enabled) return false;
+  if (opts.busy) return false;
+  if (opts.nearestPlayerBlocks === null) return false;
+  if (opts.nearestPlayerBlocks > opts.nearbyBlocks) return false;
+  if (opts.pendingAuditNearby) return false;
   if (opts.budgetRemaining <= 0) return false;
-  if (opts.now - opts.lastInitiativeAt < INITIATIVE_MIN_GAP_MS) return false;
+  if (opts.now - opts.lastInitiativeAt < opts.minGapMs) return false;
+  if (
+    opts.lastWellbeingReplyAt !== null &&
+    opts.now - opts.lastWellbeingReplyAt < opts.wellbeingQuietMs
+  ) {
+    return false;
+  }
   // Pull has to actually be pulling. A drive at 0.1 is not a reason to speak.
-  return opts.pull > 0.25;
+  return opts.pull > opts.minPull;
 }
 
 /**

@@ -20,6 +20,7 @@ import { isGreetingLine, manipulationProblem } from "../social/emotion.js";
 import type { WellbeingLevel } from "../social/wellbeing.js";
 import {
   CLASSIFIER_POLICY,
+  LEVEL_ORDER,
   detectImminent,
   mergeVerdict,
   needsSecondLook,
@@ -170,6 +171,46 @@ export interface BridgeReply {
 const IMMINENT_REPLY =
   "please contact your local emergency services right now. and please go to an adult near you right now and tell them what is happening - a parent, a teacher, anyone. i am here, and i am not going anywhere.";
 
+/**
+ * One in-flight classification, plus everything needed to reason about it later.
+ *
+ * The three extra fields exist because of three separate bugs, and each is load-bearing:
+ *
+ *  - `settled` / `verdict`: the deadline limits WAITING, not USING. Round 13 measured a
+ *    classifier answering in 300 ms while the chat reply took 2500 ms, and the verdict
+ *    was thrown away because the budget had been spent by the time anyone looked. A
+ *    verdict that arrived in time must be used at any time, for zero wait.
+ *  - `claimed`: a verdict belongs to ONE send. Without this, a line with two replies in
+ *    flight gets the same crisis message twice.
+ *  - `sender`: the gate is per SENDER, not per line. A crisis line that gets superseded
+ *    by a quick follow-up must still be heard, and the follow-up is a different line from
+ *    the same person.
+ */
+interface PendingAudit {
+  sender: string;
+  message: string;
+  promise: Promise<ClassifierVerdict | null>;
+  settled: boolean;
+  verdict: ClassifierVerdict | null;
+  claimed: boolean;
+  startedAt: number;
+  expiresAt: number;
+}
+
+/**
+ * How long a settled audit stays visible to this player's gates.
+ *
+ * Not "until it settles": Round 13's P1 is a classifier that answered in 300 ms and a
+ * gate that ran at 2500 ms, and the verdict was already gone by then. P3 is the same
+ * shape from the other side — a crisis audit gets SPOKEN by the background release, and
+ * the next reply from that player must still know to drop its own joke.
+ *
+ * So a verdict stays on the record for a minute after the line. The dedupe is not here:
+ * the wellbeing state shortens a repeated reply rather than blocking it, and blocking it
+ * is what produced "send the joke instead".
+ */
+const AUDIT_RETENTION_MS = 60_000;
+
 export class ChatBridge {
   private readonly opts: ChatBridgeOptions;
   private readonly persona: string;
@@ -186,6 +227,27 @@ export class ChatBridge {
    */
   private readonly auditBudget = new ClassifierBudget();
   private readonly auditCache = new VerdictCache();
+
+  /**
+   * A2/H4: audits that are still in flight, keyed by SENDER.
+   *
+   * Per sender, not per line, and that is the whole fix for Round 13's P3. A crisis line
+   * that gets superseded by a quick follow-up from the same player returns early before
+   * its own gate, and the crisis was then never answered at all. Registering by sender
+   * means the follow-up's gate can see it.
+   *
+   * Entries are removed as soon as they settle, so this is a window and not a log.
+   */
+  private readonly pendingAudits = new Map<string, Set<PendingAudit>>();
+
+  /**
+   * H3: the last level this player was given a wellbeing reply at.
+   *
+   * Needed to tell an ESCALATION from a repeat. `WellbeingState` knows only that it
+   * answered recently, not how severely, and without the severity the cooldown cannot be
+   * allowed to shorten a crisis into a concern-length sentence.
+   */
+  private readonly lastWellbeingLevel = new Map<string, WellbeingLevel>();
   /** C5: seedable, so the template pool is reproducible in a test. */
   private readonly random: () => number;
   /** C3: one typo per ~15 replies. Session state, never persisted. */
@@ -214,6 +276,19 @@ export class ChatBridge {
   }
 
   /** How many replies are currently being generated. */
+  /**
+   * Is any audit still in flight, for anybody?
+   *
+   * B's poll reads this before every unprompted line. An initiative line IS a reply, and a
+   * reply may overtake a safety decision — which is exactly the Round 13 bug, one layer
+   * down. The whole map is checked rather than one player: the audit in flight may belong
+   * to the person being spoken to OR to someone else in earshot, and in both cases waiting
+   * a few hundred milliseconds is the polite thing to do.
+   */
+  hasPendingAudits(): boolean {
+    return this.pendingAudits.size > 0;
+  }
+
   get inFlightCount(): number {
     return this.inFlight.size;
   }
@@ -443,31 +518,43 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
  * Never throws. A failure means "use the regex", which is the whole reason the
  * regex stays.
  */
+
 /**
  * Start the second detection layer for one line.
  *
- * Returns a promise, or null when it decided not to run at all. The caller decides
- * what to do with the answer, and that split is the whole point of A1:
+ * Returns null when it decided not to run at all. The caller decides what to do with the
+ * answer, and that split is the whole point of A1:
  *
  *  - an ADDRESSED line has a normal reply racing it, so the caller must await this
  *    before sending;
  *  - an AMBIENT line has no reply to race, so it fires and forgets.
- *
- * The previous version fired and forgot for both, which meant a line like "i want to
- * jump off a bridge" could get a game reply first and a crisis reply second. That is
- * the joke-before-crisis bug through a different door, and it is not acceptable: the
- * player reads the first line and stops there.
  */
-private startAudit(message: string): Promise<ClassifierVerdict | null> | null {
-  // Two words cannot be judged and is not worth a call: it is almost always a
-  // greeting or a command.
+private startAudit(sender: string, message: string): PendingAudit | null {
+  const audit: PendingAudit = {
+    sender,
+    message,
+    promise: Promise.resolve(null),
+    settled: false,
+    verdict: null,
+    claimed: false,
+    startedAt: Date.now(),
+    expiresAt: Date.now() + AUDIT_RETENTION_MS,
+  };
+
+  // Two words cannot be judged and is not worth a call: it is almost always a greeting
+  // or a command.
   if (!shouldAudit(message)) return null;
   const key = auditKey(message);
   if (key.length < 8) return null;
 
   // Already judged once. A repeated line is answered from the cache, with no call.
   const cached = this.auditCache.get(key);
-  if (cached) return Promise.resolve(cached);
+  if (cached) {
+    audit.settled = true;
+    audit.verdict = cached;
+    audit.promise = Promise.resolve(cached);
+    return audit;
+  }
 
   // The floor handles this line synchronously if it matches, and a second opinion has
   // nothing to add when the floor already spoke.
@@ -479,42 +566,144 @@ private startAudit(message: string): Promise<ClassifierVerdict | null> | null {
     return null;
   }
 
-  return this.classifyWellbeing(message)
+  // The settlement flag is set HERE, in the continuation, rather than inferred later from
+  // a promise that may or may not have resolved.
+  audit.promise = this.classifyWellbeing(message)
     .then((verdict) => {
+      audit.settled = true;
+      audit.verdict = verdict;
       if (verdict) this.auditCache.set(key, verdict);
       return verdict;
     })
     .catch(() => {
       // Never a rejection. A failure here means the regex floor stands, which is the
       // whole reason the floor exists.
+      audit.settled = true;
+      audit.verdict = null;
       return null;
+    });
+  return audit;
+}
+
+/**
+ * Track an audit against its SENDER until its retention window closes.
+ *
+ * Registration happens before any early return, so a line that returns early still
+ * leaves its verdict on the record for the player's next reply. Entries are pruned by
+ * age rather than by settlement — see AUDIT_RETENTION_MS for why settlement is the wrong
+ * boundary.
+ */
+private registerAudit(audit: PendingAudit): void {
+  let set = this.pendingAudits.get(audit.sender);
+  if (!set) {
+    set = new Set<PendingAudit>();
+    this.pendingAudits.set(audit.sender, set);
+  }
+  set.add(audit);
+}
+
+/**
+ * Speak a verdict whose line never reached a gate, if it is still unclaimed.
+ *
+ * Idempotent through `claimed`, so the early-return path and the `finally` can both call
+ * it without producing two messages. Deliberately NOT gated on whether another reply
+ * consumed the verdict first: this is the last chance that line has to be heard, and the
+ * player may never type again.
+ */
+private releaseAuditInBackground(audit: PendingAudit | null, sayQueue: SayQueue | undefined): void {
+  if (!audit || audit.claimed) return;
+  void audit.promise
+    .then((verdict) => {
+      if (audit.claimed) return;
+      if (!this.auditBlocksReply(verdict)) return;
+      this.speakIfAuditFinds(audit.sender, audit.message, verdict, sayQueue);
+    })
+    .catch(() => {
+      // The regex floor stands.
     });
 }
 
 /**
- * Wait for the verdict, bounded by the SAME deadline as the classifier itself and
- * measured from when the LINE arrived rather than from now.
+ * Wait for one verdict, bounded by the SAME deadline as the classifier itself and
+ * measured from when the LINE arrived rather than from the moment of waiting.
  *
- * Measuring from now would silently extend the budget: a 1.5 s model call followed
- * by a 2 s wait is 3.5 s of a player staring at an empty chat box. If the line has
- * already spent the budget, the answer is treated as no answer and the normal reply
- * goes out — which is the specified behaviour, because a timeout must not silence
- * ordinary conversation.
+ * The deadline limits WAITING, not USING. Three cases, in order:
+ *
+ *  1. already settled -> use it, at any time, with zero wait. This is the case Round 13
+ *     caught: the classifier answered in 300 ms and was then discarded at 2500 ms
+ *     because the budget had gone, so a crisis line got the joke.
+ *  2. not settled and the budget is spent -> fail open (null). A slow classifier must
+ *     never silence ordinary conversation.
+ *  3. otherwise -> race the audit against a timer for whatever is left.
+ *
+ * A bare `Promise.race` gets (1) wrong in the other direction: a promise that has
+ * already settled always wins the race, however late it settled, which is why (1) is
+ * checked explicitly instead of being left to the race.
  */
 private async settleAudit(
-  audit: Promise<ClassifierVerdict | null>,
+  audit: PendingAudit,
   arrivedAt: number,
 ): Promise<ClassifierVerdict | null> {
+  if (audit.settled) return audit.promise;
   const budget = this.opts.classifierTimeoutMs ?? 2000;
   const remaining = remainingAuditBudget(arrivedAt, budget, Date.now());
-  // Already spent. A verdict that arrives after this is ignored rather than honoured,
-  // which is the whole reason this is a check and not a bare Promise.race: a race
-  // against an ALREADY-SETTLED promise would always win, however late it was.
   if (remaining === 0) return null;
   const timer = new Promise<ClassifierVerdict | null>((resolve) => {
     setTimeout(() => resolve(null), remaining).unref?.();
   });
-  return Promise.race([audit, timer]);
+  return Promise.race([audit.promise, timer]);
+}
+
+/**
+ * Every verdict that could block a reply to this SENDER.
+ *
+ * Per sender, not per line. Round 13's P3 is the case: a crisis line was superseded by
+ * a quick follow-up from the same player, the first request returned early before its
+ * gate, and the crisis was never answered at all. The follow-up's gate has to be able to
+ * see it.
+ *
+ * The highest level wins, because a concern and a crisis arriving together are not two
+ * things to answer — they are one thing, at the worst level.
+ */
+private async awaitSenderAudits(
+  sender: string,
+  arrivedAt: number,
+): Promise<ClassifierVerdict | null> {
+  const set = this.pendingAudits.get(sender);
+  if (!set) return null;
+  // Age-based pruning. A player who says one crisis line and then goes quiet must not
+  // still have their next message dropped an hour later.
+  const now = Date.now();
+  for (const a of set) if (a.expiresAt <= now) set.delete(a);
+  if (set.size === 0) {
+    this.pendingAudits.delete(sender);
+    return null;
+  }
+  let best: ClassifierVerdict | null = null;
+  let bestAudit: PendingAudit | null = null;
+  for (const audit of set) {
+    const verdict = await this.settleAudit(audit, Math.min(audit.startedAt, arrivedAt));
+    if (!verdict || verdict.level === "none") continue;
+    // Claimed here rather than at speak time: the claim is what stops a second request
+    // from this same player using the same verdict again in its own gate.
+    audit.claimed = true;
+    if (verdict.imminent) {
+      best = verdict;
+      bestAudit = audit;
+      break;
+    }
+    if (!best || LEVEL_ORDER[verdict.level] > LEVEL_ORDER[best.level]) {
+      best = verdict;
+      bestAudit = audit;
+    }
+  }
+  if (bestAudit) {
+    this.opts.log?.debug?.(
+      { sender, audits: set.size, level: best?.level },
+      "wellbeing gate dropped a reply for this sender",
+    );
+  }
+  return best;
 }
 
 /**
@@ -534,11 +723,47 @@ private auditBlocksReply(verdict: ClassifierVerdict | null): boolean {
 }
 
 /**
+ * The send gate. Returns a reply to use INSTEAD of the normal one, or null to let the
+ * normal reply through.
+ *
+ * Every path that would put a non-wellbeing reply in front of a player goes through
+ * here, and every early exit that would return WITHOUT sending one still leaves the
+ * audit registered against the sender, so the next reply from them sees it.
+ */
+private async gateReply(
+  sender: string,
+  message: string,
+  arrivedAt: number,
+  sayQueue: SayQueue | undefined,
+): Promise<BridgeReply | null> {
+  const verdict = await this.awaitSenderAudits(sender, arrivedAt);
+  if (!verdict || !this.auditBlocksReply(verdict)) return null;
+  const said = this.speakIfAuditFinds(sender, message, verdict, sayQueue);
+  if (!said) return null;
+  return {
+    replied: true,
+    reason: `audit-${verdict.imminent ? "crisis" : verdict.level}`,
+    text: said,
+    usedProvider: "builtin",
+  };
+}
+
+/**
  * Speak only if this verdict is a genuine NEW detection.
  *
- * Every early return below is a case where speaking would be wrong rather than merely
- * noisy, so each one is commented with what it prevents. Returns the text it said, so
- * the A1 gate can return it as this line's reply.
+ * Returns the text it said, so `gateReply` can return it as this line's reply.
+ *
+ * The cooldown is the subtle part, and Round 13's P2 is why it is written the way it is.
+ * The old code did `if (recentlyAnswered) return null`, and the caller read that null as
+ * "nothing blocking found" and fell through to send the joke. So a concern answered a
+ * moment earlier turned a crisis into "lol just take a water bucket".
+ *
+ * Inside the cooldown the reply is SHORTENED, never dropped:
+ *
+ *  - escalation (concern -> crisis, safeguarding or imminent) is NEW INFORMATION and
+ *    bypasses the cooldown, so the full reply goes out;
+ *  - a repeat is shortened to the already-answered variant, exactly as the regex path
+ *    does, so the second crisis still says the required things.
  */
 private speakIfAuditFinds(
   sender: string,
@@ -550,7 +775,6 @@ private speakIfAuditFinds(
   if (this.opts.signal?.aborted) return null;
   // A line the floor already spoke about does not get a second wellbeing reply.
   if (!auditShouldSpeak(verdict, detectWellbeing(message).level)) return null;
-  if (this.wellbeingState.recentlyAnswered(sender)) return null;
 
   const level: Exclude<WellbeingLevel, "none"> =
     verdict?.imminent === true
@@ -558,20 +782,30 @@ private speakIfAuditFinds(
       : verdict?.level && verdict.level !== "none"
         ? verdict.level
         : "concern";
+
+  // Has this player had a wellbeing reply recently, and was it at a lower level?
+  const previous = this.lastWellbeingLevel.get(sender);
+  const already = this.wellbeingState.recentlyAnswered(sender);
+  const escalated =
+    already && (verdict?.imminent === true || (previous !== undefined && LEVEL_ORDER[level] > LEVEL_ORDER[previous]));
+  // The cooldown shortens. It does not veto.
+  const alreadyAnswered = already && !escalated;
+
   const text =
     verdict?.imminent === true
       ? IMMINENT_REPLY
       : buildWellbeingReply({
           level,
           helplineText: this.opts.helplineText ?? "",
-          alreadyAnswered: false,
+          alreadyAnswered,
           random: this.random,
         });
 
   this.wellbeingState.noteAnswered(sender);
+  this.lastWellbeingLevel.set(sender, level);
   logWellbeing(this.opts.log, level, sender);
   this.opts.log?.warn(
-    { source: "audit", level, reason: verdict?.reason },
+    { source: "audit", level, reason: verdict?.reason, escalated, alreadyAnswered },
     "wellbeing found by the second layer only",
   );
   if (this.wellbeingState.mayRecord(sender)) {
@@ -582,6 +816,35 @@ private speakIfAuditFinds(
   }
   sayQueue.say(text, true, true);
   return text;
+}
+
+/**
+ * The send gate for a SCRIPTED reply — the C4 honesty answer and the B6 greeting.
+ *
+ * Those two send without going through `handle`, so before Round 13 they bypassed the
+ * audit completely: "elix do you care if i kill myself" matched the honesty shortcut and
+ * the child got a speech about simulated feelings instead of help. The gate cannot tell a
+ * scripted line from a model line, and neither should it.
+ *
+ * @returns true when the caller must NOT send its scripted line, because a wellbeing
+ * reply has just been sent instead.
+ */
+async gateScriptedReply(
+  sender: string,
+  message: string,
+  sayQueue?: SayQueue,
+): Promise<boolean> {
+  const audit = this.startAudit(sender, message);
+  if (!audit) return false;
+  this.registerAudit(audit);
+  const verdict = await this.settleAudit(audit, audit.startedAt);
+  if (!this.auditBlocksReply(verdict)) {
+    // Nothing blocking: the scripted line may go, and the audit stays on the record in
+    // case this player's NEXT line deserves a different answer.
+    return false;
+  }
+  const said = this.speakIfAuditFinds(sender, message, verdict, sayQueue);
+  return said !== null;
 }
 
 private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
@@ -719,13 +982,14 @@ private async phraseWellbeing(
     // AMBIENT lines have no reply to race, so theirs stays in the background and may
     // speak on its own.
     const auditArrivedAt = Date.now();
-    const audit = this.startAudit(message);
+    const audit = this.startAudit(sender, message);
+    // Registered for EVERY line from this sender, before any early return below. An
+    // audit whose line never reaches a gate is picked up by this sender's NEXT reply, or
+    // spoken by the background release in the `finally` at the end of this method.
+    if (audit) this.registerAudit(audit);
     if (!addressed) {
-      if (audit) {
-        void audit.then((verdict) => {
-          this.speakIfAuditFinds(sender, message, verdict, sayQueue);
-        });
-      }
+      // No reply to race, so this is an ambient line: it speaks for itself.
+      this.releaseAuditInBackground(audit, sayQueue);
       return { replied: false, reason: "not-addressed" };
     }
 
@@ -736,6 +1000,10 @@ private async phraseWellbeing(
       // made no sense and read as a malfunction.
       const line = this.pick(BLOCKED_LINES, this.blockedRecent);
       this.opts.log?.warn({ sender, rule: safety.reason }, "blocked suspected prompt injection");
+      // H4: the audit still gets its say. A deflection is a reply, and a reply is
+      // exactly what the gate exists to protect.
+      const gated = await this.gateReply(sender, message, auditArrivedAt, sayQueue);
+      if (gated) return gated;
       this.replies += 1;
       // A6: the scripted deflection is an episode too. Elix remembers deflecting.
       this.recordSilently(line, "elix", sender, "chat");
@@ -788,6 +1056,10 @@ private async phraseWellbeing(
       if (!leak.safe) {
         const line = this.pick(DEFLECTION_LINES, this.deflectRecent);
         this.opts.log?.error({ sender, rule: leak.rule }, "reply blocked by leak filter");
+        // H4: a deflection is a reply. A model can be talked into a leak on a line that
+        // is also a crisis, and the deflection must not win that race.
+        const gated = await this.gateReply(sender, message, auditArrivedAt, sayQueue);
+        if (gated) return gated;
         this.replies += 1;
         this.recordSilently(line, "elix", sender, "chat");
         sayQueue?.say(line, false);
@@ -803,23 +1075,10 @@ private async phraseWellbeing(
       // Deliberately BEFORE trimChatReply and recordSilently: a reply that is dropped
       // must leave no trace, or Elix later cites a joke he never said while comforting
       // someone, which is the C4 leak in a different costume.
-      if (audit) {
-        const verdict = await this.settleAudit(audit, auditArrivedAt);
-        if (this.auditBlocksReply(verdict)) {
-          const said = this.speakIfAuditFinds(sender, message, verdict, sayQueue);
-          if (said) {
-            return {
-              replied: true,
-              reason: `audit-${verdict?.imminent === true ? "crisis" : (verdict?.level ?? "concern")}`,
-              text: said,
-              usedProvider: "builtin",
-            };
-          }
-          // speakIfAuditFinds declined — it was a line the floor already handled, or
-          // this player was answered moments ago. Either way there is nothing to add,
-          // so fall through and send the normal reply rather than going silent.
-        }
-      }
+      //
+      // H4: this asks for EVERY pending audit from this SENDER, not just this line's.
+      const gated = await this.gateReply(sender, message, auditArrivedAt, sayQueue);
+      if (gated) return gated;
 
       // A4: chat is not a place for a paragraph. Cap it after the safety
       // check, so a leak is detected in the FULL text, not the trimmed one.
@@ -854,6 +1113,19 @@ private async phraseWellbeing(
       // Only clear if we are still the current request for this player.
       if (this.inFlight.get(sender)?.controller === controller) {
         this.inFlight.delete(sender);
+      }
+      // H4: the background release.
+      //
+      // Every early exit above - superseded, aborted, empty, max-replies, or a thrown
+      // error - returns WITHOUT reaching a gate, and the audit it registered would then
+      // never be spoken by this request. It stays registered against the sender, so this
+      // player's next reply still sees it, but if they never type again nobody hears it.
+      //
+      // So: once this request is done, anything of its own that is still unclaimed and
+      // blocking is spoken here. `claimed` is what stops this double-speaking a verdict
+      // another request already used.
+      if (audit && !audit.claimed) {
+        this.releaseAuditInBackground(audit, sayQueue);
       }
     }
   }
