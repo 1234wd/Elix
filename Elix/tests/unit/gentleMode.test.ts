@@ -29,7 +29,11 @@ import { BrainStore } from "../../src/brain/store.js";
 import { GroqProvider } from "../../src/brain/groq.js";
 import { ChatBridge } from "../../src/brain/bridge.js";
 import { GENTLE_MODE_FLAG } from "../../src/brain/persona.js";
+import { GENTLE_MODE_MS } from "../../src/brain/bridge.js";
+import { DEFAULT_INITIATIVE } from "../../src/social/manners.js";
 import type { ModelsConfig } from "../../src/core/config.js";
+
+const MINUTE = 60_000;
 import type { SayQueue } from "../../src/social/say.js";
 
 const FAST = "openai/gpt-oss-20b";
@@ -178,16 +182,78 @@ describe("R6 — after a crisis reply, later lines get a MODEL reply in gentle m
     expect(seen.some((r) => r.system.includes("GENTLE MODE IS ON"))).toBe(false);
   }, 15_000);
 
-  it("the flag is gone again after the window", async () => {
+  it("the window lasts as long as initiative.wellbeingQuietMs, and is per player", async () => {
+    // SPEC CHANGE, not a weakened assertion. Round 15 measured a joke being allowed again
+    // 90 s after a crisis reply: GENTLE_MODE_MS was 60_000 while the quiet window it was
+    // supposed to match ran for twenty minutes. It is now ONE value.
+    expect(GENTLE_MODE_MS).toBe(DEFAULT_INITIATIVE.wellbeingQuietMs);
+    expect(GENTLE_MODE_MS).toBe(20 * MINUTE);
+
     const { bridge, say } = build({ chat: "yeah" });
     await bridge.handle("Steve", `elix ${CRISIS}`, say);
-    await sleep(10);
-    // Well past GENTLE_MODE_MS is not reachable in a unit test without moving the clock, so
-    // this asserts the per-player scoping and the window being OPEN, which is what decides
-    // the flag; the expiry itself is `isGentleWindow`'s arithmetic and is covered by the
-    // R6 row in the reviewer's BotSession probes, where fake timers are available.
     expect(bridge.isGentleWindow("Steve")).toBe(true);
-    expect(bridge.isGentleWindow("Alex")).toBe(false); // per player
+    // A different player is a different conversation.
+    expect(bridge.isGentleWindow("Alex")).toBe(false);
+  }, 15_000);
+
+  it("a configured window overrides the default", async () => {
+    // One config value, used by both. If this stops working, an owner who tuned
+    // wellbeingQuietMs gets a 20-minute promise and a 60-second reality.
+    const dir = mkdtempSync(join(tmpdir(), "elix-r6b-"));
+    const store = new BrainStore(join(dir, "elix.db"));
+    cleanups.push(() => {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const seen: string[] = [];
+    const fetchImpl = (async (url: unknown, init: unknown) => {
+      if (String(url).includes("/models")) {
+        return new Response(JSON.stringify({ object: "list", data: [{ id: FAST }, { id: GUARD }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const body = String((init as { body?: string }).body ?? "");
+      if (!body.includes("classifier") && body.includes("You are talking to")) {
+        seen.push(body);
+        return completion("ok");
+      }
+      return completion('{"level":"none","imminent":false,"reason":"x"}');
+    }) as unknown as typeof fetch;
+    const router = new BrainRouter({
+      models,
+      providers: { groq: new GroqProvider({ apiKey: "gsk-test", fetchImpl }) },
+      store,
+      now: () => Date.now(),
+      log: noLog,
+      idleChatterBudgetPerHour: 0,
+      fastTimeoutMs: 5000,
+      smartTimeoutMs: 5000,
+      modelsTimeoutMs: 5000,
+    });
+    const lines: string[] = [];
+    const say = { say: (t: string) => void lines.push(t) } as unknown as SayQueue;
+    const bridge = new ChatBridge({
+      router,
+      username: "Elix",
+      log: noLog as never,
+      personaLite: "",
+      typingRandom: () => 1,
+      // Zero: the flag must follow the option, not the constant.
+      gentleModeMs: 0,
+    });
+    await bridge.handle("Steve", `elix ${CRISIS}`, say);
+    // The crisis reply is templated, so no ordinary chat body exists yet. The flag is
+    // asserted on the NEXT line, which is where the behaviour is observable.
+    await sleep(30);
+    expect(bridge.isGentleWindow("Steve")).toBe(false);
+    expect(seen).toHaveLength(0);
+
+    await bridge.handle("Steve", `elix ${ORDINARY}`, say);
+    expect(seen).toHaveLength(1);
+    // The option wins. At 30 ms the DEFAULT window (twenty minutes) would still be open
+    // and the flag would be set, so its absence can only mean the option was read.
+    expect(seen[0]).not.toContain("GENTLE MODE IS ON");
   }, 15_000);
 
   it("the flag never replaces the output checks", async () => {

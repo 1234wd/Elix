@@ -1147,8 +1147,14 @@ export class BotSession {
              */
             // R5: recorded from the outcome reason, so it works with ANY bridge implementation and not
   // only the one that happens to own a WellbeingState.
-  const sentLevel = this.wellbeingLevelFromReason(outcome.reason);
-  if (sentLevel && sentLevel !== "none") this.wellbeingState.noteAnswered(username, sentLevel);
+      // R5: recorded from the outcome reason, so it works with ANY bridge implementation
+      // and not only the one that happens to own a WellbeingState.
+      //
+      // S3: but ONLY when there is no bridge state, because when there is one the bridge has
+      // already recorded this reply. A second write into the same shared object counted every
+      // intervention twice - which is what hid S2 in a live session while the unit test
+      // looked clean.
+      this.recordIfNoBridgeState(username, outcome.reason);
 
   const isWellbeing = /^(wellbeing|audit)-/.test(outcome.reason ?? "");
             if (isWellbeing) {
@@ -1255,6 +1261,23 @@ export class BotSession {
  * reply which left the session was a wellbeing reply at all, which it learns from the
  * outcome reason. Same object either way, so there is no second map to drift.
  */
+  /**
+   * S3: write a wellbeing record ONLY when the bridge has no state of its own.
+   *
+   * The bridge records the reply itself on every path - the regex floor, the audit, the
+   * background release and the gated scripted reply all write through its WellbeingState.
+   * When the session also wrote into that same object, every intervention counted twice.
+   *
+   * When there is NO bridge state, the session is the only thing that can see that a
+   * wellbeing reply left it, so it records. That keeps R5 working with any bridge
+   * implementation rather than only the one that happens to expose its state.
+   */
+  private recordIfNoBridgeState(username: string, reason: string | undefined): void {
+    if (this.deps.chatBridge?.wellbeingState) return;
+    const level = this.wellbeingLevelFromReason(reason);
+    if (level && level !== "none") this.wellbeingState.noteAnswered(username, level);
+  }
+
 private get wellbeingState(): WellbeingState {
   return this.deps.chatBridge?.wellbeingState ?? this.ownWellbeingState;
 }

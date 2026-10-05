@@ -47,6 +47,7 @@ import {
   wellbeingEpisodeText,
 } from "../social/wellbeing.js";
 import { applyTypingRealism, newTypingState } from "../social/typing.js";
+import { DEFAULT_INITIATIVE } from "../social/manners.js";
 import { checkOutputSafety, DEFLECTION_LINES } from "./leakFilter.js";
 import { trimChatReply } from "./reasoning.js";
 import { PROJECT_ROOT } from "../core/config.js";
@@ -140,6 +141,14 @@ export interface ChatBridgeOptions {
    */
   classifierTimeoutMs?: number;
   /**
+   * S1: how long after a wellbeing reply a player's later lines are answered gently.
+   *
+   * Defaults to `initiative.wellbeingQuietMs`, so it is ONE number for both. Two numbers
+   * for one idea is how gentle mode came to expire at sixty seconds while the quiet window
+   * it was supposed to match ran for twenty minutes.
+   */
+  gentleModeMs?: number;
+  /**
    * C3: seedable, so the 1-in-15 typo rate is assertable instead of being a
    * thing you can only observe by luck.
    */
@@ -226,19 +235,17 @@ const AUDIT_RETENTION_MS = 60_000;
 const AUDIT_MAP_CAP = 256;
 
 /**
- * R6: how long after a wellbeing reply a player's later lines are answered GENTLY rather
- * than with a template.
+ * S1: the default length of the gentle-mode window.
  *
- * Sixty seconds, matching the crisis cooldown. Inside it a new line gets a real model
- * reply with the gentle-mode flag set: no jokes, no teasing, no pivot to the game unless
- * they lead, and never contradicting the advice already given.
+ * NOT 60 seconds. Round 15 measured that at 90 s after a crisis reply an ordinary reply
+ * had no gentle flag at all, so a joke was permitted again ninety seconds after a child
+ * said they wanted to die. The old comment claimed sixty seconds "matched the crisis
+ * cooldown", which was simply wrong: the cooldown is ten minutes.
  *
- * The distinction from the cooldown is the point. The cooldown shortens the WELLBEING
- * reply. This changes how ORDINARY chat is answered. Before Round 14 they were the same
- * thing, and the result was a bot that answered "thanks, i talked to my mum" by telling
- * them not to stop talking to someone they trust.
+ * It is now ONE value, `initiative.wellbeingQuietMs`, used by both. Two numbers for one
+ * idea is how they came to disagree.
  */
-export const GENTLE_MODE_MS = 60_000;
+export const GENTLE_MODE_MS = DEFAULT_INITIATIVE.wellbeingQuietMs;
 
 export class ChatBridge {
   private readonly opts: ChatBridgeOptions;
@@ -557,8 +564,13 @@ private async wellbeingReply(sender: string, message: string): Promise<string | 
   // R2: the regex path records through the SAME writer as the audit path, so an
   // escalation is visible to both. Before Round 14 it recorded nothing here, and the
   // audit path kept a private map, so the two disagreed about whether a crisis was new.
+  // S2: ALWAYS write. `escalation || write(...)` short-circuited the write whenever
+  // escalation was true, so the most severe reply in the whole session was the one reply
+  // never recorded - and lastContact, the quiet window and the intervention count were all
+  // measured from the milder reply before it.
+  const wrote = this.noteWellbeingAnswered(sender, level);
   const escalation = already && level === "crisis" && this.wellbeingState_.lastLevel(sender) !== "crisis";
-  const escalated = escalation || this.noteWellbeingAnswered(sender, level).escalation;
+  const escalated = escalation || wrote.escalation;
   const template = buildWellbeingReply({
     level,
     helplineText: this.opts.helplineText ?? "",
@@ -789,15 +801,14 @@ private async awaitSenderAudits(
   }
   let best: ClassifierVerdict | null = null;
   let bestAudit: PendingAudit | null = null;
+  const blocking: PendingAudit[] = [];
   for (const audit of set) {
     // R6: an audit whose answer has ALREADY gone out does not block a line that arrived
     // afterwards. Only an answer still owed is blocking.
     if (audit.repliedAt !== null && audit.repliedAt <= arrivedAt) continue;
     const verdict = await this.settleAudit(audit, Math.min(audit.startedAt, arrivedAt));
     if (!verdict || verdict.level === "none") continue;
-    // Claimed here rather than at speak time: the claim is what stops a second request
-    // from this same player using the same verdict again in its own gate.
-    audit.claimed = true;
+    blocking.push(audit);
     if (verdict.imminent) {
       best = verdict;
       bestAudit = audit;
@@ -809,8 +820,18 @@ private async awaitSenderAudits(
     }
   }
   if (bestAudit) {
-    // Stamp it, so the NEXT line is not blocked by an answer that has already been given.
-    if (bestAudit.repliedAt === null) bestAudit.repliedAt = Date.now();
+    // S4: EVERY audit this reply answers, not just the highest one. Marking only the
+    // winner is what made gateScriptedReply re-template every later line for the rest of
+    // the window: the reply answered three audits, and two of them stayed unclaimed and
+    // unstamped, so each later line replayed them.
+    //
+    // One place, on purpose. Two callers stamping their own audit is how they came to
+    // disagree in Round 14.
+    const answeredAt = Date.now();
+    for (const audit of blocking) {
+      audit.claimed = true;
+      if (audit.repliedAt === null) audit.repliedAt = answeredAt;
+    }
     this.opts.log?.debug?.(
       { sender, audits: set.size, level: best?.level },
       "wellbeing gate dropped a reply for this sender",
@@ -903,8 +924,10 @@ private speakIfAuditFinds(
   // level, so a regex-caught concern followed by an audit-caught crisis produced the SHORT
   // crisis form - which drops the emergency guidance, the one thing a crisis reply must
   // carry.
+  // S2, same short-circuit and same fix: write first, then decide.
+  const wrote = this.noteWellbeingAnswered(sender, level);
   const escalation = already && verdict?.imminent === true && this.wellbeingState_.lastLevel(sender) !== "crisis";
-  const escalated = escalation || this.noteWellbeingAnswered(sender, level).escalation;
+  const escalated = escalation || wrote.escalation;
   // The cooldown shortens. It does not veto.
   const alreadyAnswered = already && !escalated;
 
@@ -977,7 +1000,10 @@ async gateScriptedReply(
   const audit = this.startAudit(sender, message);
   if (!audit) return false;
   this.registerAudit(audit);
-  const verdict = await this.settleAudit(audit, audit.startedAt);
+  // S4: through awaitSenderAudits, not settleAudit, so this path marks claimed and
+  // repliedAt exactly as the model-reply path does. Round 14's R6 bug reached the honesty
+  // shortcut precisely because this one settled its own audit and stamped nothing.
+  const verdict = await this.awaitSenderAudits(sender, audit.startedAt);
   if (!this.auditBlocksReply(verdict)) {
     // Nothing blocking: the scripted line may go, and the audit stays on the record in
     // case this player's NEXT line deserves a different answer.
@@ -1026,7 +1052,8 @@ async gateOwnLine(sender: string): Promise<boolean> {
  */
 isGentleWindow(sender: string): boolean {
   const at = this.wellbeingState_.lastContact(sender);
-  return at !== null && Date.now() - at < GENTLE_MODE_MS;
+  if (at === null) return false;
+    return Date.now() - at < (this.opts.gentleModeMs ?? GENTLE_MODE_MS);
 }
 
 private async classifyWellbeing(message: string): Promise<ClassifierVerdict | null> {
