@@ -7,6 +7,31 @@ like a warm, funny, loyal friend.
 The full design — memory, emotions, his own mind, and the honesty rules — is in
 **[docs/VISION.md](docs/VISION.md)**. This file is how to run and build it.
 
+
+## First run
+
+Before Elix does anything for you, do these six things. `elix doctor` checks the first two,
+and `elix status` is how you see whether any of them worked.
+
+1. **Add your Minecraft name to `owners` in `config/elix.yaml`.** Until you do, nobody can
+   command Elix - including you. The list is empty on purpose.
+2. **Read the warning about `owners` in that same file.** On a server running
+   `online-mode=false`, the server accepts *any* username, so anybody who can reach the port
+   and guesses an owner's name is obeyed. That list is only as safe as your server's login and
+   your firewall; a longer list does not make it safer.
+3. **Firewall the server port to your own IP.** On a public address with online-mode off,
+   somebody will find it eventually.
+4. **If either API key was ever shared, pasted into a chat, or committed: rotate it.** The
+   test `pnpm test tests/unit/secrets.test.ts` tells you whether anything is in the tree, but
+   a rotated key is the only actual fix.
+5. **Run `pnpm e2e` before trusting anything:**
+   `pnpm exec tsx scripts/e2e-chat.ts --owners <yourName>`
+6. **Run `elix doctor` and clear every warning it prints.**
+
+Then `pnpm start`, detached. Elix comes when you ask, and not otherwise.
+
+---
+
 ## Commands (follow / come / stop)
 
 Elix answers a short, fixed list of movement commands, in English and in Roman Urdu.
