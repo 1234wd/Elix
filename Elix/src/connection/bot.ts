@@ -34,6 +34,21 @@ import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type
 import { ReflexRunner } from "../reflexes/runner.js";
 import { isHostileMob } from "../reflexes/hostile.js";
 import { DefendController, type DefendView } from "../reflexes/defend.js";
+import {
+  HeadTurner,
+  IdleGlances,
+  LOOK_TICK_MS,
+  MIN_IDLE_GLANCE_MS,
+  crouchCount,
+  isSuppressed,
+  noteCrouchGreet,
+  pickGlanceSubject,
+  poseToward,
+  shouldCrouchGreet,
+  type CrouchLog,
+  type LookSuppression,
+  type Vec3Like as LookVec3Like,
+} from "../humanizer/look.js";
 import type { EquipSlot } from "../reflexes/tables.js";
 import type { CreatureLike, ReflexView, StackLike } from "../reflexes/decide.js";
 import { exitCleanly } from "../core/exit.js";
@@ -234,6 +249,9 @@ export const HURT_LINE_WINDOW_MS = 5 * 60_000;
 
 /** WP3: the one line Elix may say after a player hits him. */
 export const HURT_BY_A_PLAYER = "hey - that one hurt.";
+
+/** WP4: the gap between the sneak toggles of one crouch-greeting. */
+export const SNEAK_TOGGLE_MS = 220;
 
 export const PRESENCE_POLL_MS = 2_000;
 
@@ -1075,6 +1093,18 @@ export class BotSession {
   private follow: FollowController | null = null;
   /** C: one refusal per player per REFUSAL_THROTTLE_MS. */
   private readonly refusalThrottle = new RefusalThrottle();
+  /** WP4: the eased head turn. */
+  private head: HeadTurner | null = null;
+  /** WP4: the idle-glance schedule. */
+  private glances: IdleGlances | null = null;
+  /** WP4: when each owner was last crouch-greeted. */
+  private crouchGreetedAt: CrouchLog = {};
+  /** WP4: when Elix last glanced at anybody, so a glance is not repeated in one breath. */
+  private lastGlancedAt = 0;
+  /** WP4: sneak toggles still owed for a crouch-greeting. */
+  private sneakTogglesLeft = 0;
+  /** WP4: when the last sneak toggle was sent. */
+  private lastSneakAt = 0;
   /** WP3: the defender. */
   private defend: DefendController | null = null;
   /** WP3: when a player last hit Elix. Zero means nobody has. */
@@ -1168,6 +1198,138 @@ export class BotSession {
       .catch(() => {
         // A failed gate must not throw into the tick.
       });
+  }
+
+  /**
+   * WP4: the gaze, once per tick, and only while there is nothing better to do.
+   *
+   * Two rules this method exists to enforce:
+   *
+   *   - SUPPRESSION. Combat, follow and a wellbeing reply all stop the gaze dead. Elix does
+   *     not glance around while he is defending somebody or answering a sad message.
+   *   - NO TALKING. This method never sends a line. Greets and progress are somebody else's
+   *     job, through the gates.
+   */
+  private runGaze(bot: BotLike): void {
+    const head = this.head;
+    const glances = this.glances;
+    if (head === null || glances === null) return;
+    const now = Date.now();
+    const state = this.gazeState(bot);
+    const me = bot.entity?.position;
+    if (me === undefined) return;
+    const eye = { x: me.x, y: me.y, z: me.z };
+
+    const candidates = this.gazeCandidates(bot);
+
+    if (isSuppressed(state)) {
+      // Stop an in-flight turn rather than leaving the head swinging, and drop any
+      // half-finished greeting: a sneak toggle left on is Elix crouching for no reason.
+      head.cancel();
+      this.sneakTogglesLeft = 0;
+      this.setSneak(bot, false);
+      return;
+    }
+
+    // Finish a greeting that is already under way.
+    if (this.sneakTogglesLeft > 0 && now - this.lastSneakAt >= SNEAK_TOGGLE_MS) {
+      this.lastSneakAt = now;
+      this.sneakTogglesLeft -= 1;
+      this.setSneak(bot, this.sneakTogglesLeft % 2 === 1);
+    }
+
+    // Start one, for an owner who is here and has not been greeted lately. Never during
+    // gentle mode - isSuppressed above does not cover that, so mayCrouchGreet does.
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    for (const candidate of candidates) {
+      if (!candidate.isPlayer) continue;
+      if (!owners.includes(candidate.name.toLowerCase())) continue;
+      if (!shouldCrouchGreet(candidate.name, now, this.crouchGreetedAt, state)) continue;
+      noteCrouchGreet(candidate.name, now, this.crouchGreetedAt);
+      this.sneakTogglesLeft = crouchCount(candidate.name);
+      this.lastSneakAt = now;
+      head.aimAt(poseToward(eye, candidate.position), now, candidate.name);
+      break;
+    }
+
+    const subject = pickGlanceSubject(eye, candidates);
+    if (subject === null) return;
+
+    // A glance only now and then, and never twice in one breath.
+    if (glances.due(now, state) && now - this.lastGlancedAt >= MIN_IDLE_GLANCE_MS) {
+      this.lastGlancedAt = now;
+      glances.schedule(now, subject.name);
+      head.aimAt(poseToward(eye, subject.position), now, subject.name);
+    }
+    const pose = head.tick(now);
+    if (pose !== null) {
+      const look = (bot as { look?: (y: number, p: number, force?: boolean) => void }).look;
+      if (typeof look === "function") {
+        try {
+          look.call(bot, pose.yaw, pose.pitch, false);
+        } catch {
+          // A look the server rejects is not worth a tick.
+        }
+      }
+    }
+  }
+
+  /**
+   * What would stop the gaze right now.
+   *
+   * Every field is read from state the rest of the session already owns - nothing here
+   * decides anything, it only reports:
+   *
+   *   - `combat` is the defender's own engagement flag;
+   *   - `following` is the follow controller's own busy flag;
+   *   - `wellbeingReply` is "is an audit in flight for anybody", which is the bridge's own
+   *     answer to "is a reply being composed right now";
+   *   - `gentleMode` uses `wellbeingQuietMs` - the SAME window the initiative engine uses -
+   *     so Elix is quiet for exactly as long as he decided to be quiet.
+   */
+  private gazeState(bot: BotLike): LookSuppression {
+    const quiet = this.deps.config.initiative?.wellbeingQuietMs ?? DEFAULT_INITIATIVE.wellbeingQuietMs;
+    const inFlight = this.deps.chatBridge?.inFlightCount ?? 0;
+    let quietForSomebody = false;
+    for (const name of Object.keys(bot.players ?? {})) {
+      const last = this.ownWellbeingState.lastContact(name);
+      if (last !== null && Date.now() - last < quiet) quietForSomebody = true;
+    }
+    return {
+      combat: this.defend?.engaged === true,
+      following: this.follow?.busy === true,
+      wellbeingReply: inFlight > 0,
+      gentleMode: quietForSomebody,
+    };
+  }
+
+  /** mineflayer's setControlState, guarded. A bot that cannot sneak is not a crash. */
+  private setSneak(bot: BotLike, on: boolean): void {
+    const set = (bot as { setControlState?: (k: string, v: boolean) => void }).setControlState;
+    if (typeof set !== "function") return;
+    try {
+      set.call(bot, "sneak", on);
+    } catch {
+      // Nothing to do about it.
+    }
+  }
+
+  /** Players and mobs close enough to be worth looking at. */
+  private gazeCandidates(bot: BotLike): Array<{ name: string; position: LookVec3Like; isPlayer: boolean }> {
+    const out: Array<{ name: string; position: LookVec3Like; isPlayer: boolean }> = [];
+    for (const [name, player] of Object.entries(bot.players ?? {})) {
+      const pos = playerPosition(player);
+      if (pos === undefined) continue;
+      out.push({ name, position: pos, isPlayer: true });
+    }
+    const raw = (bot as { entities?: Record<string, unknown> }).entities ?? {};
+    for (const key of Object.keys(raw)) {
+      const entity = entityOf(raw[key]);
+      if (entity === null || entity.isValid === false) continue;
+      if (entity.type === "player") continue; // already added above
+      out.push({ name: entity.name, position: entity.position, isPlayer: false });
+    }
+    return out;
   }
 
   /** C: the follow tick, so a stop takes effect inside one tick. */
@@ -1346,6 +1508,12 @@ export class BotSession {
     // only things it can reach in the world are a swing and a step backwards.
     this.defend = new DefendController(this.deps.config.skillCap ?? "normal");
     this.hurtByPlayerAt = 0;
+    // WP4: the gaze. A head turner, an idle-glance schedule and a greeting log, all driven
+    // from the same 50 ms tick, and all suppressed while Elix has something to do.
+    this.head = new HeadTurner(LOOK_TICK_MS);
+    this.glances = new IdleGlances();
+    this.crouchGreetedAt = {};
+    this.glances.schedule(Date.now(), "startup");
     this.followTimer = setInterval(() => {
       if (this.shutdownRequested || this.ended) return;
       // WP3 first: a hostile mob next to the owner outranks everything below.
@@ -1356,6 +1524,8 @@ export class BotSession {
       // tick after the danger is gone - `interruptedFollow` is the only state needed.
       const holding = this.runReflexes();
       if (!holding) this.follow?.tick(this.followTarget(bot), stopForHazard(bot));
+      // WP4 last, and only when nothing above claimed the tick.
+      if (!holding) this.runGaze(bot);
       // "come" ends itself once it is standing where it was asked to stand.
       const goal = this.comeTargetReached(bot);
       if (goal) this.follow?.arrive();
@@ -1856,6 +2026,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // reaction delay that started before the stop.
     this.defend?.stop();
     this.hurtByPlayer = null;
+    // WP4: a stop drops the turn and the pending glance, so the head is not left mid-swing.
+    this.head?.cancel();
+    this.glances?.clear();
       log.info({ username, matched: command.matched }, "command: stop");
       this.say?.say(ACKNOWLEDGEMENTS.stop);
       return true;
