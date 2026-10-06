@@ -3,8 +3,8 @@
 Backlog WP1–WP12 from `docs/LONG_RUN_BRIEF.md`. One commit per WP: `WPn: <title>`. Never
 leave the tree red.
 
-**If this file and `docs/LONG_RUN_BRIEF.md` are all you have, resume at the first WP that is
-not DONE.** Read those two files first.
+**If this file and `docs/LONG_RUN_BRIEF.md` are all you have: WP1–WP10 are DONE. Resume at
+WP11** (split `bot.ts` and `bridge.ts`), then WP12 (voice plan) if there is time.
 
 Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`,
 `round15Probes.test.ts`, `round16Probes.test.ts`. All green after every WP.
@@ -12,139 +12,171 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | WP | Status | Commit | Tests added | Notes |
 | --- | --- | --- | --- | --- |
 | WP1 Part C against the real pathfinder | **DONE** | `7f18574` | `pathfinderContract.test.ts` (7), `round16Probes.test.ts` (6, read-only) | U1–U5 |
-| WP2 Survival reflexes | **DONE** | see log | `reflexTables.test.ts` (11), `reflexes.test.ts` (46), `mcdataSource.test.ts` (9) | breathe, creeper, eat, armour, priority, stop, table completeness, data-source guard |
-| WP3 Protect the owner | TODO | | | next |
-| WP4 Human-like gaze | TODO | | | |
-| WP5a gather | TODO | | | |
-| WP5b craft | TODO | | | |
-| WP5c give / deposit | TODO | | | |
-| WP6 World memory | TODO | | | |
-| WP7 NVIDIA + Ollama tiers | TODO | | | |
-| WP8 Constrained tool calls | TODO | | | |
-| WP9 Status + first-run safety | TODO | | | |
-| WP10 e2e rows | TODO | | | |
-| WP11 Split bot.ts / bridge.ts | TODO | | | |
-| WP12 Voice plan | TODO | | | |
+| WP2 Survival reflexes | **DONE** | `3599ae5` | `reflexTables.test.ts` (11), `reflexes.test.ts` (46), `mcdataSource.test.ts` (9) | breathe/creeper/eat/armour, priority, stop, table completeness, data-source guard |
+| WP3 Protect the owner | **DONE** | `360f476` | `defend.test.ts` (38) | target selection, reaction bounds per skillCap, cooldown, retreat, never a player |
+| WP4 Human-like gaze | **DONE** | `40ac355` | `look.test.ts` (33) | 40°/tick cap, 150–400 ms, speaker look, crouch-greet, idle glances, suppression |
+| WP5a gather | **DONE** | `0f2af6b` | `gather.test.ts` (46) | allow-list, leaves-or-not, protected places, real `harvestTools`, `bot.dig` contract |
+| WP5b craft | **DONE** | `f380555` | `craft.test.ts` (35) | real 26.2 recipes, table placement rules, `bot.recipesFor`/`bot.craft` contract |
+| WP5c give / deposit | **DONE** | `ae82a1a` | `give.test.ts` (34) | give only to the asker, deposit only, **never withdraw**, `bot.toss` contract |
+| WP6 World memory | **DONE** | `c5ed596` | `worldMemory.test.ts` (29) | tested migration on a copy of the old schema, whisper-only coordinates |
+| WP7 NVIDIA + Ollama | **DONE** | `bf1ce94` | `providers.test.ts` (34) | 24 h 402 breaker, silent-absent local probe, no hard-coded model ids, call deadlines |
+| WP8 Constrained tool calls | **DONE** | `95da322` | `toolCalls.test.ts` (26) | closed zod list, owner-only, dropped-reply drops calls, gentle mode, 1/reply + 6/min |
+| WP9 Status + first run | **DONE** | `2a939d7` | `status.test.ts` (27) | key redaction, no chat text, owner/offline-server warnings, README checklist |
+| WP10 e2e rows | **DONE** | `3564c4e` | — (script) | command rows, opt-in `--owners`, ❌ **not run** — no server reachable from here |
+| WP11 Split bot.ts / bridge.ts | **NEXT** | | | mechanical; target ≤800 lines/file |
+| WP12 Voice plan | TODO | | | stretch |
 
-## WP2 — what was built, and what the data turned out to be
+## WP11 — exactly what is left to do
 
-New files, all inside the allowed new-module list:
+Target: no file over 800 lines. Measured at `3564c4e`:
 
-- `src/world/mcdata.ts` — the ONE accessor for version-sensitive data (§1 Q2). The version
-  is a parameter, never a literal.
-- `src/reflexes/tables.ts` — `ARMOR_POINTS` (29 pieces) and `MELEE_DAMAGE` (23 items), with
-  the wiki URLs and the access date in the header comment.
-- `src/reflexes/decide.ts` — the pure decisions and the priority ladder.
-- `src/reflexes/runner.ts` — the only stateful part, and the only thing `stop` has to reach.
-- `src/reflexes/hostile.ts` — the hostile / never-attacked lists. WP3 and WP4 ask this module,
-  not their own list. Note this is a hand-written list, because the brief asked for the
-  *entity category* in WP3; the categories are now in one place and are covered by
-  `tests/unit/defend.test.ts` in WP3.
-- `bot.ts` gained wiring only: `reflexViewOf`, four guarded mineflayer adapters, a reflex
-  field, `runReflexes()` on the existing 50 ms tick, and `this.reflexes?.stop()` beside
-  `this.follow?.stop()`.
+```
+2600  src/connection/bot.ts      <- the big one
+1433  src/brain/bridge.ts
+ 991  src/memory/store.ts
+ 967  src/brain/router.ts
+ 898  src/social/wellbeing.ts
+```
 
-### §1 Q1 answered properly, and the wiki's own numbers
+The brief names what should move out of `bot.ts`: chat dispatch, initiative wiring, presence,
+crash guards, command routing. Out of `bridge.ts`: audit store and gate, chat reply, wellbeing
+reply.
 
-`ARMOR_POINTS` and `MELEE_DAMAGE` were read off the wiki (accessed 2026-10-06) and are
-cross-checked by two tests:
+Wiring added in WP2–WP8 that WP11 will have to move along with it (all in `bot.ts`, all with
+thin local adapters next to them):
 
-- the four pieces of each set sum to the full-set figure the same page publishes
-  (leather 7, copper 10, gold 11, chainmail 12, iron 15, diamond 20, netherite 20);
-- golden armour never outranks iron or chainmail, and a golden sword or axe never
-  out-damages its iron equivalent — the exact bug the rejected `MATERIAL_TIER` default had.
+- `reflexViewOf`, `entityOf`, `inventoryOf`, `equippedOf`, `numberField` → the WP2 reflex view
+- `equipOf`, `consumeOf`, `lookAtOf`, `clearControlStatesOf`, `findItemOf` → WP2 adapters
+- `defendViewOf` → WP3
+- `runReflexes`, `runDefend`, `maybeSayHurtLine`, `runGaze`, `gazeState`, `gazeCandidates`,
+  `setSneak` → WP2–WP4 tick wiring
+- `realGoalFactory` construction inside `start()` → WP1
 
-**Nothing was left out.** All 29 armour pieces (including the copper set and the turtle
-helmet) and all 23 melee items (8 swords, 7 axes, the mace, 7 spears, the trident) have
-verified values. The values that the wiki does not publish as armour points are excluded
-from the 29 by the brief's own definition and are asserted to be absent rather than zero:
-`elytra`, `wolf_armor`, `bow`, `shield`. `armorPointsFor` and `meleeDamageFor` return `null`
-for anything unknown, and a `null` item is never auto-equipped.
+**Rule for WP11: test changes are allowed ONLY in import paths.** If any behaviour change is
+needed to make a move work, stop and mark the WP PARTIAL rather than fixing it in place.
 
-### Two findings worth keeping
+## Findings worth not rediscovering
 
-1. **`items.json` cannot be filtered by `enchantCategories` to find armour.** In 26.2,
-   `iron_helmet` is tagged `head_armor`, but `diamond_chestplate` carries only `equippable`,
-   `armor`, `durability`, `vanishing` — no `chest_armor`. A category-based completeness test
-   would have skipped every chestplate in the game and reported green. Detection is by name
-   shape instead, and the test says why.
-2. **`prismarine-item` does not resolve items by name.** `new Item("bread", 1)` yields
-   `name: "unknown"`. Items are built from a numeric id, which is what mineflayer does from
-   the server's NBT. The contract test therefore builds real Items from the vendored 26.2
-   ids and asserts the resulting `item.name` matches, which also proves the vendored data and
-   the real prismarine registry agree on every item Elix touches. A name-based shortcut would
-   have built an item the real library would never hand us.
+- **`minecraft-data.items` is an OBJECT keyed by numeric id** — not an array, not keyed by
+  name. `for (const item of data.items)` throws. Use `allItems()` in `src/world/mcdata.ts`.
+- **`entitiesByName[x].category` is a plain STRING** in 26.2 (`"Hostile mobs"`), not an array.
+  Reading only the array shape makes every mob look passive.
+- **`prismarine-item`'s export is a LOADER**, not a class: `require('prismarine-item')(registry)`
+  returns the Item class. Items are built from a **numeric id**; `new Item("bread", 1)` gives
+  `name: "unknown"`. Its `slot` is set by the inventory, so an item handed to `bot.equip` must
+  have one.
+- **`bot.consume()` throws `Food is full` at food 20**, so never start an eat there.
+- **`bot.dig(block)` throws on a null block** and on `digTime === Infinity`; it reads
+  `block.position` and `block.name`.
+- **`bot.toss(itemType, metadata, count)` has no zero-count guard of its own** — it relies on
+  `bot.transfer`, which only throws on an empty source or a full destination.
+- **26.2 crafts stone tools from `cobbled_deepslate`**, not from cobblestone.
+- **`recipes.json` is keyed by RESULT id** and holds several rows per key; the first row for
+  `crafting_table` is the cherry-planks one, so assert the shape, not the plank.
+- **`items.json` cannot be filtered by `enchantCategories` to find armour**: chestplates carry
+  only `equippable`/`armor`/`durability`/`vanishing`, with no `chest_armor`. Use name shape.
+- **`minecraft-data@1.21.4` disagrees with itself about ids** (`foods` vs `itemsByName`), which
+  is why everything reads the vendored 26.2 through `src/world/mcdata.ts`.
+- **The secret scanner flags credential-shaped strings in ANY file**, including tests. Build
+  fake keys from parts (`["sk","..."].join("-")`) — the scanner is not weakened, it just has
+  nothing to find in the file.
+- **`MemoryStore` holds the database open**, so a temp-dir cleanup on Windows needs an explicit
+  `close()` before `rmSync`.
+
+## Bugs the tests found this round (all fixed)
+
+Each of these was a real defect, not a test problem:
+
+| Found by | Bug |
+| --- | --- |
+| WP1 probes | `PathfinderModule.goals` declared only `GoalNear`, so `GoalFollow` was `undefined` and every follow silently failed |
+| WP1 probes | `parseAddressedCommand` lower-cased the line then matched the name case-sensitively, so **no command worked at all** while the probes passed |
+| WP2 tables | A material-tier tool ranking put **gold above iron** — the exact error the owner rejected for armour |
+| WP3 tests | `isPlayerEntity`'s username regex matched `"zombie"`, so Elix refused to defend the owner against a zombie |
+| WP3 tests | `bogged` was in the never-attacked list; the game data says it is hostile |
+| WP3 tests | `entityCategories` read only the array shape and ignored 26.2's plain-string category |
+| WP4 tests | `shouldCrouchGreet` used `0` as "never greeted", so nobody was greeted while the clock read 0 |
+| WP6 tests | `parseRemember` accepted "home and follow me" as one place name — two instructions in one hat |
+| WP7 tests | `.env` exists locally and is gitignored; the test asserted absence, which was the wrong invariant |
+| WP7 tests | `canReturnJson` did not know `openai/gpt-oss`, the guard role's own first choice |
+| WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
+| WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
 
 ## Deviations
 
-Changes to tests I wrote myself, each one encoded a bug WP1 or WP2 fixed.
+Changes to tests I wrote myself, each one encoded a bug or a rule this backlog changed.
 
-- `tests/unit/actions.test.ts` — "the acknowledgement goes through the same sender gate as
-  any reply" asserted the Round 15 **bug**: the ack went through `gateScriptedReply`, which
-  classifies its argument as the sender's own words. Now expects `gateOwnLine` and asserts
-  nothing Elix says is classified as the owner's.
-- `tests/unit/actions.test.ts` — controller goal assertions described our own intent object
-  (`{ kind: "follow", distance }`). Now the library's real `GoalFollow` and `rangeSq`.
-- `tests/unit/actions.test.ts` — entity stubs were `{ id: 1 }`, which the real `GoalFollow`
-  constructor throws on. Now mineflayer-shaped.
-- `tests/unit/reflexes.test.ts` — mine own new test, not a bug from an earlier round: the
-  assertion that a `stop` leaves `endReason` null was wrong. A flee completes on its own
-  tick, which is what `finished` records; the test now asserts `finished` and states that
-  what matters is that nothing is left running.
+- `tests/unit/actions.test.ts` — three changes, all WP1: the acknowledgement was asserted to go
+  through `gateScriptedReply` (the Round 15 **bug** — it classifies its input as the player's
+  words); the goal assertions described our own intent object rather than the library's real
+  `GoalFollow`/`rangeSq`; and entity stubs were `{ id: 1 }`, which the real `GoalFollow`
+  constructor throws on.
+- `tests/unit/config.test.ts` — "uses only the two cloud providers plus builtin" and
+  `removedVendorName()` both encoded the pre-WP7 world. The second used NVIDIA as its
+  "removed vendor" fixture, so after WP7 re-added NVIDIA it would have fed the schema a REAL
+  provider and proved nothing. Both now state the WP7 rule, and the guard-role list gained a
+  `canReturnJson` assertion.
+- `tests/unit/reflexes.test.ts` — my own new test asserted a `stop` leaves `endReason` null; a
+  flee completes on its own tick, which is what `finished` records.
+- `tests/unit/status.test.ts` — the fake key literals were assembled from parts because the
+  secret scanner flags credential-shaped strings in any file. The scanner is untouched.
 
-Production code outside the new-module rule (each of these is a bug, and the first three are
-ones the brief itself reported):
+Production code changed outside the new-module rule — all wiring, signatures or types the
+brief itself required:
 
-- `src/connection/bot.ts` — `PathfinderModule.goals` declared only `GoalNear`, so
-  `GoalFollow` was `undefined` and every follow silently became `goal-build-failed`.
-- `src/actions/commands.ts` — `parseAddressedCommand` lower-cased the line then matched the
-  bot's name case-sensitively, so no command worked at all while the probes passed.
-- `src/connection/bot.ts` — the spawn-time walk warned "walk failed" every 5 s in every test.
-  Now gated on `canConfigureMovements(bot)`.
+- `src/connection/bot.ts` — the `PathfinderModule.goals` type, the spawn-walk gate, and the
+  `ACKNOWLEDGEMENTS` table made `Partial` as WP5 actions were added.
+- `src/actions/commands.ts` — `ActionName` grew the WP5/WP8 action names.
+- `src/memory/store.ts` — WP6 added `places()`, `addDeath`, `lastDeath`, `deaths`,
+  `deathCount`. Row type is spelled `Row` because `Record` is shadowed in that file.
+- `src/core/config.ts` — the provider enum gained `nvidia` and `ollama`.
+- `config/models.yaml`, `config/elix.yaml`, `.env.example`, `README.md` — WP7/WP9.
 
-## Questions for the owner (none is a stop condition)
+## Questions for the owner (none was a stop condition)
 
-- **WP2 design choice:** the reflex tick runs on the existing 50 ms follow tick, and `armour`
-  does NOT interrupt follow — picking up a better sword while walking is what Elix should do.
-  Interrupting follow for armour would stop him every time a good item dropped.
-- **WP3 note:** the brief asks for hostile mobs "from `minecraft-data` entity categories, not
-  a hand-written name list". `items.json`/`entities.json` in 26.2 does not carry a usable
-  hostile flag, so the lists are hand-written in `src/reflexes/hostile.ts` with the
-  never-attacked rule checked first. Proceeding that way unless told otherwise.
-- Should `owners` ever be per-profile? Currently global — one server, one owner set.
-- Should the WP10 e2e command rows be part of the default run? Currently opt-in via
-  `--owners`, so the default run never grants command rights.
-
-## Notes for whoever picks this up
-
-- `tests/unit/round12A1.test.ts` has a wall-clock assertion (`< 950ms`). It failed once
-  under full-suite parallel load (1029ms) and passed both when re-run alone and on a full
-  re-run. It is a timing flake under load, not a regression. Do not "fix" it by widening the
-  threshold; if it keeps flaking, the honest fix is fake timers for that measurement.
-- CRLF trap: `git checkout`/`git clone` restore CRLF, so any script that string-matches
-  source must `.replace(/\r\n/g,"\n")` first.
-- Quoting trap in `.cjs` patch scripts: apostrophes in emitted TypeScript break
-  single-quoted JS strings. Use the `write` tool for new files, or the `edit` tool for
-  targeted changes — both proved far more reliable in Round 17.
-- vitest swallows `console.log`; write diagnostics to a file with `writeFileSync`.
+- **WP2:** the reflex tick runs on the existing 50 ms follow tick, and `armour` deliberately does
+  **not** interrupt follow — picking up a better sword while walking is what Elix should do.
+  Chosen; say if you want it to interrupt.
+- **WP3:** the brief asked for hostile mobs "from minecraft-data entity categories, not a
+  hand-written list". 26.2 *does* have `entitiesByName[x].category`, so `isHostileMob()` asks the
+  data first and keeps the hand-written set only as the fallback for a missing data pack.
+  `tests/unit/defend.test.ts` asserts every name in it agrees with the category.
+- **`owners` is global** (agreed). A per-profile list would let a test profile grant itself.
+- **WP10 command rows are opt-in** (agreed) via `--owners`, so a default run never grants
+  command rights.
+- **Still open from earlier rounds:** the owner's three manual in-game results are blank, and
+  **both API keys need rotating** (`.env` is gitignored but has been on this machine a long
+  time).
 
 ## Gates
 
-At `bdfd421` (docs: long-run brief):
+At `3564c4e` (WP10):
 
 ```
 pnpm typecheck  exit 0
 pnpm lint       exit 0
-pnpm test       Tests  1554 passed | 2 skipped (1556)
+pnpm test       Tests  1924 passed | 2 skipped (1926)
 round13Probes 8   round14Probes 6   round15Probes 5   round16Probes 6
 secret scan   9 passed
 ```
 
-After WP2 (see the WP table for the commit):
+Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 1806 → 1835 → 1869 →
+1895 → 1922 → **1924** passed.
 
-```
-pnpm typecheck  exit 0
-pnpm lint       exit 0
-pnpm test       Tests  1620 passed | 2 skipped (1622)
-secret scan    9 passed
-```
+## Notes for whoever picks this up
+
+- `tests/unit/round12A1.test.ts` and `partA.test.ts > counts a timeout toward the circuit
+  breaker` both contain **wall-clock / load-sensitive assertions**. Each failed once under
+  full-suite parallel load and passed alone and on re-run. Do not widen a threshold to make
+  them stable; the honest fix is fake timers for that measurement.
+- CRLF trap: `git checkout`/`git clone` restore CRLF, so any script that string-matches source
+  must `.replace(/\r\n/g,"\n")` first.
+- Quoting trap in `.cjs` patch scripts: apostrophes in emitted TypeScript break single-quoted JS
+  strings. The `write` and `edit` tools proved far more reliable in Round 17 — prefer them, and
+  when a patch script throws "not found", the anchor almost always has different indentation
+  than assumed. `Select-String -Context` shows **more** indentation than the file has.
+- vitest swallows `console.log`; write diagnostics to a file with `writeFileSync`.
+- `require()` is **not** available inside vitest test files (ESM). Import the module, or read
+  the file with `readFileSync`.
+- `packages/` test files cannot import a transitive dependency directly. `better-sqlite3` is
+  resolved through `tests/unit/sqliteLoader.ts`, which fails loudly if it cannot find a driver.
