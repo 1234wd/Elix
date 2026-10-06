@@ -12,3 +12,4 @@ build/
 # The real code is the folder, so archives are never wanted here.
 *.zip
 Elix.zip
+opencode.json
