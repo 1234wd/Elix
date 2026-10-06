@@ -181,7 +181,7 @@ export type ServerProfile = z.infer<typeof profileSchema>;
  * `builtin` is Elix's own scripted fallback code — scripted chat lines and an
  * FTS5-only retrieval path. It is NOT a downloaded model, and it needs no key.
  */
-const providerNameSchema = z.enum(["groq", "hf", "builtin"]);
+const providerNameSchema = z.enum(["groq", "nvidia", "hf", "ollama", "builtin"]);
 
 const modelRefSchema = z.object({
   provider: providerNameSchema,

@@ -4,8 +4,16 @@
 # available match from each role's preference list. These are PREFERENCE LISTS,
 # not hard-coded IDs — if a model disappears, the next entry is used.
 #
-# Cloud AI only. Two providers: Groq (fast, generous free tier) and Hugging Face.
+# Four providers, in the vision's order:
+#   groq   fast, generous free tier
+#   nvidia https://integrate.api.nvidia.com/v1 - a 402 there opens a 24h breaker
+#   hf     chat fallback and embeddings; its free credit is tiny
+#   ollama local, NO key, and SILENTLY ABSENT when it is not running on localhost
 # The `builtin` provider is Elix's own scripted fallback code, not a model.
+#
+# WP7 added nvidia and ollama. Both resolve their model ids from GET /v1/models at startup,
+# so nothing below is a hard-coded id - they are SUBSTRINGS, matched against what the
+# server actually offers. A substring that matches nothing is skipped, not guessed at.
 #
 # If every cloud provider is down or out of quota, Elix says "brb, lag" and
 # keeps playing on reflex + skill code. Nothing is ever silent.
@@ -15,12 +23,18 @@ roles:
     preference:
       - { provider: groq, model: "openai/gpt-oss-20b" }
       - { provider: groq, model: "llama-3.1-8b-instant" }
+      # WP7: NVIDIA between Groq and HF, then local. Only instruct/chat models appear,
+      # because these two roles answer with JSON the guard's parser has to read back.
+      - { provider: nvidia, model: "llama-3.1-8b-instruct" }
+      - { provider: ollama, model: "instruct" }
       - { provider: hf, model: "meta-llama/Llama-3.3-70B-Instruct" }
   smart: # planning, hard questions, memory consolidation, reflection
     preference:
       - { provider: groq, model: "openai/gpt-oss-120b" }
       - { provider: groq, model: "qwen/qwen3.8-27b" }
       - { provider: groq, model: "llama-3.3-70b-versatile" }
+      - { provider: nvidia, model: "llama-3.3-70b-instruct" }
+      - { provider: ollama, model: "instruct" }
       - { provider: hf, model: "deepseek-ai/DeepSeek-V3" }
   stt: # voice -> text
     preference:
@@ -49,6 +63,12 @@ roles:
   # `keyword-regex` is last because it cannot return a verdict either. It degrades to the
   # regex floor, which is the same safe direction as an unavailable classifier.
   guard:
+    # WP7: NVIDIA and local Ollama are DELIBERATELY ABSENT from this role's list, and that is
+    # the point. The guard must return the JSON verdict in CLASSIFIER_POLICY; a model that
+    # cannot is worse than no model, because every classifier call that fell past the first
+    # entry used to return prose, failed parseVerdict and silently degraded to the regex
+    # floor. `providers/local.ts` has `canReturnJson()` for exactly this, and the entries
+    # below all satisfy it.
     preference:
       - { provider: groq, model: "openai/gpt-oss-safeguard-20b" }
       - { provider: groq, model: "openai/gpt-oss-20b" }
@@ -61,6 +81,16 @@ providers:
   hf:
     baseUrl: https://router.huggingface.co/v1
     env: HF_TOKEN
+  # WP7: NVIDIA sits between Groq and HF in the vision's order. A 402 here means "credits
+  # gone", not "try again shortly", so the router opens its breaker for 24 hours.
+  nvidia:
+    baseUrl: https://integrate.api.nvidia.com/v1
+    env: NVIDIA_API_KEY
+  # WP7: local Ollama. env is null because a local model has no account and no key - the
+  # router probes it at startup and it is silently absent when nothing is listening.
+  ollama:
+    baseUrl: http://127.0.0.1:11434/v1
+    env: null
   builtin:
     baseUrl: null
     env: null

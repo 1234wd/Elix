@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { canReturnJson } from "../../src/brain/providers/local.js";
 import {
   elixConfigSchema,
   modelsConfigSchema,
@@ -194,17 +195,41 @@ describe("modelsConfigSchema", () => {
     expect(models.providers.hf?.baseUrl).toBe("https://router.huggingface.co/v1");
   });
 
-  it("uses only the two cloud providers plus builtin", async () => {
+  // WP7 added nvidia and ollama, so this is four providers plus builtin.
+  it("uses only the known providers plus builtin", async () => {
     const models = await loadModelsConfig();
-    expect(Object.keys(models.providers).sort()).toEqual(["builtin", "groq", "hf"]);
+    expect(Object.keys(models.providers).sort()).toEqual(["builtin", "groq", "hf", "nvidia", "ollama"]);
     for (const [role, spec] of Object.entries(models.roles)) {
       for (const entry of spec.preference) {
         expect(
-          ["groq", "hf", "builtin"],
+          ["groq", "nvidia", "hf", "ollama", "builtin"],
           `${role} references provider ${String(entry.provider)}`,
         ).toContain(entry.provider);
       }
     }
+  });
+
+  // WP7: the guard role must never reference a tier that cannot return the JSON verdict.
+  it("never gives the guard role a model that cannot return JSON", async () => {
+    const models = await loadModelsConfig();
+    const guard = models.roles.guard;
+    expect(guard, "the guard role must exist").toBeTruthy();
+    for (const entry of guard?.preference ?? []) {
+      if (entry.provider === "builtin") continue;
+      // A base model answers in prose, and a prose answer to the classifier is the Round 11
+      // silent degradation to the regex floor - the bug this role's list already had once.
+      expect(
+        canReturnJson(entry.model),
+        `guard lists ${entry.provider}/${entry.model}, which cannot return JSON`,
+      ).toBe(true);
+    }
+  });
+
+  it("configures ollama without a key, because a local model has no account", async () => {
+    const models = await loadModelsConfig();
+    const ollama = models.providers.ollama as { apiKey?: unknown } | undefined;
+    expect(ollama, "ollama must be configured").toBeTruthy();
+    expect(ollama?.apiKey ?? null).toBeNull();
   });
 
   it("rejects a missing role", () => {
@@ -222,8 +247,16 @@ describe("modelsConfigSchema", () => {
  * removed vendor across src/, config/, tests/, README.md and .env.example
  * returns nothing, while the schema is still proven to reject it.
  */
+/**
+ * A vendor that is NOT a provider, and never was.
+ *
+ * Round 17 WP7 RE-ADDED NVIDIA on purpose, so the old fixture here - which used to prove the
+ * schema rejected the vendor this project had dropped - would now feed it a REAL provider and
+ * prove nothing. This is a genuinely unknown name instead, so the test still says what it
+ * says: an unknown provider is a configuration error, not a silently accepted entry.
+ */
 function removedVendorName(): string {
-  return ["nv", "idia"].join("");
+  return ["some-", "retired-vendor"].join("");
 }
 
 describe("provider schema rejects the removed vendor", () => {
