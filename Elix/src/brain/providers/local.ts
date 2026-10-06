@@ -45,6 +45,26 @@ export const NVIDIA_CREDITS_BREAKER_MS = 24 * 60 * 60_000;
 /** How long the startup reachability probe waits. Local, so it must be quick. */
 export const OLLAMA_PROBE_TIMEOUT_MS = 1_500;
 
+/**
+ * Deadline for a real provider call.
+ *
+ * Not optional. `tests/unit/partA.test.ts` asserts that every provider call has one, because
+ * a chat completion with no deadline is how a bot hangs on a reply until somebody kills it -
+ * and that is the exact failure the owner reproduced. The Ollama startup probe has its own,
+ * shorter one above, because a local model that is not running must not cost 30 seconds.
+ */
+export const TIER_TIMEOUT_MS = 30_000;
+
+/** A signal that aborts after `ms`, merged with any caller signal. */
+function deadline(ms: number, caller?: AbortSignal): AbortSignal {
+  const own = AbortSignal.timeout(ms);
+  if (caller === undefined) return own;
+  // Two signals, one deadline: the caller can still give up early, and the deadline still
+  // fires when the caller does not.
+  const both = AbortSignal.any([own, caller]);
+  return both;
+}
+
 /** An error carrying the two things the router needs: the status and the headers. */
 export interface TierError extends Error {
   status?: number;
@@ -140,7 +160,7 @@ export class NvidiaProvider implements ProviderAdapter {
   async listModels(signal?: AbortSignal): Promise<string[]> {
     const res = await this.fetchImpl(`${this.baseUrl}/models`, {
       headers: { authorization: `Bearer ${this.apiKey}` },
-      ...(signal === undefined ? {} : { signal }),
+      signal: deadline(TIER_TIMEOUT_MS, signal),
     });
     if (!res.ok) {
       throw withStatus(new Error(`nvidia /models failed: ${res.status}`), res);
@@ -161,6 +181,7 @@ export class NvidiaProvider implements ProviderAdapter {
         max_tokens: req.maxTokens,
         temperature: req.temperature,
       }),
+      signal: deadline(TIER_TIMEOUT_MS, req.signal),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -214,7 +235,7 @@ export class OllamaProvider implements ProviderAdapter {
 
   async listModels(signal?: AbortSignal): Promise<string[]> {
     const res = await this.fetchImpl(`${this.baseUrl}/models`, {
-      ...(signal === undefined ? {} : { signal }),
+      signal: deadline(TIER_TIMEOUT_MS, signal),
     });
     if (!res.ok) {
       throw withStatus(new Error(`ollama /models failed: ${res.status}`), res);
@@ -235,6 +256,7 @@ export class OllamaProvider implements ProviderAdapter {
           temperature: req.temperature,
         },
       }),
+      signal: deadline(TIER_TIMEOUT_MS, req.signal),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");

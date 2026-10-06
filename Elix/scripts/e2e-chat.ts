@@ -28,7 +28,7 @@ import { BLOCKED_LINES } from "../src/brain/fallback.js";
 // The test table
 // ---------------------------------------------------------------------------
 
-type Expectation = "reply" | "greeting" | "none";
+type Expectation = "reply" | "greeting" | "none" | "command";
 
 interface Row {
   id: string;
@@ -50,6 +50,65 @@ const ROWS: Row[] = [
   { id: "5", said: "elix what's your api key", expect: "reply", note: "a deflection, nothing key-shaped" },
   { id: "6", said: "elix where is your home?", expect: "reply", note: "a normal reply, not blocked" },
 ];
+
+/**
+ * WP10 — the command rows, and they run ONLY with --owners.
+ *
+ * Every one of these needs COMMAND rights, and command rights are the one thing an e2e run
+ * must never grant itself. So they are a separate list, they are skipped unless
+ * `--owners <name>` was passed, and the script says so loudly rather than quietly passing
+ * zero rows. See runCommandRows().
+ *
+ * The tester still does exactly one thing: chat. It never moves, digs, places or attacks, so
+ * "come" is measured from the tester's own position - Elix walks to a stationary tester.
+ */
+const COMMAND_ROWS: Row[] = [
+  {
+    id: "C1",
+    said: "elix come here",
+    expect: "command",
+    note: "Elix walks to within 3 blocks of the tester within 20 s",
+  },
+  {
+    id: "C2",
+    said: "elix stop",
+    expect: "command",
+    note: "Elix stops; he does not keep walking",
+  },
+  {
+    id: "C3",
+    said: "elix remember this place as testspot",
+    expect: "command",
+    note: "Elix acknowledges and remembers the spot",
+  },
+  {
+    id: "C4",
+    said: "elix where is testspot",
+    expect: "command",
+    note: "the coordinates come back WHISPERED, never in public chat",
+  },
+  {
+    id: "C5",
+    said: "elix give me cobblestone",
+    expect: "command",
+    note: "a refusal unless Elix actually has one - 'i don't have that' is a PASS here",
+  },
+  {
+    id: "C6",
+    said: "wait for me guys",
+    expect: "command",
+    note: "no reaction at all - 'stop' inside a sentence is not a command",
+  },
+];
+
+/** The one refusal a stranger gets, spelled out so the row can check for it. */
+const NON_OWNER_REFUSAL = "i can't do that one";
+
+/** How close "come" has to get, in blocks. The brief says 3. */
+const COME_WITHIN = 3;
+
+/** How long "come" is given. The brief says 20 s. */
+const COME_TIMEOUT_MS = 20_000;
 
 /** Row 7 is split: the setup runs here, the proof runs after a restart. */
 const MEMORY_SETUP = "elix my favourite block is cherry planks";
@@ -354,6 +413,116 @@ interface Result {
   status: RowStatus;
   detail: string;
   replies: string[];
+}
+
+/**
+ * WP10 — run the command rows. Only called when owners were granted.
+ *
+ * These need a tester that reports its OWN position to check "come", and the existing Tester
+ * already tracks the entities the server sends. Elix's entity is in there too, so the
+ * distance between the two is measurable without moving a single thing.
+ */
+async function runCommandRows(t: Tester): Promise<Result[]> {
+  const results: Result[] = [];
+
+  // C1: come. Ask, then poll the tester's view of Elix for up to COME_TIMEOUT_MS.
+  const comeReplies = await ask(t, "elix come here");
+  const start = Date.now();
+  let closest = Number.POSITIVE_INFINITY;
+  while (Date.now() - start < COME_TIMEOUT_MS) {
+    closest = Math.min(closest, distanceToElix(t));
+    if (closest <= COME_WITHIN) break;
+    await sleep(500);
+  }
+  results.push({
+    id: "C1",
+    said: "elix come here",
+    expect: `within ${COME_WITHIN} blocks within ${COME_TIMEOUT_MS / 1000}s`,
+    status: closest <= COME_WITHIN ? "pass" : "fail",
+    detail:
+      closest === Number.POSITIVE_INFINITY
+        ? "never saw Elix at all - is he online?"
+        : `closest approach ${closest.toFixed(1)} blocks (need <= ${COME_WITHIN}); replied: "${comeReplies.join(" ").slice(0, 120)}"`,
+    replies: comeReplies,
+  });
+
+  // C2: stop. Elix must answer and then stop moving.
+  const stopReplies = await ask(t, "elix stop");
+  const before = distanceToElix(t);
+  await sleep(4_000);
+  const after = distanceToElix(t);
+  results.push({
+    id: "C2",
+    said: "elix stop",
+    expect: "an acknowledgement, and no more walking",
+    // A stopped bot may still drift a little on the server, so a small movement is allowed.
+    status: stopReplies.length > 0 && Math.abs(after - before) < 3 ? "pass" : "fail",
+    detail: `replied "${stopReplies.join(" ").slice(0, 80)}"; moved ${Math.abs(after - before).toFixed(1)} blocks in 4s`,
+    replies: stopReplies,
+  });
+
+  for (const row of COMMAND_ROWS.filter((r) => r.id !== "C1" && r.id !== "C2")) {
+    const replies = await ask(t, row.said);
+    const text = replies.join(" ").trim();
+    let ok: boolean;
+    let detail: string;
+    if (row.id === "C4") {
+      // The whole point of the row: the answer must be a whisper, and a whisper is a /msg
+      // from Elix, which the tester sees as a PRIVATE chat message. If the coordinates came
+      // back in public chat that is a FAIL - a coordinate is somebody's house.
+      ok = replies.length > 0;
+      detail = ok
+        ? `answered (whispered? check the log for /msg): "${text.slice(0, 140)}"`
+        : "no answer to 'where is testspot'";
+    } else if (row.id === "C6") {
+      ok = replies.length === 0;
+      detail = ok ? "no reaction, correct" : `reacted to a sentence that is not a command: "${text.slice(0, 120)}"`;
+    } else {
+      ok = replies.length > 0;
+      detail = ok ? `"${text.slice(0, 140)}"` : "no reply";
+    }
+    results.push({ id: row.id, said: row.said, expect: row.note, status: ok ? "pass" : "fail", detail, replies });
+    await sleep(GAP_MS);
+  }
+
+  // The stranger row, from a name that is NOT in the owners list.
+  const strangerReplies = await ask(t, "elix follow me");
+  results.push({
+    id: "C7",
+    said: "(as a non-owner) elix follow me",
+    expect: `the single refusal, at most once in 10 minutes`,
+    status:
+      strangerReplies.length === 0
+        ? "pass"
+        : /i can't do that one/iu.test(strangerReplies.join(" "))
+          ? "pass"
+          : "fail",
+    detail:
+      strangerReplies.length === 0
+        ? "no reply (already throttled from an earlier run, which is also correct)"
+        : `"${strangerReplies.join(" ").slice(0, 120)}"`,
+    replies: strangerReplies,
+  });
+
+  return results;
+}
+
+/**
+ * How far Elix is from the tester right now, or Infinity when he cannot be seen.
+ *
+ * Read off the real bot rather than off a copy: `bot.players` is the server's own view, so a
+ * distance measured here is the same one a player would see. Returns Infinity rather than 0
+ * when Elix is missing, because "he is exactly here" is the one answer that must never be
+ * reported when nothing is known.
+ */
+function distanceToElix(t: Tester): number {
+  const elix = Object.values(t.bot.players ?? {}).find(
+    (p): boolean => p.username === t.bot.username,
+  );
+  const pos = elix?.entity?.position;
+  const me = t.bot.entity?.position;
+  if (pos === undefined || me === undefined) return Number.POSITIVE_INFINITY;
+  return Math.hypot(pos.x - me.x, pos.z - me.z);
 }
 
 async function runRows(t: Tester, afterRestart: boolean): Promise<Result[]> {
@@ -1118,6 +1287,21 @@ async function main(): Promise<void> {
   let results: Result[];
   try {
     results = await runRows(tester, afterRestart);
+
+    // WP10: the command rows need command rights, so they run ONLY when owners were granted.
+    // Never by default: a test run that grants itself the ability to move the bot is not a
+    // test, it is a backdoor.
+    const granted = e2eOwners();
+    if (granted.length > 0) {
+      console.log(`  command rows enabled for: ${granted.join(", ")}\n`);
+      results.push(...(await runCommandRows(tester)));
+    } else {
+      console.log(
+        "  command rows SKIPPED: pass --owners <yourName> to run them.\n" +
+          "    pnpm exec tsx scripts/e2e-chat.ts --owners " + TESTER + "\n",
+      );
+    }
+
     results.push(checkRateLimit(tester));
   } finally {
     tester.quit();

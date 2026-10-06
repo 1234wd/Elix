@@ -71,6 +71,41 @@ describe("WP7 — NVIDIA", () => {
     expect(result.text).toBe("hello");
   });
 
+  it("every provider call carries a deadline, because a hung reply is a hung bot", async () => {
+    // tests/unit/partA.test.ts asserts this for the router; this asserts it for the two new
+    // adapters, so a future edit that drops the signal fails here first.
+    const seen: Array<AbortSignal | undefined> = [];
+    const fetch = (async (_url: string, init?: RequestInit) => {
+      seen.push(init?.signal ?? undefined);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as unknown as FetchLike;
+    const nvidia = new NvidiaProvider({ apiKey: "k", fetchImpl: fetch });
+    await nvidia.complete(REQ, "m");
+    await nvidia.listModels();
+    const ollama = new OllamaProvider({ fetchImpl: fetch });
+    await ollama.complete(REQ, "m");
+    await ollama.listModels();
+    expect(seen).toHaveLength(4);
+    for (const signal of seen) {
+      expect(signal, "a provider call went out with no signal at all").toBeInstanceOf(AbortSignal);
+      // And it is not already aborted, or every call would fail instantly.
+      expect(signal?.aborted).toBe(false);
+    }
+  });
+
+  it("a caller signal still aborts a provider call", async () => {
+    const caller = new AbortController();
+    const fetch = (async (_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    }) as unknown as FetchLike;
+    const nvidia = new NvidiaProvider({ apiKey: "k", fetchImpl: fetch });
+    const call = nvidia.complete({ ...REQ, signal: caller.signal }, "m");
+    caller.abort();
+    await expect(call).rejects.toThrow();
+  });
+
   it("lists models from /v1/models, and never from a hard-coded id", async () => {
     const fetch = responder(200, { data: [{ id: "nvidia/llama-3.1-8b-instruct" }, { id: "nvidia/mistral-7b" }] });
     const provider = new NvidiaProvider({ apiKey: "k", fetchImpl: fetch });
