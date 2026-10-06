@@ -31,6 +31,10 @@ import {
   type ActionName,
 } from "../actions/commands.js";
 import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
+import { ReflexRunner } from "../reflexes/runner.js";
+import { isHostileMob } from "../reflexes/hostile.js";
+import type { EquipSlot } from "../reflexes/tables.js";
+import type { CreatureLike, ReflexView, StackLike } from "../reflexes/decide.js";
 import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
@@ -657,6 +661,206 @@ export function requirePathfinder(): PathfinderModule {
  */
 const movementsReady = new WeakSet<object>();
 
+/**
+ * Assemble the reflex view from mineflayer's own fields.
+ *
+ * Every read is guarded at runtime rather than cast, because a fake bot and a real bot do
+ * not agree on which of these exist, and a reflex that throws on the tick takes the bot
+ * with it. `ReflexRunner` decides; this only reports.
+ */
+export function reflexViewOf(bot: BotLike): ReflexView {
+  const position = bot.entity?.position;
+  const me: Vec3Like = position ?? { x: 0, y: 64, z: 0 };
+  // bot.entity.isInWater exists on a real bot; a fake may not have it, and "not in water"
+  // is the safe reading because "breathe" is the one reflex that must never fire on a guess.
+  const inWater = (bot.entity as { isInWater?: unknown } | undefined)?.isInWater === true;
+
+  // Entities: mineflayer keys bot.entities by id, and each one has name/position/isValid.
+  let hostile: ReflexView["hostile"] = null;
+  let creeper: ReflexView["creeper"] = null;
+  const entities = (bot as { entities?: Record<string, unknown> }).entities ?? {};
+  for (const key of Object.keys(entities)) {
+    const entity = entityOf(entities[key]);
+    if (entity === null || entity.isValid === false) continue;
+    const distance = Math.hypot(entity.position.x - me.x, entity.position.z - me.z);
+    if (entity.name === "creeper") {
+      if (creeper === null || distance < creeper.distance) {
+        creeper = { name: entity.name, distance, position: entity.position };
+      }
+      continue;
+    }
+    if (!isHostileMob(entity.name)) continue;
+    if (hostile === null || distance < hostile.distance) {
+      hostile = { name: entity.name, distance };
+    }
+  }
+
+  const inventory = inventoryOf(bot);
+  return {
+    position: me,
+    inWater,
+    oxygenLevel: numberField(bot, "oxygenLevel", 300),
+    food: numberField(bot, "food", 20),
+    hostile,
+    creeper,
+    inventory,
+    equipped: equippedOf(bot),
+  };
+}
+
+/**
+ * One numeric field off the bot, read through a guard, with the SAFE default when absent.
+ *
+ * `food` and `oxygenLevel` are real mineflayer bot fields, but BotLike does not declare
+ * them and several unit-test fakes do not set them. The defaults matter: no food field
+ * reads as 20 (never hungry, never eats by accident) and no oxygen field reads as 300
+ * (never drowns on a guess).
+ */
+function numberField(bot: BotLike, key: "food" | "oxygenLevel", fallback: number): number {
+  const raw = (bot as unknown as Record<string, unknown>)[key];
+  return typeof raw === "number" ? raw : fallback;
+}
+
+/** A mineflayer Entity, read through runtime guards. */
+function entityOf(value: unknown): CreatureLike | null {
+  if (value === null || typeof value !== "object") return null;
+  const raw = value as { name?: unknown; type?: unknown; position?: unknown; isValid?: unknown; health?: unknown };
+  if (typeof raw.name !== "string") return null;
+  const pos = raw.position as { x?: unknown; y?: unknown; z?: unknown } | undefined;
+  if (
+    pos === undefined ||
+    typeof pos.x !== "number" ||
+    typeof pos.y !== "number" ||
+    typeof pos.z !== "number"
+  ) {
+    return null;
+  }
+  return {
+    name: raw.name,
+    type: typeof raw.type === "string" ? raw.type : undefined,
+    position: { x: pos.x, y: pos.y, z: pos.z },
+    isValid: raw.isValid === true,
+    health: typeof raw.health === "number" ? raw.health : undefined,
+  };
+}
+
+/** mineflayer's bot.inventory.items(), mapped to { name, count }. */
+function inventoryOf(bot: BotLike): StackLike[] {
+  const items = (bot as { inventory?: { items?: () => unknown } }).inventory;
+  if (items === undefined || typeof items.items !== "function") return [];
+  const list = items.items();
+  if (!Array.isArray(list)) return [];
+  const out: StackLike[] = [];
+  for (const entry of list) {
+    if (entry === null || typeof entry !== "object") continue;
+    const item = entry as { name?: unknown; count?: unknown };
+    if (typeof item.name !== "string") continue;
+    out.push({ name: item.name, count: typeof item.count === "number" ? item.count : 1 });
+  }
+  return out;
+}
+
+/** What is worn and held, by item name. Empty slots read as null. */
+function equippedOf(bot: BotLike): Partial<Record<EquipSlot, string | null>> {
+  const out: Partial<Record<EquipSlot, string | null>> = {};
+  const get = (path: string): string | null => {
+    let node: unknown = bot;
+    for (const key of path.split(".")) {
+      if (node === null || typeof node !== "object") return null;
+      node = (node as Record<string, unknown>)[key];
+    }
+    if (node === null || node === undefined) return null;
+    const named = node as { name?: unknown };
+    return typeof named.name === "string" ? named.name : null;
+  };
+  out.head = get("inventory.slots.5");
+  out.torso = get("inventory.slots.6");
+  out.legs = get("inventory.slots.7");
+  out.feet = get("inventory.slots.8");
+  // The held item is the quick-bar slot the client currently has selected.
+  const heldSlot = get("quickBarSlot");
+  if (typeof heldSlot === "string") out.hand = heldSlot;
+  return out;
+}
+
+/**
+ * The four mineflayer calls the reflexes need, each guarded.
+ *
+ * A reflex that throws takes the bot with it, and these run on a 50 ms tick, so every one
+ * of them swallows its own failure rather than letting an exception reach the interval.
+ * None of them awaits anything that could block the tick.
+ */
+async function equipOf(bot: BotLike, item: unknown, destination: EquipSlot): Promise<void> {
+  const equip = (bot as { equip?: (i: unknown, d: string) => Promise<unknown> }).equip;
+  if (typeof equip !== "function") return;
+  if (item === null || typeof item !== "object") return;
+  try {
+    await equip.call(bot, item, destination);
+  } catch {
+    // mineflayer throws "Invalid item object in equip (...)" and "invalid destination: x".
+    // Both mean "do not equip this one", not "crash the tick".
+  }
+}
+
+/** mineflayer's bot.consume(). Throws "Food is full" at 20; decideEat never gets there. */
+async function consumeOf(bot: BotLike): Promise<void> {
+  const consume = (bot as { consume?: () => Promise<unknown> }).consume;
+  if (typeof consume !== "function") return;
+  try {
+    await consume.call(bot);
+  } catch {
+    // Nothing to eat, or already eating. The next tick decides again.
+  }
+}
+
+/** Look at a point, if this bot can look. */
+function lookAtOf(bot: BotLike, target: { x: number; y: number; z: number }): void {
+  const look = (bot as { look?: (y: number, p: number, force?: boolean) => void }).look;
+  if (typeof look !== "function") return;
+  const me = bot.entity?.position;
+  if (!me) return;
+  const dx = target.x - me.x;
+  const dy = target.y - me.y;
+  const dz = target.z - me.z;
+  const yaw = Math.atan2(-dx, dz);
+  const pitch = Math.atan2(-dy, Math.hypot(dx, dz));
+  try {
+    look.call(bot, yaw, pitch, true);
+  } catch {
+    // A look the server rejects is not worth a tick.
+  }
+}
+
+/** Drop control states, so a stop leaves nothing half-applied. */
+function clearControlStatesOf(bot: BotLike): void {
+  const clear = (bot as { clearControlStates?: () => void }).clearControlStates;
+  if (typeof clear !== "function") return;
+  try {
+    clear.call(bot);
+  } catch {
+    // A dead bot has nothing to clear.
+  }
+}
+
+/** Find a real prismarine Item by name, which is what bot.equip requires. */
+function findItemOf(bot: BotLike, name: string): unknown | null {
+  const items = (bot as { inventory?: { items?: () => unknown } }).inventory;
+  if (items === undefined || typeof items.items !== "function") return null;
+  let list: unknown;
+  try {
+    list = items.items();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list)) return null;
+  for (const entry of list) {
+    if (entry === null || typeof entry !== "object") continue;
+    const item = entry as { name?: unknown };
+    if (item.name === name) return entry;
+  }
+  return null;
+}
+
 /** Can this bot's Movements be built at all? Real mineflayer bots always can. */
 export function canConfigureMovements(bot: BotLike): boolean {
   const registry = (bot as { registry?: unknown }).registry;
@@ -826,6 +1030,31 @@ export class BotSession {
   private follow: FollowController | null = null;
   /** C: one refusal per player per REFUSAL_THROTTLE_MS. */
   private readonly refusalThrottle = new RefusalThrottle();
+  /** WP2: the survival reflexes. The only reflex state in the process. */
+  private reflexes: ReflexRunner | null = null;
+  /**
+   * Run one reflex tick. Returns true while a reflex is holding follow off.
+   *
+   * Fire-and-forget on purpose: this is called from a 50 ms interval, and an awaited
+   * reflex could overlap the next one. The runner's decision is synchronous, and a failed
+   * action is caught inside the adapters above.
+   */
+  private runReflexes(): boolean {
+    const runner = this.reflexes;
+    if (runner === null) return false;
+    void runner
+      .tick()
+      .then(() => {
+        if (runner.endReason === "failed") {
+          this.deps.log.warn("reflex action failed - nothing left running");
+        }
+      })
+      .catch(() => {
+        this.deps.log.warn("reflex tick threw - nothing left running");
+      });
+    return runner.interruptedFollow;
+  }
+
   /** C: the follow tick, so a stop takes effect inside one tick. */
   private followTimer: ReturnType<typeof setInterval> | null = null;
   /** C3: the presence diff timer. Cleared with every other timer. */
@@ -984,9 +1213,26 @@ export class BotSession {
       // what crashed the real pathfinder in Round 16.
       realGoalFactory(() => requirePathfinder() as never),
     );
+    // WP2: the survival reflexes run on the SAME 50 ms tick as follow, and are checked
+    // FIRST - a creeper outranks a follow, and 50 ms is the whole of the difference
+    // between the two. Nothing here can block: every decision is a pure function and every
+    // action is a single fire-and-forget call.
+    this.reflexes = new ReflexRunner({
+      view: () => reflexViewOf(bot),
+      equip: async (item, destination) => {
+        await equipOf(bot, item, destination);
+      },
+      consume: () => consumeOf(bot),
+      lookAt: (target) => lookAtOf(bot, target),
+      clearControlStates: () => clearControlStatesOf(bot),
+      findItem: (name) => findItemOf(bot, name),
+    });
     this.followTimer = setInterval(() => {
       if (this.shutdownRequested || this.ended) return;
-      this.follow?.tick(this.followTarget(bot), stopForHazard(bot));
+      // A reflex that outranks follow holds it off, and follow resumes by itself on the
+      // tick after the danger is gone - `interruptedFollow` is the only state needed.
+      const holding = this.runReflexes();
+      if (!holding) this.follow?.tick(this.followTarget(bot), stopForHazard(bot));
       // "come" ends itself once it is standing where it was asked to stand.
       const goal = this.comeTargetReached(bot);
       if (goal) this.follow?.arrive();
@@ -1480,6 +1726,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // stop / stay / wait: synchronous, unconditional, never gated.
     if (command.action === "stop") {
       this.follow?.stop();
+    // WP2: a stop cancels an in-progress eat or flee inside the same tick and drops the
+    // control states, so nothing is left half-applied.
+    this.reflexes?.stop();
       log.info({ username, matched: command.matched }, "command: stop");
       this.say?.say(ACKNOWLEDGEMENTS.stop);
       return true;
