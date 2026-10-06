@@ -59,6 +59,7 @@ interface McData {
   blocksByName: Record<string, { id: number; name: string }>;
   foods: Record<string, FoodDef>;
   entities: Record<string, unknown>;
+  entitiesByName: Record<string, { id: number; name: string; category?: string[] }>;
 }
 
 const cache = new Map<string, McData | null>();
@@ -147,4 +148,33 @@ export function blockNames(version: string = VENDORED_VERSION): Set<string> {
   const data = dataForVersion(version);
   if (!data) return new Set();
   return new Set(Object.keys(data.blocksByName ?? {}));
+}
+
+/** The categories minecraft-data records for an entity, e.g. ["Hostile mobs"]. */
+export function entityCategories(
+  name: string,
+  version: string = VENDORED_VERSION,
+): string[] {
+  const data = dataForVersion(version);
+  const entity = data?.entitiesByName?.[name] as { category?: unknown } | undefined;
+  if (entity === undefined || entity.category === undefined) return [];
+  // 26.2 stores the category as a plain string ("Hostile mobs"), and older data stores an
+  // array of them. Both shapes appear in the wild, and reading only one of them is how
+  // `isHostileByCategory` quietly answers false for every mob.
+  if (typeof entity.category === "string") return [entity.category];
+  if (!Array.isArray(entity.category)) return [];
+  return entity.category.filter((c): c is string => typeof c === "string");
+}
+
+/** True when minecraft-data knows this entity at all. */
+export function isKnownEntity(name: string, version: string = VENDORED_VERSION): boolean {
+  return dataForVersion(version)?.entitiesByName?.[name] !== undefined;
+}
+
+/** True when minecraft-data itself calls this entity hostile. */
+export function isHostileByCategory(
+  name: string,
+  version: string = VENDORED_VERSION,
+): boolean {
+  return entityCategories(name, version).some((c) => c === "Hostile mobs");
 }

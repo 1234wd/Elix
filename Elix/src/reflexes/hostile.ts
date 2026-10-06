@@ -17,6 +17,7 @@
  * Creepers are in NEITHER list for combat purposes: WP2 handles them by fleeing, and WP3
  * must never swing at one.
  */
+import { isHostileByCategory, isKnownEntity } from "../world/mcdata.js";
 
 /** Mobs that attack Elix. The good-friend rules decide what happens next. */
 export const HOSTILE_MOBS: ReadonlySet<string> = Object.freeze(
@@ -110,13 +111,24 @@ export const NEVER_ATTACKED: ReadonlySet<string> = Object.freeze(
     "camel",
     "happy_ghast",
     "frog",
-    "bogged",
   ]),
 );
 
-/** True when the mob fights back. */
-export function isHostileMob(name: string): boolean {
+/**
+ * True when the mob fights back.
+ *
+ * minecraft-data is asked FIRST, through the single accessor: 26.2's `entitiesByName`
+ * carries a `category` of "Hostile mobs" for every hostile, which is the real answer and
+ * stays right when Mojang adds a mob. `HOSTILE_MOBS` above is only the fallback for a
+ * version with no entity data, so a missing data pack degrades to the known list instead of
+ * to "nothing is hostile", which would leave Elix defenceless.
+ *
+ * `NEVER_ATTACKED` is checked before either, and is not a fallback: the good-friend rules
+ * are absolute.
+ */
+export function isHostileMob(name: string, version?: string): boolean {
   if (NEVER_ATTACKED.has(name)) return false;
+  if (version !== undefined && isHostileByCategory(name, version)) return true;
   return HOSTILE_MOBS.has(name);
 }
 
@@ -128,9 +140,19 @@ export function isNeverAttacked(name: string): boolean {
 /**
  * True for a player entity.
  *
- * mineflayer gives player entities \`type: "player"\` and often a username with no type,
- * so both are consulted. Used by WP3's "a player hit Elix and he does not fight back".
+ * mineflayer gives player entities `type: "player"`, and that is the answer. A player seen
+ * through `bot.players` may carry a bare username with no type, so the name shape is the
+ * fallback - but ONLY for a name minecraft-data does not know as a mob.
+ *
+ * That last clause is not decoration. The first version of this was
+ * `/^[A-Za-z0-9_]{3,16}$/`, and WP3's own tests caught it: it matched "zombie", so Elix
+ * refused to defend the owner against a zombie because he had decided it was a person. A
+ * greedy "looks like a username" test must never be allowed to claim a mob.
  */
 export function isPlayerEntity(name: string, type?: string): boolean {
-  return type === "player" || name === "player" || /^[A-Za-z0-9_]{3,16}$/u.test(name);
+  if (type === "player") return true;
+  if (name === "player") return true;
+  // A name the game data knows is a mob is a mob, whatever its type field says.
+  if (isKnownEntity(name) || HOSTILE_MOBS.has(name) || NEVER_ATTACKED.has(name)) return false;
+  return /^[A-Za-z0-9_]{3,16}$/u.test(name);
 }

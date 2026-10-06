@@ -33,6 +33,7 @@ import {
 import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { ReflexRunner } from "../reflexes/runner.js";
 import { isHostileMob } from "../reflexes/hostile.js";
+import { DefendController, type DefendView } from "../reflexes/defend.js";
 import type { EquipSlot } from "../reflexes/tables.js";
 import type { CreatureLike, ReflexView, StackLike } from "../reflexes/decide.js";
 import { exitCleanly } from "../core/exit.js";
@@ -227,6 +228,12 @@ export const GREET_COOLDOWN_MS = 90_000;
  */
 /** C: the follow tick. One tick, so a stop takes effect inside 50 ms. */
 export const FOLLOW_TICK_MS = 50;
+
+/** WP3: Elix says one short line after a player hits him, at most this often. */
+export const HURT_LINE_WINDOW_MS = 5 * 60_000;
+
+/** WP3: the one line Elix may say after a player hits him. */
+export const HURT_BY_A_PLAYER = "hey - that one hurt.";
 
 export const PRESENCE_POLL_MS = 2_000;
 
@@ -716,7 +723,7 @@ export function reflexViewOf(bot: BotLike): ReflexView {
  * reads as 20 (never hungry, never eats by accident) and no oxygen field reads as 300
  * (never drowns on a guess).
  */
-function numberField(bot: BotLike, key: "food" | "oxygenLevel", fallback: number): number {
+function numberField(bot: BotLike, key: "food" | "oxygenLevel" | "health", fallback: number): number {
   const raw = (bot as unknown as Record<string, unknown>)[key];
   return typeof raw === "number" ? raw : fallback;
 }
@@ -859,6 +866,44 @@ function findItemOf(bot: BotLike, name: string): unknown | null {
     if (item.name === name) return entry;
   }
   return null;
+}
+
+/**
+ * Assemble the defend view from mineflayer's own fields.
+ *
+ * Owners come from the configured owner list, matched against the tracked players, so a
+ * stranger's name is never enough - the same rule the command path uses.
+ */
+export function defendViewOf(bot: BotLike, owners: string[], hurtByPlayer: string | null): DefendView {
+  const me = bot.entity?.position;
+  const position: Vec3Like = me ?? { x: 0, y: 64, z: 0 };
+  const wanted = owners.map((o) => o.toLowerCase());
+  const players = bot.players ?? {};
+  const ownerDistances: DefendView["owners"] = [];
+  for (const name of Object.keys(players)) {
+    if (!wanted.includes(name.toLowerCase())) continue;
+    const pos = playerPosition(players[name]);
+    if (pos === undefined) continue;
+    ownerDistances.push({
+      name,
+      distance: Math.hypot(pos.x - position.x, pos.z - position.z),
+      position: { x: pos.x, y: pos.y, z: pos.z },
+    });
+  }
+  const entities: CreatureLike[] = [];
+  const raw = (bot as { entities?: Record<string, unknown> }).entities ?? {};
+  for (const key of Object.keys(raw)) {
+    const entity = entityOf(raw[key]);
+    if (entity !== null) entities.push(entity);
+  }
+  return {
+    position,
+    health: numberField(bot, "health", 20),
+    owners: ownerDistances,
+    entities,
+    heldWeapon: equippedOf(bot).hand ?? null,
+    hurtByPlayer: hurtByPlayer === null ? null : { name: hurtByPlayer, distance: 0 },
+  };
 }
 
 /** Can this bot's Movements be built at all? Real mineflayer bots always can. */
@@ -1030,6 +1075,14 @@ export class BotSession {
   private follow: FollowController | null = null;
   /** C: one refusal per player per REFUSAL_THROTTLE_MS. */
   private readonly refusalThrottle = new RefusalThrottle();
+  /** WP3: the defender. */
+  private defend: DefendController | null = null;
+  /** WP3: when a player last hit Elix. Zero means nobody has. */
+  private hurtByPlayerAt = 0;
+  /** WP3: the player who last hit Elix, or null. */
+  private hurtByPlayer: string | null = null;
+  /** WP3: when the one hurt line was last said. */
+  private saidHurtLineAt = 0;
   /** WP2: the survival reflexes. The only reflex state in the process. */
   private reflexes: ReflexRunner | null = null;
   /**
@@ -1053,6 +1106,68 @@ export class BotSession {
         this.deps.log.warn("reflex tick threw - nothing left running");
       });
     return runner.interruptedFollow;
+  }
+
+  /**
+   * Run one defend tick. Returns true while Elix is engaged or moving away, which holds the
+   * lower reflexes and follow off for that tick.
+   *
+   * Every swing goes through DefendController, which asks `decideDefend` first, and that
+   * refuses players, pets, villagers, golems, passive mobs and creepers before it looks at
+   * anything else. There is no other path to a swing in this file.
+   */
+  private runDefend(bot: BotLike): boolean {
+    const controller = this.defend;
+    if (controller === null) return false;
+    const view = defendViewOf(bot, this.deps.config.owners ?? [], this.hurtByPlayer);
+    let engaged = false;
+    try {
+      const action = controller.tick(view, {
+        onSwing: (target) => {
+          engaged = true;
+          const attack = (bot as { attack?: (e: unknown) => void }).attack;
+          if (typeof attack === "function") {
+            try {
+              attack.call(bot, target);
+            } catch {
+              // A rejected attack is not worth a tick, and never a crash.
+            }
+          }
+        },
+        onMove: (to) => {
+          engaged = true;
+          lookAtOf(bot, to);
+        },
+      });
+      engaged = engaged || action.kind === "attack" || action.kind === "step-away" || action.kind === "retreat";
+    } catch {
+      this.deps.log.warn("defend tick threw - nothing left running");
+      controller.stop();
+    }
+    if (engaged && this.hurtByPlayer !== null) {
+      // WP3: one short line, through gateOwnLine, never gateScriptedReply. Said once per
+      // player per WINDOW_MS, because being hit twice is not worth saying twice.
+      this.maybeSayHurtLine(this.hurtByPlayer);
+    }
+    return engaged;
+  }
+
+  /** WP3: the one line Elix may say after a player hits him. */
+  private maybeSayHurtLine(player: string): void {
+    const now = Date.now();
+    if (now - this.saidHurtLineAt < HURT_LINE_WINDOW_MS) return;
+    this.saidHurtLineAt = now;
+    const bridge = this.deps.chatBridge;
+    if (!bridge?.gateOwnLine) return;
+    void bridge
+      .gateOwnLine(player)
+      .then(async (suppressed: boolean) => {
+        if (suppressed) return;
+        this.say?.say(HURT_BY_A_PLAYER);
+      })
+      .catch(() => {
+        // A failed gate must not throw into the tick.
+      });
   }
 
   /** C: the follow tick, so a stop takes effect inside one tick. */
@@ -1227,8 +1342,16 @@ export class BotSession {
       clearControlStates: () => clearControlStatesOf(bot),
       findItem: (name) => findItemOf(bot, name),
     });
+    // WP3: defend the owner. One controller, created with the configured skillCap, and the
+    // only things it can reach in the world are a swing and a step backwards.
+    this.defend = new DefendController(this.deps.config.skillCap ?? "normal");
+    this.hurtByPlayerAt = 0;
     this.followTimer = setInterval(() => {
       if (this.shutdownRequested || this.ended) return;
+      // WP3 first: a hostile mob next to the owner outranks everything below.
+      if (this.runDefend(bot)) {
+        return;
+      }
       // A reflex that outranks follow holds it off, and follow resumes by itself on the
       // tick after the danger is gone - `interruptedFollow` is the only state needed.
       const holding = this.runReflexes();
@@ -1729,6 +1852,10 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // WP2: a stop cancels an in-progress eat or flee inside the same tick and drops the
     // control states, so nothing is left half-applied.
     this.reflexes?.stop();
+    // WP3: and it clears the engagement, so the next tick cannot swing on the strength of a
+    // reaction delay that started before the stop.
+    this.defend?.stop();
+    this.hurtByPlayer = null;
       log.info({ username, matched: command.matched }, "command: stop");
       this.say?.say(ACKNOWLEDGEMENTS.stop);
       return true;
