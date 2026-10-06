@@ -248,6 +248,9 @@ const VEC_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS episode_vec USING vec0(embedding float[384]);
 `;
 
+/** One row, with the columns this store does not model left untyped. */
+export type Row = Record<string, unknown>;
+
 export interface MemoryStoreOptions {
   path: string;
   /** vec0 dimension. Must match the embedding model, forever. */
@@ -741,6 +744,59 @@ export class MemoryStore {
            z = excluded.z, dimension = excluded.dimension, note = excluded.note`,
       )
       .run(p.key, p.kind, p.ts, p.x ?? null, p.y ?? null, p.z ?? null, p.dimension ?? null, p.note ?? null);
+  }
+
+  /**
+   * Every remembered place.
+   *
+   * WP6 needs this because WP5's protected radius has to consider ALL of them, not just the
+   * one somebody happened to name. Returns raw rows; `src/world/memory.ts` reads them
+   * through guards, because a place with null coordinates is legal in this schema.
+   */
+  places(): Row[] {
+    return this.db.prepare("SELECT * FROM places ORDER BY ts DESC").all() as Row[];
+  }
+
+  /** Where somebody last died, or null. */
+  lastDeath(player: string): Row | null {
+    const row = this.db
+      .prepare("SELECT * FROM deaths WHERE player = ? ORDER BY ts DESC LIMIT 1")
+      .get(player) as Row | undefined;
+    return row ?? null;
+  }
+
+  /** Every death for a player, newest first. */
+  deaths(player: string, limit = 5): Row[] {
+    return this.db
+      .prepare("SELECT * FROM deaths WHERE player = ? ORDER BY ts DESC LIMIT ?")
+      .all(player, limit) as Row[];
+  }
+
+  /** Record where somebody died. */
+  addDeath(d: {
+    player: string;
+    x: number;
+    y: number;
+    z: number;
+    dimension?: string | null;
+    cause?: string | null;
+    ts: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO deaths (player, x, y, z, dimension, cause, ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(d.player, d.x, d.y, d.z, d.dimension ?? null, d.cause ?? null, d.ts);
+  }
+
+  /** How many deaths are remembered, for a player or in total. */
+  deathCount(player?: string): number {
+    const row =
+      player === undefined
+        ? (this.db.prepare("SELECT COUNT(*) AS n FROM deaths").get() as { n: number })
+        : (this.db.prepare("SELECT COUNT(*) AS n FROM deaths WHERE player = ?").get(player) as { n: number });
+    return row?.n ?? 0;
   }
 
   place(key: string): Record<string, unknown> | null {
