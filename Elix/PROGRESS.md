@@ -23,13 +23,48 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | WP8 Constrained tool calls | **DONE** | `95da322` | `toolCalls.test.ts` (26) | closed zod list, owner-only, dropped-reply drops calls, gentle mode, 1/reply + 6/min |
 | WP9 Status + first run | **DONE** | `2a939d7` | `status.test.ts` (27) | key redaction, no chat text, owner/offline-server warnings, README checklist |
 | WP10 e2e rows | **DONE** | `3564c4e` | — (script) | command rows, opt-in `--owners`, ❌ **not run** — no server reachable from here |
-| WP11 Split bot.ts / bridge.ts | **NEXT** | | | mechanical; target ≤800 lines/file |
-| WP12 Voice plan | TODO | | | stretch |
+| WP11 Split bot.ts / bridge.ts | **PARTIAL** | `0d74e79` | — (no test changes) | hazard + reflex-adapter blocks moved out, re-exported; bot.ts 2600 → 2249 |
+| WP12 Voice plan | **DONE** | see log | — (document) | `docs/VOICE_PLAN.md`; no code, no runtime deps |
 
-## WP11 — exactly what is left to do
+## WP11 — PARTIAL, and exactly what is left
+
+**Done (`0d74e79`):** two cohesive blocks moved out of `bot.ts` **verbatim**, with every moved
+name re-exported from `bot.ts` so that **no import path in `src/` or `tests/` changed**.
+That last part is the whole trick, and it is why this was safe: 1924 tests green with zero test
+edits, which is what WP11 allows.
+
+- `src/connection/hazards.ts` (172 lines) — `WALK_DISTANCES`, `HAZARD_BLOCKS`,
+  `HAZARD_PASSABLE_REJECTS`, `toVec3`, `stopForHazard`, `isSafeFloor`, `isPassable`,
+  `isStandable`, `pickWalkDirection`, and the `WalkOutcome`/`WalkSkipReason` types.
+- `src/connection/reflexAdapters.ts` (237 lines) — the WP2–WP4 view builders
+  (`reflexViewOf`, `defendViewOf`, `entityOf`, `inventoryOf`, `equippedOf`,
+  `numberField`) and the five guarded mineflayer calls (`equipOf`, `consumeOf`,
+  `lookAtOf`, `clearControlStatesOf`, `findItemOf`).
+
+**Still to do, and why it was not done in this session:** `BotSession` itself is ~1500 of
+bot.ts's remaining 2249 lines. Reaching the brief's ≤800 target means splitting a class that
+40-odd test files construct directly and poke at, which is exactly the case where a "mechanical"
+refactor starts quietly changing behaviour. The brief's own instruction for that situation is to
+stop and mark the WP PARTIAL, so that is what this is. Next session:
+
+1. `src/connection/chatDispatch.ts` — `handleChat` and `runCommand`.
+2. `src/connection/presence.ts` — `installCrashGuards`, `greetingFor`, `isGreetingFor`,
+   `hasFollowUp`, `lookAround`, the greeting tables.
+3. `src/connection/initiative.ts` — the 5 s poll and its wiring.
+4. `src/connection/followWiring.ts` — `runReflexes`, `runDefend`, `runGaze`,
+   `maybeSayHurtLine`, `gazeState`, `gazeCandidates`, `setSneak`, `startFollow`,
+   `startCome`.
+5. Then `bridge.ts` (1433): audit store and gate, chat reply, wellbeing reply — same
+   re-export trick.
+
+Rule unchanged: test edits are allowed **only** in import paths; if a move needs a behaviour
+change, stop and leave the WP PARTIAL rather than fixing it in place.
+
+## WP11 — original plan, for reference
 
 Target: no file over 800 lines. Measured at `3564c4e`:
 
+At the start of WP11:
 ```
 2600  src/connection/bot.ts      <- the big one
 1433  src/brain/bridge.ts
