@@ -1,5 +1,4 @@
 import { createRequire } from "node:module";
-import { Vec3 } from "vec3";
 import type { ElixConfig, ServerProfile } from "../core/config.js";
 import type { Logger } from "../core/logger.js";
 import { pingServer, type PingResult } from "./ping.js";
@@ -7,7 +6,6 @@ import { classifyDisconnect, BACKOFF_SCHEDULE_MS, type DisconnectKind } from "./
 import { describeReason, type DescribedReason } from "./kickReason.js";
 import { ReconnectScheduler } from "./scheduler.js";
 import { resolveTargetVersion, expectedProtocol, hasDataFor } from "./version.js";
-import { blockName } from "./safeWorld.js";
 import { bus, shutdownState } from "../core/events.js";
 import {
   EmotionEngine,
@@ -32,8 +30,19 @@ import {
 } from "../actions/commands.js";
 import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { ReflexRunner } from "../reflexes/runner.js";
-import { isHostileMob } from "../reflexes/hostile.js";
-import { DefendController, type DefendView } from "../reflexes/defend.js";
+import { DefendController } from "../reflexes/defend.js";
+import { pickWalkDirection, stopForHazard } from "./hazards.js";
+import type { WalkOutcome } from "./hazards.js";
+import {
+  clearControlStatesOf,
+  consumeOf,
+  defendViewOf,
+  equipOf,
+  entityOf,
+  findItemOf,
+  lookAtOf,
+  reflexViewOf,
+} from "./reflexAdapters.js";
 import {
   HeadTurner,
   IdleGlances,
@@ -49,8 +58,6 @@ import {
   type LookSuppression,
   type Vec3Like as LookVec3Like,
 } from "../humanizer/look.js";
-import type { EquipSlot } from "../reflexes/tables.js";
-import type { CreatureLike, ReflexView, StackLike } from "../reflexes/decide.js";
 import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
@@ -464,179 +471,6 @@ export function hasFollowUp(message: string, username: string): boolean {
 // Safe walk (A7) — never digs, never places, never pillars
 // ---------------------------------------------------------------------------
 
-const WALK_DISTANCES = [
-  { dx: 10, dz: 0, name: "+x" },
-  { dx: -10, dz: 0, name: "-x" },
-  { dx: 0, dz: 10, name: "+z" },
-  { dx: 0, dz: -10, name: "-z" },
-] as const;
-
-export type WalkSkipReason = "no-entity" | "no-safe-direction";
-
-export interface WalkOutcome {
-  walked: boolean;
-  reason?: WalkSkipReason;
-  direction?: string;
-}
-
-/**
- * Blocks that must never be walked onto or through (A10, corrected in A1).
- *
- * Every name here is verified against vendor/minecraft-data/data/pc/26.2/
- * blocks.json by a unit test — a typo or an invented name would silently never
- * match, which is how `flowing_lava` and `sulfur_vent` got in before.
- *
- * Deliberately NOT hazards, despite looking alarming:
- *
- *   sulfur, cinnabar, sulfur_bricks, cinnabar_bricks
- *     Ordinary solid blocks (boundingBox "block"). Sulfur is the main rock of
- *     sulfur caves; treating it as a hazard would make those caves
- *     unnavigable and break the explore-sulfur-caves goal.
- *     https://minecraft.wiki/w/Sulfur
- *
- *   sulfur_spike
- *     A solid block you can stand on. Its stalactites can fall and damage,
- *     like pointed dripstone, but the block itself is not a hazard.
- *     https://minecraft.wiki/w/Sulfur_Spike
- *
- *   campfire, soul_campfire
- *     Light and smoke only — no damage on contact.
- *
- * Sources for the 26.2-specific entries:
- *   potent_sulfur — "produces noxious gas, which gives Nausea temporarily, if
- *     placed beneath shallow water. Placing a magma block below it in shallow
- *     water turns it into a geyser." Avoiding it is the cheap safe play.
- *     https://minecraft.wiki/w/Potent_Sulfur
- *   geysers are potent_sulfur + magma_block + water, so magma_block is the
- *     physical hazard and is listed below.
- */
-export const HAZARD_BLOCKS: ReadonlySet<string> = new Set([
-  // Damage on contact or from standing on it.
-  "lava",
-  "magma_block",
-  "fire",
-  "soul_fire",
-  "powder_snow",
-  "sweet_berry_bush",
-  "wither_rose",
-  // Contact damage.
-  "cactus",
-  "pointed_dripstone",
-  // Traps and movement hazards.
-  "cobweb",
-  // Liquids: boundingBox is "empty", so a name-only check walks into them.
-  "water",
-  "bubble_column",
-  // 26.2: emits noxious gas, and spawns geysers with magma below it.
-  "potent_sulfur",
-]);
-
-/** Blocks whose boundingBox is "empty" but which still stop us. Liquids and traps. */
-export const HAZARD_PASSABLE_REJECTS: ReadonlySet<string> = new Set([
-  "water",
-  "bubble_column",
-  "lava",
-  "fire",
-  "soul_fire",
-  "powder_snow",
-  "cobweb",
-  "sweet_berry_bush",
-  "wither_rose",
-]);
-
-/**
- * Build a real Vec3 for world queries.
- *
- * prismarine-world's getBlock() calls `pos.floored()`, so a plain {x,y,z} object
- * throws "pos.floored is not a function". vec3 is mineflayer's own dependency.
- */
-export function toVec3(p: Vec3Like): Vec3Like {
-  return new Vec3(p.x, p.y, p.z);
-}
-
-/**
- * C: is Elix standing somewhere he should not be right now?
- *
- * The existing hazard checks WIN over following, and this is where that is enforced: the
- * follow tick asks before it keeps a goal, and a `true` here cancels it with
- * `endedBecause: "hazard"`.
- *
- * Only the block at Elix's own feet is checked, not the whole path. The pathfinder already
- * refuses to dig and already avoids hazards through the Movements in `makeSafeMovements`;
- * this is the cheap last check for "the ground turned to lava under him", which is the case
- * no amount of re-pathing fixes.
- */
-export function stopForHazard(bot: BotLike): boolean {
-  const pos = bot.entity?.position;
-  if (!pos) return true; // no position is not a safe place to keep walking
-  const feet = bot.blockAt(toVec3(pos));
-  if (feet && HAZARD_BLOCKS.has(blockName(feet))) return true;
-  const floor = bot.blockAt(toVec3({ x: pos.x, y: pos.y - 1, z: pos.z }));
-  return floor !== null && !isSafeFloor(floor);
-}
-
-/** A10: is this block safe to stand on? Needs a full solid box and no hazard. */
-export function isSafeFloor(block: BlockLike | null): boolean {
-  if (!block) return false;
-  const name = blockName(block);
-  if (name === "air" || name === "cave_air") return false;
-  if (HAZARD_BLOCKS.has(name)) return false;
-  // A hazard is only safe to stand on if it is genuinely solid; lava is not.
-  const shape = block.boundingBox;
-  return shape === "block" || shape === undefined;
-}
-
-/** A10: is this block clear to walk through? Empty box, not a liquid. */
-export function isPassable(block: BlockLike | null): boolean {
-  if (!block) return false;
-  const name = blockName(block);
-  // Liquids and traps are boundingBox "empty", so the name check is the only
-  // thing that stops us walking head-first into water (A1).
-  if (HAZARD_PASSABLE_REJECTS.has(name)) return false;
-  if (HAZARD_BLOCKS.has(name)) return false;
-  const shape = block.boundingBox;
-  // "empty" covers air, cave_air, short_grass, flowers, torches and signs -
-  // all passable despite having names that are not "air".
-  return shape === "empty" || shape === undefined;
-}
-
-/**
- * Is this spot standable without digging?
- *
- * A10: the old version required the floor to be "not air", which counted lava
- * and water as a floor, and required the feet and head to be exactly "air",
- * which rejected cave_air, short_grass and flowers. Now the boundingBox decides.
- */
-export function isStandable(
-  blockAt: (p: Vec3Like) => BlockLike | null,
-  x: number,
-  y: number,
-  z: number,
-): boolean {
-  const bx = Math.floor(x);
-  const by = Math.floor(y);
-  const bz = Math.floor(z);
-  const floor = blockAt(toVec3({ x: bx, y: by - 1, z: bz }));
-  const feet = blockAt(toVec3({ x: bx, y: by, z: bz }));
-  const head = blockAt(toVec3({ x: bx, y: by + 1, z: bz }));
-  return isSafeFloor(floor) && isPassable(feet) && isPassable(head);
-}
-
-/** Pick the first direction with a solid floor and air at head height. */
-export function pickWalkDirection(
-  blockAt: (p: Vec3Like) => BlockLike | null,
-  pos: Vec3Like,
-): { x: number; y: number; z: number; name: string } | null {
-  for (const dir of WALK_DISTANCES) {
-    const tx = pos.x + dir.dx;
-    const tz = pos.z + dir.dz;
-    if (isStandable(blockAt, tx, pos.y, tz)) {
-      return { x: tx, y: pos.y, z: tz, name: dir.name };
-    }
-  }
-  return null;
-}
-
 /**
  * Load mineflayer-pathfinder as CommonJS.
  *
@@ -685,244 +519,6 @@ export function requirePathfinder(): PathfinderModule {
  * lines a test actually reads.
  */
 const movementsReady = new WeakSet<object>();
-
-/**
- * Assemble the reflex view from mineflayer's own fields.
- *
- * Every read is guarded at runtime rather than cast, because a fake bot and a real bot do
- * not agree on which of these exist, and a reflex that throws on the tick takes the bot
- * with it. `ReflexRunner` decides; this only reports.
- */
-export function reflexViewOf(bot: BotLike): ReflexView {
-  const position = bot.entity?.position;
-  const me: Vec3Like = position ?? { x: 0, y: 64, z: 0 };
-  // bot.entity.isInWater exists on a real bot; a fake may not have it, and "not in water"
-  // is the safe reading because "breathe" is the one reflex that must never fire on a guess.
-  const inWater = (bot.entity as { isInWater?: unknown } | undefined)?.isInWater === true;
-
-  // Entities: mineflayer keys bot.entities by id, and each one has name/position/isValid.
-  let hostile: ReflexView["hostile"] = null;
-  let creeper: ReflexView["creeper"] = null;
-  const entities = (bot as { entities?: Record<string, unknown> }).entities ?? {};
-  for (const key of Object.keys(entities)) {
-    const entity = entityOf(entities[key]);
-    if (entity === null || entity.isValid === false) continue;
-    const distance = Math.hypot(entity.position.x - me.x, entity.position.z - me.z);
-    if (entity.name === "creeper") {
-      if (creeper === null || distance < creeper.distance) {
-        creeper = { name: entity.name, distance, position: entity.position };
-      }
-      continue;
-    }
-    if (!isHostileMob(entity.name)) continue;
-    if (hostile === null || distance < hostile.distance) {
-      hostile = { name: entity.name, distance };
-    }
-  }
-
-  const inventory = inventoryOf(bot);
-  return {
-    position: me,
-    inWater,
-    oxygenLevel: numberField(bot, "oxygenLevel", 300),
-    food: numberField(bot, "food", 20),
-    hostile,
-    creeper,
-    inventory,
-    equipped: equippedOf(bot),
-  };
-}
-
-/**
- * One numeric field off the bot, read through a guard, with the SAFE default when absent.
- *
- * `food` and `oxygenLevel` are real mineflayer bot fields, but BotLike does not declare
- * them and several unit-test fakes do not set them. The defaults matter: no food field
- * reads as 20 (never hungry, never eats by accident) and no oxygen field reads as 300
- * (never drowns on a guess).
- */
-function numberField(bot: BotLike, key: "food" | "oxygenLevel" | "health", fallback: number): number {
-  const raw = (bot as unknown as Record<string, unknown>)[key];
-  return typeof raw === "number" ? raw : fallback;
-}
-
-/** A mineflayer Entity, read through runtime guards. */
-function entityOf(value: unknown): CreatureLike | null {
-  if (value === null || typeof value !== "object") return null;
-  const raw = value as { name?: unknown; type?: unknown; position?: unknown; isValid?: unknown; health?: unknown };
-  if (typeof raw.name !== "string") return null;
-  const pos = raw.position as { x?: unknown; y?: unknown; z?: unknown } | undefined;
-  if (
-    pos === undefined ||
-    typeof pos.x !== "number" ||
-    typeof pos.y !== "number" ||
-    typeof pos.z !== "number"
-  ) {
-    return null;
-  }
-  return {
-    name: raw.name,
-    type: typeof raw.type === "string" ? raw.type : undefined,
-    position: { x: pos.x, y: pos.y, z: pos.z },
-    isValid: raw.isValid === true,
-    health: typeof raw.health === "number" ? raw.health : undefined,
-  };
-}
-
-/** mineflayer's bot.inventory.items(), mapped to { name, count }. */
-function inventoryOf(bot: BotLike): StackLike[] {
-  const items = (bot as { inventory?: { items?: () => unknown } }).inventory;
-  if (items === undefined || typeof items.items !== "function") return [];
-  const list = items.items();
-  if (!Array.isArray(list)) return [];
-  const out: StackLike[] = [];
-  for (const entry of list) {
-    if (entry === null || typeof entry !== "object") continue;
-    const item = entry as { name?: unknown; count?: unknown };
-    if (typeof item.name !== "string") continue;
-    out.push({ name: item.name, count: typeof item.count === "number" ? item.count : 1 });
-  }
-  return out;
-}
-
-/** What is worn and held, by item name. Empty slots read as null. */
-function equippedOf(bot: BotLike): Partial<Record<EquipSlot, string | null>> {
-  const out: Partial<Record<EquipSlot, string | null>> = {};
-  const get = (path: string): string | null => {
-    let node: unknown = bot;
-    for (const key of path.split(".")) {
-      if (node === null || typeof node !== "object") return null;
-      node = (node as Record<string, unknown>)[key];
-    }
-    if (node === null || node === undefined) return null;
-    const named = node as { name?: unknown };
-    return typeof named.name === "string" ? named.name : null;
-  };
-  out.head = get("inventory.slots.5");
-  out.torso = get("inventory.slots.6");
-  out.legs = get("inventory.slots.7");
-  out.feet = get("inventory.slots.8");
-  // The held item is the quick-bar slot the client currently has selected.
-  const heldSlot = get("quickBarSlot");
-  if (typeof heldSlot === "string") out.hand = heldSlot;
-  return out;
-}
-
-/**
- * The four mineflayer calls the reflexes need, each guarded.
- *
- * A reflex that throws takes the bot with it, and these run on a 50 ms tick, so every one
- * of them swallows its own failure rather than letting an exception reach the interval.
- * None of them awaits anything that could block the tick.
- */
-async function equipOf(bot: BotLike, item: unknown, destination: EquipSlot): Promise<void> {
-  const equip = (bot as { equip?: (i: unknown, d: string) => Promise<unknown> }).equip;
-  if (typeof equip !== "function") return;
-  if (item === null || typeof item !== "object") return;
-  try {
-    await equip.call(bot, item, destination);
-  } catch {
-    // mineflayer throws "Invalid item object in equip (...)" and "invalid destination: x".
-    // Both mean "do not equip this one", not "crash the tick".
-  }
-}
-
-/** mineflayer's bot.consume(). Throws "Food is full" at 20; decideEat never gets there. */
-async function consumeOf(bot: BotLike): Promise<void> {
-  const consume = (bot as { consume?: () => Promise<unknown> }).consume;
-  if (typeof consume !== "function") return;
-  try {
-    await consume.call(bot);
-  } catch {
-    // Nothing to eat, or already eating. The next tick decides again.
-  }
-}
-
-/** Look at a point, if this bot can look. */
-function lookAtOf(bot: BotLike, target: { x: number; y: number; z: number }): void {
-  const look = (bot as { look?: (y: number, p: number, force?: boolean) => void }).look;
-  if (typeof look !== "function") return;
-  const me = bot.entity?.position;
-  if (!me) return;
-  const dx = target.x - me.x;
-  const dy = target.y - me.y;
-  const dz = target.z - me.z;
-  const yaw = Math.atan2(-dx, dz);
-  const pitch = Math.atan2(-dy, Math.hypot(dx, dz));
-  try {
-    look.call(bot, yaw, pitch, true);
-  } catch {
-    // A look the server rejects is not worth a tick.
-  }
-}
-
-/** Drop control states, so a stop leaves nothing half-applied. */
-function clearControlStatesOf(bot: BotLike): void {
-  const clear = (bot as { clearControlStates?: () => void }).clearControlStates;
-  if (typeof clear !== "function") return;
-  try {
-    clear.call(bot);
-  } catch {
-    // A dead bot has nothing to clear.
-  }
-}
-
-/** Find a real prismarine Item by name, which is what bot.equip requires. */
-function findItemOf(bot: BotLike, name: string): unknown | null {
-  const items = (bot as { inventory?: { items?: () => unknown } }).inventory;
-  if (items === undefined || typeof items.items !== "function") return null;
-  let list: unknown;
-  try {
-    list = items.items();
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(list)) return null;
-  for (const entry of list) {
-    if (entry === null || typeof entry !== "object") continue;
-    const item = entry as { name?: unknown };
-    if (item.name === name) return entry;
-  }
-  return null;
-}
-
-/**
- * Assemble the defend view from mineflayer's own fields.
- *
- * Owners come from the configured owner list, matched against the tracked players, so a
- * stranger's name is never enough - the same rule the command path uses.
- */
-export function defendViewOf(bot: BotLike, owners: string[], hurtByPlayer: string | null): DefendView {
-  const me = bot.entity?.position;
-  const position: Vec3Like = me ?? { x: 0, y: 64, z: 0 };
-  const wanted = owners.map((o) => o.toLowerCase());
-  const players = bot.players ?? {};
-  const ownerDistances: DefendView["owners"] = [];
-  for (const name of Object.keys(players)) {
-    if (!wanted.includes(name.toLowerCase())) continue;
-    const pos = playerPosition(players[name]);
-    if (pos === undefined) continue;
-    ownerDistances.push({
-      name,
-      distance: Math.hypot(pos.x - position.x, pos.z - position.z),
-      position: { x: pos.x, y: pos.y, z: pos.z },
-    });
-  }
-  const entities: CreatureLike[] = [];
-  const raw = (bot as { entities?: Record<string, unknown> }).entities ?? {};
-  for (const key of Object.keys(raw)) {
-    const entity = entityOf(raw[key]);
-    if (entity !== null) entities.push(entity);
-  }
-  return {
-    position,
-    health: numberField(bot, "health", 20),
-    owners: ownerDistances,
-    entities,
-    heldWeapon: equippedOf(bot).hand ?? null,
-    hurtByPlayer: hurtByPlayer === null ? null : { name: hurtByPlayer, distance: 0 },
-  };
-}
 
 /** Can this bot's Movements be built at all? Real mineflayer bots always can. */
 export function canConfigureMovements(bot: BotLike): boolean {
@@ -1048,6 +644,37 @@ export function mapPlayerPositions(
   return out;
 }
 
+
+/**
+ * WP11 - these moved to their own modules, and are re-exported here so that no import path
+ * anywhere in `src/` or `tests/` had to change. `bot.ts` keeps its public surface; only its
+ * size changed.
+ */
+export {
+  WALK_DISTANCES,
+  stopForHazard,
+  isSafeFloor,
+  isPassable,
+  isStandable,
+  pickWalkDirection,
+  toVec3,
+  HAZARD_BLOCKS,
+  HAZARD_PASSABLE_REJECTS,
+} from "./hazards.js";
+export type { WalkSkipReason, WalkOutcome } from "./hazards.js";
+
+export { reflexViewOf, defendViewOf } from "./reflexAdapters.js";
+export {
+  numberField,
+  entityOf,
+  inventoryOf,
+  equippedOf,
+  equipOf,
+  consumeOf,
+  lookAtOf,
+  clearControlStatesOf,
+  findItemOf,
+} from "./reflexAdapters.js";
 
 export class BotSession {
   private readonly deps: SessionDeps;
