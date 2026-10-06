@@ -41,6 +41,50 @@ export const TARGET_LOST_MS = 10_000;
 /** One tick. `stop` must complete inside this. */
 export const ONE_TICK_MS = 50;
 
+/**
+ * Builds REAL pathfinder goals.
+ *
+ * Round 16 found the reason Part C shipped 22 green tests and would have crashed on the
+ * first tick: the controller handed `setGoal` a plain object `{ kind: "follow", ... }`, and
+ * mineflayer-pathfinder 2.4.5 calls `goal.isValid()` on the next `physicsTick`. That throws
+ * inside mineflayer's tick, becomes an uncaughtException, and Elix quits and reconnects —
+ * six times in a minute is a crash burst.
+ *
+ * So the goals come from the library's own `goals` export and are injected, which keeps the
+ * controller testable without making a fake the thing that decides what a goal is. The
+ * contract test in `pathfinderContract.test.ts` runs every goal this factory can build
+ * through the four calls the library makes per tick.
+ */
+export interface GoalFactory {
+  follow(entity: unknown, distance: number): unknown;
+  near(x: number, y: number, z: number, radius: number): unknown;
+}
+
+/**
+ * The real factory, built from the library through `bot.ts`'s existing loader so there is
+ * one place that knows how the plugin is required.
+ *
+ * Loaded lazily and memoised, because requiring a plugin at module scope makes every unit
+ * test that imports this file depend on it.
+ */
+export function realGoalFactory(load: () => { goals: Record<string, new (...args: never[]) => unknown> }): GoalFactory {
+  let goals: Record<string, new (...args: never[]) => unknown> | null = null;
+  const get = (): Record<string, new (...args: never[]) => unknown> => {
+    if (goals === null) goals = load().goals as Record<string, new (...args: never[]) => unknown>;
+    return goals;
+  };
+  return {
+    follow(entity: unknown, distance: number): unknown {
+      const Ctor = get().GoalFollow as unknown as new (e: unknown, d: number) => unknown;
+      return new Ctor(entity, distance);
+    },
+    near(x: number, y: number, z: number, radius: number): unknown {
+      const Ctor = get().GoalNear as unknown as new (x: number, y: number, z: number, r: number) => unknown;
+      return new Ctor(x, y, z, radius);
+    },
+  };
+}
+
 export type FollowMode = "follow" | "come" | null;
 
 export interface FollowTarget {
@@ -90,6 +134,12 @@ export class FollowController {
   constructor(
     private readonly pathfinder: PathfinderLike | null,
     private readonly now: () => number = Date.now,
+    /**
+     * Injected rather than required here. Round 16's U1 was exactly this file reaching for
+     * a plain object instead of the library, so the factory is a required collaborator and
+     * the contract test builds every goal it can produce.
+     */
+    private readonly goalFactory: GoalFactory,
   ) {}
 
   get current(): FollowState {
@@ -124,7 +174,15 @@ export class FollowController {
   follow(entity: unknown, targetName: string): { ok: boolean; reason?: string } {
     const goal = this.followGoal(entity);
     if (!goal) return { ok: false, reason: "target-not-tracked" };
-    this.pathfinder?.setGoal(goal);
+    // A goal the library cannot run is worse than no goal at all: it throws on the next
+    // physicsTick and takes the process with it. So building one is where this can fail.
+    let built: unknown;
+    try {
+      built = this.goalFactory.follow(entity, FOLLOW_DISTANCE);
+    } catch (err) {
+      return { ok: false, reason: `goal-build-failed: ${(err as Error).message}` };
+    }
+    this.pathfinder?.setGoal(built);
     this.state = {
       mode: "follow",
       target: targetName,
@@ -142,8 +200,16 @@ export class FollowController {
    * of the command, not a standing arrangement. Someone who says "come here" and then runs
    * away should not be followed.
    */
-  come(position: { x: number; y: number; z: number }): { ok: boolean } {
-    this.pathfinder?.setGoal({ kind: "near", position, radius: COME_RADIUS });
+  come(position: { x: number; y: number; z: number }): { ok: boolean; reason?: string } {
+    // U4: the position is the SPEAKER'S, passed in by the caller. The old code took the
+    // nearest player, so "come here" from someone 12 blocks away walked to a stranger at 3.
+    let built: unknown;
+    try {
+      built = this.goalFactory.near(position.x, position.y, position.z, COME_RADIUS);
+    } catch (err) {
+      return { ok: false, reason: `goal-build-failed: ${(err as Error).message}` };
+    }
+    this.pathfinder?.setGoal(built);
     this.state = {
       mode: "come",
       target: null,
@@ -221,6 +287,19 @@ export class FollowController {
   followGoal(entity: unknown): { kind: "follow"; entity: unknown; distance: number } | null {
     if (entity === null || entity === undefined) return null;
     return { kind: "follow", entity, distance: FOLLOW_DISTANCE };
+  }
+
+  /**
+   * Would a goal build succeed? Checked before anything is set, so a missing goal library
+   * is a refused command with a logged reason rather than a crash on the next tick.
+   */
+  canBuildGoals(): boolean {
+    try {
+      this.goalFactory.near(0, 0, 0, 1);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 

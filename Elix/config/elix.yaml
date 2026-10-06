@@ -71,6 +71,22 @@ safety:
 #   tryhard  fast reactions, fights back
 skillCap: normal
 
+# WHO may command Elix to move (follow / come / stop / gather / craft / give).
+#
+# EMPTY IS THE DEFAULT, and that is the point: nobody can move the bot until you add
+# yourself. Everyone else gets one short polite refusal, at most once every 10 minutes.
+#
+# READ THIS BEFORE YOU ADD A NAME. In OFFLINE mode the server accepts any username, so a
+# name here can be typed by anybody - no password, no session. `whitelist off` plus a
+# guessed name is enough, and names are not secret (they are in the tab list).
+#
+# So this list is only as safe as your server's login and firewall. On a cracked server with
+# no authentication there are no real owners, and a longer list does not make it one.
+#
+#   owners:
+#     - YourMinecraftName
+owners: []
+
 persona: config/persona.md
 dataDir: data
 logLevel: info

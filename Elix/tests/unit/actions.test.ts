@@ -16,6 +16,7 @@
  */
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { Vec3 } from "vec3";
 import {
   BotSession,
   FOLLOW_TICK_MS,
@@ -24,7 +25,7 @@ import {
   type SessionDeps,
   type Vec3Like,
 } from "../../src/connection/bot.js";
-import { FollowController, TARGET_LOST_MS } from "../../src/actions/follow.js";
+import { FollowController, TARGET_LOST_MS, realGoalFactory } from "../../src/actions/follow.js";
 import { allCommandForms, parseCommand } from "../../src/actions/commands.js";
 import { bus } from "../../src/core/events.js";
 import type { ElixConfig } from "../../src/core/config.js";
@@ -121,6 +122,7 @@ function harness(players: Record<string, unknown>, options: { gateBlocks?: boole
   const bots: FakeBot[] = [];
   const pf: FakePathfinder = { setGoal: vi.fn(), stop: vi.fn() };
   const sayLines: string[] = [];
+  const ownGated: string[] = [];
   const gated: Array<{ sender: string; message: string }> = [];
   const bridge = {
     handle: vi.fn(async () => ({ replied: false, reason: "not-addressed" })),
@@ -129,7 +131,10 @@ function harness(players: Record<string, unknown>, options: { gateBlocks?: boole
       gated.push({ sender, message });
       return options.gateBlocks === true;
     }),
-    gateOwnLine: vi.fn(async () => false),
+    gateOwnLine: vi.fn(async (sender: string) => {
+      ownGated.push(sender);
+      return false;
+    }),
     hasPendingAudits: () => false,
     hasUnsettledAudits: () => false,
     inFlightCount: 0,
@@ -163,6 +168,7 @@ function harness(players: Record<string, unknown>, options: { gateBlocks?: boole
     sayLines,
   };
   (h as unknown as { gated: typeof gated }).gated = gated;
+  (h as unknown as { ownGated: string[] }).ownGated = ownGated;
   return h;
 }
 
@@ -178,6 +184,27 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
 });
+
+/**
+ * The four calls mineflayer-pathfinder 2.4.5 makes on a goal every physicsTick.
+ *
+ * Copied from the library's own index.js, because the point of the contract test is that
+ * these four calls work on whatever the controller built - not that the controller's intent
+ * object is shaped the way the intent object was.
+ */
+function exerciseGoalLikeThePathfinder(goal: unknown): void {
+  const g = goal as {
+    isValid: () => boolean;
+    hasChanged: () => boolean;
+    heuristic: (n: unknown) => number;
+    isEnd: (n: unknown) => boolean;
+  };
+  const node = new Vec3(0, 65, 0);
+  g.isValid();
+  g.hasChanged();
+  g.heuristic(node);
+  g.isEnd(node);
+}
 
 /* ---------------------------------------------------------------- the parser */
 
@@ -225,13 +252,21 @@ describe("C — the command list is one auditable table", () => {
 
 /* ------------------------------------------------------------ the controller */
 
-describe("C — the controller", () => {
+describe("C — the controller, with REAL pathfinder goals", () => {
   const pf = () => ({ setGoal: vi.fn(), stop: vi.fn() });
+  // U1: the library's own goals, not a description of them. A fake goal factory is exactly
+  // what shipped in Round 15 and it accepted an object the real pathfinder throws on.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const goals = realGoalFactory(() => require("mineflayer-pathfinder") as never);
+  /** A mineflayer-shaped entity, because GoalFollow reads `entity.position` on construction. */
+  const TARGET = { username: "Steve", position: new Vec3(5, 65, 0), isValid: true, height: 1.8 };
+  const controller = (p: ReturnType<typeof pf>, now = () => 1000): FollowController =>
+    new FollowController(p, now, goals);
 
   it("stop is synchronous and clears the goal with one call", () => {
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    c.follow({ id: 1 }, "Steve");
+    const c = controller(p);
+    c.follow(TARGET, "Steve");
     expect(c.busy).toBe(true);
     c.stop();
     // No await anywhere on this path. A stop that can be delayed is not a stop.
@@ -239,27 +274,34 @@ describe("C — the controller", () => {
     expect(c.busy).toBe(false);
   });
 
-  it("follow builds GoalFollow on the LIVE entity at 2-3 blocks", () => {
+  it("follow builds a REAL GoalFollow on the live entity at 2-3 blocks", () => {
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    const entity = { position: { x: 5, y: 65, z: 0 } };
+    const c = controller(p);
+    const entity = { position: new Vec3(5, 65, 0), isValid: true, height: 1.8 };
     expect(c.follow(entity, "Steve").ok).toBe(true);
-    expect(p.setGoal).toHaveBeenCalledWith({ kind: "follow", entity, distance: 3 });
+    const goal = p.setGoal.mock.calls[0]?.[0] as { rangeSq?: number };
+    // The library's own class, so the four per-tick calls exist. This is the assertion
+    // Round 15 could not make, because it never built a real goal.
+    expect(typeof (goal as { isValid?: unknown }).isValid).toBe("function");
+    // GoalFollow stores rangeSq, not distance. Asserting on our own field name is how
+    // Round 15 got a green test for a goal the library could not run.
+    expect(goal.rangeSq).toBe(9);
+    expect(() => exerciseGoalLikeThePathfinder(goal)).not.toThrow();
   });
 
   it("follow is REFUSED, not queued, when the target is untracked", () => {
     // mineflayer drops `entity` out of range. A follow that silently does nothing while
     // looking like it works is worse than an honest refusal.
     const p = pf();
-    const c = new FollowController(p, () => 1000);
+    const c = controller(p);
     expect(c.follow(null, "Steve")).toEqual({ ok: false, reason: "target-not-tracked" });
     expect(p.setGoal).not.toHaveBeenCalled();
   });
 
   it("gives up when the target leaves", () => {
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    c.follow({ id: 1 }, "Steve");
+    const c = controller(p);
+    c.follow(TARGET, "Steve");
     expect(c.tick(null, false)).toBe(false);
     expect(c.current.endedBecause).toBe("target-gone");
     expect(p.stop).toHaveBeenCalled();
@@ -267,8 +309,8 @@ describe("C — the controller", () => {
 
   it("gives up when the target dies", () => {
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    c.follow({ id: 1 }, "Steve");
+    const c = controller(p);
+    c.follow(TARGET, "Steve");
     const done = c.tick({ name: "Steve", position: { x: 1, y: 65, z: 0 }, alive: false }, false);
     expect(done).toBe(false);
     expect(c.current.endedBecause).toBe("target-died");
@@ -277,8 +319,8 @@ describe("C — the controller", () => {
   it("survives a brief loss of the entity, then gives up", () => {
     let now = 1000;
     const p = pf();
-    const c = new FollowController(p, () => now);
-    c.follow({ id: 1 }, "Steve");
+    const c = controller(p, () => now);
+    c.follow({ position: new Vec3(1, 65, 0), isValid: true }, "Steve");
     const untracked = { name: "Steve", position: undefined, alive: true };
     now += TARGET_LOST_MS - 1000;
     expect(c.tick(untracked, false)).toBe(true); // round a hill
@@ -290,23 +332,23 @@ describe("C — the controller", () => {
   it("HAZARDS WIN over following, always", () => {
     // The reason for following is not worth a lava pool.
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    c.follow({ id: 1 }, "Steve");
+    const c = controller(p);
+    c.follow(TARGET, "Steve");
     const alive = { name: "Steve", position: { x: 1, y: 65, z: 0 }, alive: true };
     expect(c.tick(alive, true)).toBe(false);
     expect(c.current.endedBecause).toBe("hazard");
     expect(p.stop).toHaveBeenCalled();
   });
 
-  it("come is a single journey to where they were, not a standing follow", () => {
+  it("come builds a REAL GoalNear at where they were, not a standing follow", () => {
     const p = pf();
-    const c = new FollowController(p, () => 1000);
-    c.come({ x: 9, y: 65, z: -3 });
-    expect(p.setGoal).toHaveBeenCalledWith({
-      kind: "near",
-      position: { x: 9, y: 65, z: -3 },
-      radius: 2,
-    });
+    const c = controller(p);
+    expect(c.come({ x: 9, y: 65, z: -3 }).ok).toBe(true);
+    const goal = p.setGoal.mock.calls[0]?.[0] as { x?: number; y?: number; z?: number };
+    expect(goal.x).toBe(9);
+    expect(goal.y).toBe(65);
+    expect(goal.z).toBe(-3);
+    expect(() => exerciseGoalLikeThePathfinder(goal)).not.toThrow();
     c.arrive();
     expect(c.busy).toBe(false);
     expect(c.current.endedBecause).toBe("arrived");
@@ -314,7 +356,7 @@ describe("C — the controller", () => {
 
   it("stop with no pathfinder still clears the state", () => {
     // Nothing may be left believing it is following.
-    const c = new FollowController(null, () => 1000);
+    const c = new FollowController(null, () => 1000, goals);
     expect(() => c.stop()).not.toThrow();
     expect(c.busy).toBe(false);
   });
@@ -332,14 +374,22 @@ describe("C — BotSession, with mineflayer-shaped players", () => {
     await spawn(h, "ElixOwner", "elix follow me");
 
     expect(h.pf.setGoal).toHaveBeenCalledTimes(1);
-    const goal = h.pf.setGoal.mock.calls[0]?.[0] as { kind: string; entity: { position?: unknown } };
-    expect(goal.kind).toBe("follow");
+    // A REAL mineflayer-pathfinder GoalFollow, which is the whole of Round 16's U1: the old
+    // plain object had no isValid(), so the library threw on the next physicsTick.
+    const goal = h.pf.setGoal.mock.calls[0]?.[0] as { entity?: { position?: unknown }; rangeSq?: number; isValid?: () => boolean };
+    expect(typeof goal.isValid).toBe("function");
+    expect(goal.rangeSq).toBe(9);
     // The goal holds the LIVE ENTITY, read through the mineflayer path. Round 13 read
     // `player.position`, which does not exist, so this never fired in a real server.
-    expect(goal.entity?.position).toEqual({ x: 4, y: 65, z: 0 });
+    expect((goal.entity as { position?: unknown } | undefined)?.position).toMatchObject({ x: 4, y: 65, z: 0 });
   });
 
-  it("the acknowledgement goes through the same sender gate as any reply", async () => {
+  it("the acknowledgement goes through gateOwnLine and is NEVER classified", async () => {
+    // Round 16 U5. The old version asserted that the ack went through gateScriptedReply,
+    // which was the bug: that call CLASSIFIES the line it is handed as the sender's own
+    // words, so "on my way" was filed as a safety record against the owner for something
+    // they never said. Elix's own words use gateOwnLine, which waits for what that player
+    // is already owed and classifies nothing.
     const h = harness({ ElixOwner: mineflayerPlayer("ElixOwner", 4) });
     await h.s.start();
     h.bots[0]!.emit("spawn");
@@ -348,8 +398,10 @@ describe("C — BotSession, with mineflayer-shaped players", () => {
     await spawn(h, "ElixOwner", "elix follow me");
 
     const gated = (h as unknown as { gated: Array<{ sender: string; message: string }> }).gated;
-    expect(gated).toHaveLength(1);
-    expect(gated[0]?.message).toMatch(/on my way/i);
+    const own = (h as unknown as { ownGated: string[] }).ownGated;
+    expect(own, "gateOwnLine was not consulted for the acknowledgement").toEqual(["ElixOwner"]);
+    // And nothing Elix said was ever handed to the classifier as the owner's words.
+    expect(gated).toEqual([]);
   });
 
   it("'elix stop' clears the goal within ONE TICK, even mid-reply", async () => {

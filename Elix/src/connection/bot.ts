@@ -23,8 +23,14 @@ import { SayQueue } from "../social/say.js";
 import { WellbeingState, detectWellbeing, type WellbeingLevel } from "../social/wellbeing.js";
 import { DEFAULT_INITIATIVE, type Drive } from "../social/manners.js";
 import { decideInitiative, nextShape } from "./initiative.js";
-import { ACKNOWLEDGEMENTS, NOT_AN_OWNER, parseCommand } from "../actions/commands.js";
-import { COME_RADIUS, FollowController, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
+import {
+  ACKNOWLEDGEMENTS,
+  NOT_AN_OWNER,
+  RefusalThrottle,
+  parseAddressedCommand,
+  type ActionName,
+} from "../actions/commands.js";
+import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { exitCleanly } from "../core/exit.js";
 
 // Several deps (mineflayer-pathfinder, prismarine-chat, minecraft-data) are
@@ -614,7 +620,19 @@ export interface PathfinderModule {
   /** mineflayer plugin; the type lives in mineflayer-pathfinder's .d.ts. */
   pathfinder: (bot: unknown) => void;
   Movements: new (bot: unknown) => Record<string, unknown>;
-  goals: { GoalNear: new (x: number, y: number, z: number, range: number) => unknown };
+  /**
+   * The goal classes Elix actually builds.
+   *
+   * Round 16 cost a full WP here: this type listed only GoalNear, so `GoalFollow` was
+   * `undefined` at runtime and `new undefined(entity, 3)` threw — caught by the
+   * controller's own guard, so every follow silently became "goal-build-failed" and the
+   * probes read "no goal was set" rather than "the library has more goal classes than the
+   * type said". The cast to the real library in a test is what found it.
+   */
+  goals: {
+    GoalNear: new (x: number, y: number, z: number, range: number) => unknown;
+    GoalFollow: new (entity: unknown, range: number) => unknown;
+  };
 }
 
 export function requirePathfinder(): PathfinderModule {
@@ -629,9 +647,35 @@ export function requirePathfinder(): PathfinderModule {
  * every block a placement could target is excluded from the avoid set, so even
  * a path that needs a block fails instead of placing one.
  */
+/**
+ * Has the Movements already been built for this bot?
+ *
+ * Set when `makeSafeMovements` succeeds, and consulted everywhere a movement-capable
+ * session is assumed. A fake bot has no prismarine registry, so the spawn-time walk could
+ * never work in a unit test — and it warned about that every five seconds, which buried the
+ * lines a test actually reads.
+ */
+const movementsReady = new WeakSet<object>();
+
+/** Can this bot's Movements be built at all? Real mineflayer bots always can. */
+export function canConfigureMovements(bot: BotLike): boolean {
+  const registry = (bot as { registry?: unknown }).registry;
+  return registry !== null && registry !== undefined;
+}
+
+/** True once `makeSafeMovements` has succeeded for this bot. */
+export function hasMovements(bot: BotLike): boolean {
+  return movementsReady.has(bot as unknown as object);
+}
+
 export async function makeSafeMovements(
   bot: BotLike,
 ): Promise<Record<string, unknown>> {
+  if (!canConfigureMovements(bot)) {
+    // No registry means no Movements, and the throw would be swallowed into a misleading
+    // "no safe walk direction" every five seconds.
+    throw new Error("no block registry on this bot: Movements cannot be configured");
+  }
   const { Movements } = requirePathfinder();
   const movements = new Movements(bot as never);
   movements.canDig = false;
@@ -650,6 +694,7 @@ export async function makeSafeMovements(
     pathfinder: { setMovements(m: unknown): void };
   }).pathfinder;
   pathfinder.setMovements(movements);
+  movementsReady.add(bot as unknown as object);
   return movements;
 }
 
@@ -779,6 +824,8 @@ export class BotSession {
   private idleBudgetUsed = 0;
   /** C: follow / come / stop. Null until a pathfinder exists. */
   private follow: FollowController | null = null;
+  /** C: one refusal per player per REFUSAL_THROTTLE_MS. */
+  private readonly refusalThrottle = new RefusalThrottle();
   /** C: the follow tick, so a stop takes effect inside one tick. */
   private followTimer: ReturnType<typeof setInterval> | null = null;
   /** C3: the presence diff timer. Cleared with every other timer. */
@@ -930,7 +977,13 @@ export class BotSession {
     // effect inside ONE TICK and the give-up checks have to notice a dead or departed
     // target while it still matters. It reads state and calls the pathfinder; it never
     // awaits anything, so nothing in it can be delayed by a provider.
-    this.follow = new FollowController(pathfinderOf(bot));
+    this.follow = new FollowController(
+      pathfinderOf(bot),
+      () => Date.now(),
+      // U1: the library's own goals, through the existing loader. A plain object here is
+      // what crashed the real pathfinder in Round 16.
+      realGoalFactory(() => requirePathfinder() as never),
+    );
     this.followTimer = setInterval(() => {
       if (this.shutdownRequested || this.ended) return;
       this.follow?.tick(this.followTarget(bot), stopForHazard(bot));
@@ -1035,10 +1088,15 @@ export class BotSession {
       log.info({ greeting, isDay }, "sent greeting");
     }, 2000);
 
-    this.setTimer(() => {
-      if (this.shutdownRequested || this.ended) return;
-      void this.walkAndBack(bot);
-    }, 5000);
+    // Only when the bot could actually move. On a real server this is always true; in a
+    // unit test it never is, and the alternative was a warning every five seconds that had
+    // nothing to do with the behaviour under test.
+    if (canConfigureMovements(bot)) {
+      this.setTimer(() => {
+        if (this.shutdownRequested || this.ended) return;
+        void this.walkAndBack(bot);
+      }, 5000);
+    }
 
     this.setTimer(() => {
       if (this.shutdownRequested || this.ended) return;
@@ -1089,9 +1147,14 @@ export class BotSession {
     // wellbeing check, so a line that matched the floor can never move the bot, and BEFORE
     // the honesty and greeting shortcuts, so "are you a bot, follow me" follows rather
     // than arguing about being a machine.
-    const command = parseCommand(message);
+    // U2 + U3, and this is the gate the whole of Part C hangs on:
+    //   ADDRESSED ONLY, and WHOLE INTENT. parseCommand() is the raw matcher and finds
+    //   "stop" inside "wait for me guys" and inside a question about creepers. Only a line
+    //   addressed to Elix whose whole content, bar two filler words, IS a command counts.
+    //   Everything else falls through to the brain, which is where a question belongs.
+    const command = parseAddressedCommand(message, profile.username);
     if (command) {
-      void this.runCommand(bot, username, message);
+      void this.runCommand(bot, username, command.action, command.matched);
       return;
     }
 
@@ -1391,19 +1454,26 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
   private async runCommand(
     bot: BotLike,
     username: string,
-    message: string,
+    action: ActionName,
+    matched: string,
   ): Promise<boolean> {
     const { log } = this.deps;
-    const command = parseCommand(message);
-    if (!command) return false;
+    const command = { action, matched };
 
     const owners = this.deps.config.owners ?? [];
     const isOwner = owners.some((o) => o.toLowerCase() === username.toLowerCase());
     if (!isOwner) {
+      // U2, second half: at most one refusal per player per ten minutes. A stranger typing
+      // "stop spamming" and being told "i can't do that one" every time turns the bot into
+      // something to poke, and announces that there IS a command behind it.
+      if (!this.refusalThrottle.take(username)) {
+        log.debug({ username }, "refusal throttled");
+        return true;
+      }
       // One short refusal, and no reason given: explaining the rule tells a stranger
       // exactly which rule to look for.
       this.say?.say(NOT_AN_OWNER);
-      log.info({ username }, "command refused: not an owner");
+      log.info({ username, matched }, "command refused: not an owner");
       return true;
     }
 
@@ -1418,15 +1488,21 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     const started =
       command.action === "follow"
         ? this.startFollow(bot, username)
-        : this.startCome(bot);
+        : // U4: the SPEAKER. The old code took the nearest player, so "come here" from
+          // someone 12 blocks away walked to a stranger at 3.
+          this.startCome(bot, username);
 
     const ack = ACKNOWLEDGEMENTS[command.action];
     const bridge = this.deps.chatBridge;
-    // The SAME sender gate as any reply. If it blocks, the action has already happened and
-    // only the acknowledgement is dropped.
-    if (bridge?.gateScriptedReply) {
+    // U5: gateOwnLine, NEVER gateScriptedReply.
+    //
+    // gateScriptedReply CLASSIFIES the line it is handed, as the sender's own words. "on my
+    // way" is ELIX's, so passing it there files a safety record against the owner for
+    // something they never said - the Round 14 R3 bug, back through a different door.
+    // gateOwnLine only waits for what that player is already owed, and classifies nothing.
+    if (bridge?.gateOwnLine) {
       try {
-        const suppressed = await bridge.gateScriptedReply(username, ack, this.say ?? undefined);
+        const suppressed = await bridge.gateOwnLine(username);
         if (suppressed) {
           log.info({ username, action: command.action }, "command: ack suppressed by the gate");
           return true;
@@ -1451,11 +1527,11 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
   }
 
   /** C: GoalNear at the position AT THE MOMENT of the command, then stop. */
-  private startCome(bot: BotLike): { ok: boolean; reason?: string } {
+  private startCome(bot: BotLike, target: string): { ok: boolean; reason?: string } {
     const me = bot.entity?.position;
     if (!me) return { ok: false, reason: "no-position" };
-    const target = nearestPlayerName(mapPlayerPositions(bot.players), this.deps.profile.username, me);
-    if (target === null) return { ok: false, reason: "nobody-nearby" };
+    // The person who asked, not the person nearest. If they are not tracked there is
+    // nothing to walk to, and a refusal beats walking to a stranger.
     const pos = playerPosition(bot.players?.[target]);
     if (!pos) return { ok: false, reason: "target-not-tracked" };
     return this.follow?.come(pos) ?? { ok: false, reason: "no-pathfinder" };

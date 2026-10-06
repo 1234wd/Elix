@@ -98,6 +98,111 @@ function escapeRegExp(text: string): string {
 }
 
 /**
+ * Filler words allowed between Elix's name and the command.
+ *
+ * Two of them, not twenty. Every filler word is a hole in the whole-intent rule, and the
+ * rule exists so that a QUESTION containing "stop" is answered instead of obeyed. "elix how
+ * do i stop creepers from blowing up my house" must not become a stop command, and a
+ * generous filler list is how that bug comes back.
+ */
+export const FILLER_WORDS: ReadonlySet<string> = new Set([
+  "please",
+  "pls",
+  "plz",
+  "now",
+  "bro",
+  "yaar",
+  "ok",
+  "okay",
+]);
+
+/** How many filler words may sit between the name and the command. */
+export const MAX_FILLER_WORDS = 2;
+
+/**
+ * The command in a line that was ADDRESSED to Elix, or null.
+ *
+ * This is what `BotSession` uses. `parseCommand` is the raw matcher and will happily find
+ * "stop" inside a question, which is correct for its job and wrong for this one.
+ *
+ * Two rules, both measured in Round 16:
+ *
+ *  - ADDRESSED ONLY. "wait for me guys" is one player talking to another, and treating it
+ *    as a command lets a stranger stop Elix by accident — or on purpose, by typing six
+ *    words that look like chat.
+ *  - WHOLE INTENT. After removing Elix's name and up to two filler words, what is left must
+ *    be EXACTLY a command form. So "elix follow me" is a command and
+ *    "elix how do i stop creepers from blowing up my house" is a question.
+ *
+ * The consequence is that anything not exactly a command goes to the brain as normal chat,
+ * which is where a question belongs.
+ */
+export function parseAddressedCommand(message: string, botName: string): CommandMatch | null {
+  const normalised = normaliseCommand(message);
+  if (normalised.length === 0) return null;
+
+  // Addressed, as a whole word, case-insensitively. The line has already been lowercased
+  // by normaliseCommand, so matching the configured name case-sensitively never matched
+  // anything at all — `regex(/(?:^|\s)Elix(?:$|\s)/)` against "elix follow me" is false.
+  // Round 16 measured this as "follow me does nothing", which is the safest possible
+  // failure and therefore the hardest one to notice.
+  const escaped = escapeRegExp(botName.toLowerCase());
+  const nameRe = new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`, "iu");
+  if (!nameRe.test(normalised)) return null;
+
+  // Strip the name, then up to MAX_FILLER_WORDS leading filler words.
+  const withoutName = normalised.replace(nameRe, " ").replace(/\s+/gu, " ").trim();
+  const words = withoutName.split(" ").filter(Boolean);
+  let i = 0;
+  while (i < words.length && i < MAX_FILLER_WORDS && FILLER_WORDS.has(words[i] as string)) i++;
+  const remainder = words.slice(i).join(" ");
+  if (remainder.length === 0) return null;
+
+  // EXACT match, not containment. This single rule is what keeps
+  // "elix stop spamming" from stopping Elix.
+  for (const [action, forms] of FORMS) {
+    for (const form of forms) {
+      if (remainder === form) return { action, matched: form };
+    }
+  }
+  return null;
+}
+
+/**
+ * How often one player may be told "i can't do that one".
+ *
+ * Round 16 measured a stranger saying "stop spamming the chat" and being told he cannot,
+ * which turns a bot into a thing to poke. Once per ten minutes is enough for the owner to
+ * learn and not enough to be a nuisance.
+ */
+export const REFUSAL_THROTTLE_MS = 10 * 60_000;
+
+/** Per-player refusal throttle. Small enough to hold in a field. */
+export class RefusalThrottle {
+  private readonly lastAt = new Map<string, number>();
+
+  constructor(private readonly windowMs: number = REFUSAL_THROTTLE_MS) {}
+
+  /** True when this player may be refused now; records the refusal. */
+  take(player: string, now: number = Date.now()): boolean {
+    const last = this.lastAt.get(player);
+    if (last !== undefined && now - last < this.windowMs) return false;
+    this.lastAt.set(player, now);
+    return true;
+  }
+
+  /** Has this player been refused inside the window? Read-only, for tests. */
+  isThrottled(player: string, now: number = Date.now()): boolean {
+    const last = this.lastAt.get(player);
+    return last !== undefined && now - last < this.windowMs;
+  }
+
+  get size(): number {
+    return this.lastAt.size;
+  }
+}
+
+/**
  * The short acknowledgement for an accepted command.
  *
  * Lowercase, no punctuation, one line. A player who says "come here" in front of three
