@@ -55,7 +55,8 @@ export interface FoodDef {
 interface McData {
   version: { minecraftVersion: string };
   itemsByName: Record<string, ItemDef>;
-  items: ItemDef[];
+  /** Keyed by NUMERIC ID as a string in minecraft-data, NOT by name and NOT an array. */
+  items: Record<string, ItemDef>;
   blocksByName: Record<string, { id: number; name: string }>;
   foods: Record<string, FoodDef>;
   entities: Record<string, unknown>;
@@ -141,6 +142,16 @@ export function foodsByName(version: string = VENDORED_VERSION): Map<string, Foo
  */
 export function foodQuality(name: string, version: string = VENDORED_VERSION): number {
   return foodsByName(version).get(name)?.effectiveQuality ?? 0;
+}
+
+/** Every item definition, in the order minecraft-data lists them. */
+export function allItems(version: string = VENDORED_VERSION): ItemDef[] {
+  return Object.values(dataForVersion(version)?.items ?? {});
+}
+
+/** One item by numeric id, or null. `harvestTools` is keyed by these ids. */
+export function itemById(id: number | string, version: string = VENDORED_VERSION): ItemDef | null {
+  return dataForVersion(version)?.items[String(id)] ?? null;
 }
 
 /** Block facts by name, or an empty map. */

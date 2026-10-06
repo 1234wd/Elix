@@ -21,7 +21,14 @@
  */
 
 /** What a line can ask Elix to do. Nothing else is reachable. */
-export type ActionName = "follow" | "come" | "stop";
+/**
+ * What an owner can tell Elix to do.
+ *
+ * `gather`, `craft` and `give` are WP5/WP8 actions. They live here rather than in the skill
+ * modules because this is where "is this addressed, whole-intent and allowed" is decided, and
+ * that decision must be made once.
+ */
+export type ActionName = "follow" | "come" | "stop" | "gather" | "craft" | "give" | "goTo" | "remember";
 
 export interface CommandMatch {
   action: ActionName;
@@ -208,10 +215,11 @@ export class RefusalThrottle {
  * Lowercase, no punctuation, one line. A player who says "come here" in front of three
  * others should not read a paragraph.
  */
-export const ACKNOWLEDGEMENTS: Readonly<Record<ActionName, string>> = {
+export const ACKNOWLEDGEMENTS: Readonly<Partial<Record<ActionName, string>>> = {
   follow: "on my way",
   come: "coming",
   stop: "ok, stopping",
+  gather: "on it",
 };
 
 /**

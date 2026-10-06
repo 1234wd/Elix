@@ -2030,7 +2030,7 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     this.head?.cancel();
     this.glances?.clear();
       log.info({ username, matched: command.matched }, "command: stop");
-      this.say?.say(ACKNOWLEDGEMENTS.stop);
+      this.say?.say(ACKNOWLEDGEMENTS["stop"] ?? "ok");
       return true;
     }
 
@@ -2063,7 +2063,7 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     if (!started.ok) {
       log.info({ username, action: command.action, reason: started.reason }, "command: not started");
     }
-    this.say?.say(ack);
+    this.say?.say(ack ?? "ok");
     return true;
   }
 
