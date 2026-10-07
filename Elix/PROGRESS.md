@@ -3,8 +3,14 @@
 Backlog WP1–WP12 from `docs/LONG_RUN_BRIEF.md`. One commit per WP: `WPn: <title>`. Never
 leave the tree red.
 
-**If this file and `docs/LONG_RUN_BRIEF.md` are all you have: WP1–WP10 are DONE. Resume at
-WP11** (split `bot.ts` and `bridge.ts`), then WP12 (voice plan) if there is time.
+Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
+
+**RESUME HERE: R18-C — wire gather (probe X3).** R18-A and R18-B are DONE. X3–X7 remain:
+gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
+
+The single most important rule this round is §1 of the brief: **an item is DONE only with a
+BotSession-level test that drives the feature to a real mineflayer call.** Round 17 shipped 370
+tests and a whole feature set that the bot could not do, because nothing called it.
 
 Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`,
 `round15Probes.test.ts`, `round16Probes.test.ts`. All green after every WP.
@@ -25,6 +31,61 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | WP10 e2e rows | **DONE** | `3564c4e` | — (script) | command rows, opt-in `--owners`, ❌ **not run** — no server reachable from here |
 | WP11 Split bot.ts / bridge.ts | **PARTIAL** | `0d74e79` | — (no test changes) | hazard + reflex-adapter blocks moved out, re-exported; bot.ts 2600 → 2249 |
 | WP12 Voice plan | **DONE** | see log | — (document) | `docs/VOICE_PLAN.md`; no code, no runtime deps |
+
+## Round 18 — item state
+
+| Item | Status | Commit | Probes |
+| --- | --- | --- | --- |
+| R18-A portability | **DONE** | `f99b70b` | X0 ✅ |
+| R18-B reflex units | **DONE** | `f4432c9` | X1 ✅ X2 ✅ |
+| R18-C wire gather | **NEXT** | — | X3 ❌ |
+| R18-D wire craft | TODO | | — |
+| R18-E wire give/deposit | TODO | | X4 ❌ |
+| R18-F wire world memory | TODO | | X5 ❌ |
+| R18-G wire tool calls | TODO | | X6 ❌ |
+| R18-H wire NVIDIA/Ollama | TODO | | X7 ❌ |
+| R18-I wiring audit | TODO | | — |
+| R18-J setup wizard | TODO | | — |
+| R18-K sleep | TODO | | — |
+| R18-L finish splitting | TODO | | — |
+| R18-M voice step 1 | TODO | | — |
+
+Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
+fixture check).
+
+### R18-A — how the fresh-clone gate works, and the ordering problem
+
+`scripts/fresh-gate.ps1` (git root) clones into `.fresh/`, installs, and runs the three gates.
+Two things that cost time and will again:
+
+- **It clones from git, so it can only see COMMITTED work.** Commit first, then gate. A gate run
+  before the commit tests the previous commit and will "fail" on work that is already correct.
+- PowerShell treats pnpm's stderr banner as a terminating error under `ErrorActionPreference =
+  'Stop'`. The script keeps `Continue` and judges each gate by its own exit code.
+
+### R18-B — the real bug, and the trap behind it
+
+`bot.oxygenLevel` is `Math.round(air_supply / 15)` — **0 to 20**. The threshold was 120, on a
+0-300 scale, so in ANY water at FULL air the breathe reflex fired every tick and outranked
+follow, defend and everything else. On a live server that is a bot that swims up constantly and
+ignores its owner. Now `LOW_OXYGEN = 6` and the unknown-field fallback is 20, not 300.
+
+`MINECRAFT_SCALES` in `src/reflexes/decide.ts` holds the documented ranges in one place
+(health 0-20, food 0-20, foodSaturation 0-20, oxygenLevel 0-20) so there is one place to check
+them against `node_modules/mineflayer/docs/api.md`.
+
+`swim-up` now calls `bot.setControlState("jump", true)` for `JUMP_HOLD_TICKS` (8 ticks =
+400 ms) and releases it. `stop()` releases jump too — a stop that clears control states but not
+the key Elix is physically holding leaves him jumping in place.
+
+Two more bugs found on the way:
+
+- **`runReflexes` read `interruptedFollow` one tick late.** It does `void runner.tick()` and
+  then asks whether follow is being held off, and the answer was always about the PREVIOUS
+  tick. `tick()` now settles that flag before its first await.
+- **A patch script aborted mid-run and wrote nothing**, which silently dropped the jump press
+  and cost twenty minutes of staring at correct code. **Every `.cjs` patch script must verify it
+  found every anchor before writing** — and if it throws, assume NOTHING landed.
 
 ## WP11 — PARTIAL, and exactly what is left
 
