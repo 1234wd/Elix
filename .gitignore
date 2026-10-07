@@ -13,3 +13,4 @@ build/
 *.zip
 Elix.zip
 opencode.json
+.fresh/

@@ -1,59 +1,65 @@
-# ROUND 17 — LONG RUN, continued (plan for 5+ hours of continuous work)
+# ROUND 18 — LONG RUN (plan for 5+ hours of continuous work)
 
-You are continuing the Elix project at commit e380f01. WP1 is DONE (7f18574) and the reviewer re-ran everything on a fresh clone: typecheck 0, lint 0, 1554 passed / 2 skipped, all four probe files green. Good work on WP1, and especially on the three bugs you found behind U1.
+You are continuing the Elix project at ba2c275. The reviewer re-ran everything on a **fresh clone** and read the wiring. Round 17 wrote a lot of good, well-tested logic: the reflexes, defend, gaze, the armour and damage tables, and the twelve bugs you found and fixed. But **much of it is not connected to the running bot**, and that changes what "done" means from now on.
 
-**The last session stopped after 33 minutes to ask questions. That must not happen again.** Your four questions are answered in §1 below, and from now on a question is never a reason to stop.
+What the reviewer measured on ba2c275:
+- **Fresh clone fails: 3 tests.** `craft.test.ts`, `gather.test.ts` and `give.test.ts` read mineflayer from a hard-coded, machine-specific pnpm path (`node_modules/.pnpm/mineflayer@4.39.0_patch_has_35aecf.../...`). That path only exists on your Windows machine.
+- **Not wired (no production caller):**
+  - gather, craft and give: there is no `bot.dig`, `bot.craft` or `bot.toss` anywhere in `src/`;
+  - places, where-is and where-did-I-die: `parseRemember`, `parseWhereIs` and `parseWhereDied` are never called, and `bot.whisper` is never called;
+  - tool calls: `parseToolCalls` is only used inside `toolCalls.ts`;
+  - NVIDIA and Ollama: `buildBrain()` only constructs `groq` and `hf`.
+
+  None of the 370 new tests drive a `BotSession`. Your live-test table told the owner to type `elix get 10 cobblestone`, `elix give me <item>` and `elix remember this place as testspot`. All three go to the chat model, and nothing happens.
+- **Breathe reflex uses the wrong scale.** It assumes oxygen runs 0–300 (`LOW_OXYGEN = 120`). mineflayer's `bot.oxygenLevel` is 0–20 (`lib/plugins/breath.js`: `Math.round(air / 15)`). So in any water, at full air, "breathe" fires on every tick and outranks follow and defend. When it fires, `swim-up` only looks up and never presses jump.
+- **Wired and plausible:** the reflex runner (eat, armour, creeper), defend (`bot.attack`), gaze and crouch, and follow / come / stop.
+
+The reviewer added `tests/unit/round18Probes.test.ts`. On ba2c275, **8 fail and 1 passes** (X0–X7, listed in the probe file's header). Make all 9 pass by fixing the CODE.
 
 ---
 
 ## 0. How to work for a long time without stopping
 
-**Step 0, before anything else:** save this whole message, unchanged, as `docs/LONG_RUN_BRIEF.md` inside the Elix project folder (next to `docs/VISION.md`), and commit it as `docs: long-run brief`. From now on, `docs/LONG_RUN_BRIEF.md` plus `PROGRESS.md` are everything a fresh session needs. **If your context is reset, compacted or restarted, read those two files first and continue from the first unfinished WP.**
+**Step 0, before anything else:** overwrite `docs/LONG_RUN_BRIEF.md` with this whole message, unchanged, and commit it as `docs: round 18 brief`. If your context is reset, compacted or restarted, read `docs/LONG_RUN_BRIEF.md` and `PROGRESS.md` first, and continue from the first unfinished item.
 
-1. **Permissions are pre-approved.** The owner configured OpenCode to allow edits and shell commands without approval. There is nothing to wait for. Asking questions is disabled for this run: do not try to ask the owner anything.
-2. **A question is never a stop condition.** Write it under "Questions for the owner" in `PROGRESS.md`, pick the safest reasonable default, record it under "Deviations", and keep working.
-3. **Partial progress beats a blocked WP.** If one part of a WP is blocked, finish every other part, commit, mark the WP **PARTIAL** with the reason, and move on.
-4. **Low context is not a stop condition either.** Update `PROGRESS.md` (exact next step, open files, failing test if any), then carry on. If the tool restarts the session, Step 0 still applies.
-5. **One WP at a time, no reports in between.** For each WP:
-   1. Read only the code you need.
-   2. Write the acceptance tests first and watch them fail.
-   3. Implement.
-   4. Run `pnpm typecheck`, `pnpm lint` and `pnpm test`, then `tests/unit/secrets.test.ts`.
-   5. Commit as `WPn: <title>`.
-   6. Update `PROGRESS.md`.
-   7. **Go straight to the next WP.**
-6. **Time box: 90 minutes per WP.** If gates are not green after 90 minutes, `git reset --hard` to the last WP commit (local only), mark the WP BLOCKED with the failing test name and one paragraph on why, and move on. Never commit red.
-7. **Stop only when:**
-   - every WP is DONE, PARTIAL or BLOCKED;
+1. **Permissions are pre-approved, and questions are disabled.** Never wait for approval. Never ask. Write questions into `PROGRESS.md`, take the safest default, record it under "Deviations", and keep going.
+2. **The fresh-clone gate runs INSIDE the workspace.** Last session you lost it because the temp directory is outside the allowed folders.
+   - Add `.fresh/` to the root `.gitignore`.
+   - Clone with `git clone . .fresh/elix` from the git root, then run `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint` and `pnpm test` inside `.fresh/elix/Elix`.
+   - Run this gate at the end of **every** item, not only at the end of the round. Delete `.fresh/` and re-clone each time.
+3. **One item at a time, no reports in between.** For each item:
+   1. Write the acceptance tests first and watch them fail.
+   2. Implement.
+   3. Run the working-tree gates, then the fresh-clone gate, then `secrets.test.ts`.
+   4. Commit as `R18-<letter>: <title>`.
+   5. Update `PROGRESS.md`.
+   6. **Go straight to the next item.**
+4. **Partial beats blocked.** If part of an item is blocked, finish the rest, commit, mark it PARTIAL with the reason, and move on.
+5. **Time box: 90 minutes per item.** If gates are not green after 90 minutes, `git reset --hard` to the last item commit (local only), mark the item BLOCKED with the failing test and why, and move on. Never commit red.
+6. **Stop only when:**
+   - every item is DONE, PARTIAL or BLOCKED;
    - a gate cannot be made green even after reverting; or
-   - a step would need a secret, a push, or deleting data outside the repo.
+   - a step would need a secret, a push, or deleting anything outside the repo.
+
+   A question, low context, or "this is hard" is never a stop.
 
 ---
 
-## 1. The owner's answers to your four questions
+## 1. The new definition of DONE (this round's most important rule)
 
-**Q1. Armour points and attack damage: neither of your two options as written.** Your `MATERIAL_TIER` default is **wrong**, so do not use it. It ranks gold above iron and chainmail. In the game, gold armour is weaker than both chainmail and iron, and a golden sword or axe hits less hard than an iron one.
+An item is **DONE** only when **all** of these hold:
+- A **`BotSession`-level test** drives the feature from its real trigger (a chat line, a tick, or a server event) through to a **real mineflayer API call** on a mineflayer-shaped fake bot. For example: `bot.dig(block)`, `bot.toss(type, metadata, count)`, `bot.whisper(name, text)`, `bot.pathfinder.setGoal(realGoal)`, `bot.setControlState("jump", true)`.
+- Every exported function in the new modules has a **production caller**, or an entry in the wiring allow-list (R18-I) with a one-line reason.
+- The **fresh-clone gate** is green.
 
-Do this instead:
-- Build two explicit tables, `ARMOR_POINTS` (per armour item) and `MELEE_DAMAGE` (per weapon or tool item).
-- Take the values from the Minecraft Wiki pages (Armor, Sword, Axe, Spear, Mace, Trident) using your web tool. Put the URL and the access date in a comment above each table.
-- They must cover **every** armour and melee item in the vendored 26.2 `items.json`. That is 29 armour pieces, including the copper set and the turtle helmet, plus swords, axes, spears, the mace and the trident.
-- Add a **completeness test** that iterates the vendored 26.2 items and fails if one is missing, so a future item fails loudly.
-- If you cannot verify a value from the wiki (new copper or spear items, for example), **leave that item out of auto-equip**, list it in `PROGRESS.md`, and never guess a number.
-- Food ranking uses the vendored `foods.json` `effectiveQuality`, as you found.
-
-**Q2. Yes.** Everything version-sensitive reads the vendored 26.2 data, through **one** accessor module (or `bot.registry` for the connected version at runtime). Add a test that fails if any `src/` module loads a hard-coded older `minecraft-data` version, or joins `foods` to `items` through the installed 1.21.x package.
-
-**Q3. Global `owners`: agreed.**
-
-**Q4. e2e command rows opt-in via `--owners`: agreed.**
+A feature that only has module-level tests is **PARTIAL**, never DONE. In the final report, the owner's live-test list may only contain features that are DONE by this definition.
 
 ---
 
-## 2. Hard rules (these apply to every WP)
+## 2. Hard rules (these apply to every item)
 
-- **Read-only files:** `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`, `round15Probes.test.ts` and `round16Probes.test.ts`. Never edit their assertions, delays or timeouts. They must all stay green after every WP.
-- **Never weaken an existing test to make it pass.** You may change a test you wrote yourself **only** when it encodes a bug this backlog is fixing. Each such change must be listed under "Deviations" with a one-line reason. (WP1 used this for three of your own tests, which is fine.)
+- **Read-only files:** `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`, `round15Probes.test.ts`, `round16Probes.test.ts` and `round18Probes.test.ts`. Never edit their assertions, delays or timeouts. They must all stay green after every WP.
+- **Never weaken an existing test to make it pass.** You may change a test you wrote yourself **only** when it encodes a bug this backlog is fixing. Each such change must be listed under "Deviations" with a one-line reason.
 - **Mineflayer-shaped data.** In tests, a player is `{ username, entity?: { position: Vec3, isValid, ... } }`, and positions are real `Vec3` objects from the `vec3` package. Mobs are mineflayer `Entity`-shaped (`name`, `type`, `position: Vec3`, `isValid`, `health` where relevant). No `as` casts on mineflayer objects; use runtime guards.
 - **NEW: real-library contract rule.** Anything handed to a third-party library (pathfinder goals, `Movements`, `bot.equip` / `bot.dig` / `bot.craft` / `bot.toss` arguments, `minecraft-data` lookups) must be checked against the **real** library in at least one test. A fake must never accept something the real library would reject. Round 15 shipped 22 green tests while every goal it built crashed the real pathfinder on the first tick.
 - **Every line Elix sends goes through the existing gates:**
@@ -70,159 +76,91 @@ Do this instead:
   - never dig within `protectedRadius` (default 24) of a remembered place (WP6);
   - only owners can command;
   - commands must be addressed to Elix.
-- **New code goes in new modules:** `src/reflexes/`, `src/skills/`, `src/world/`, `src/brain/providers/`. `bot.ts` (1,932+ lines) and `bridge.ts` (1,505+ lines) only get wiring lines until WP11.
+- **New code goes in new modules.** `bot.ts` (2,411 lines) and `bridge.ts` (1,532 lines) only get wiring lines until R18-L splits them.
 - **No new runtime dependencies** unless written down in `DECISIONS.md` with a reason. Prefer small in-house code over adding `mineflayer-pvp` and similar packages. `mineflayer-pathfinder`, `vec3` and the vendored `minecraft-data` are already available.
 - **Never** push, touch `.env`, print, log or commit a key, or commit the server IP anywhere new.
 - **Honesty in `PROGRESS.md`.** If something was not run, it says ❌. A test that only exercises a fake does not count as "live".
 
 ---
 
-## 3. The backlog (continue in this order; WP1 is done)
+## 3. The backlog (in this order)
 
-### WP1 — Part C against the real pathfinder: **DONE** (7f18574)
+### R18-A — Portability (probe X0)
+- Replace the hard-coded `node_modules/.pnpm/...` paths in `craft.test.ts`, `gather.test.ts` and `give.test.ts` with `createRequire(import.meta.url).resolve("mineflayer/lib/plugins/<file>.js")`. If the package's `exports` blocks deep paths, resolve `mineflayer/package.json` and join from its directory.
+- Prefer calling the real function over reading its source text, where possible.
+- Set up the in-workspace fresh-clone gate (§0.2) and run it.
 
-Keep `round16Probes` and `pathfinderContract` green after every WP.
+### R18-B — Reflex units against mineflayer (probes X1, X2)
+- `bot.oxygenLevel` is 0–20. Re-base the breathe threshold on that scale (e.g. low at ≤ 6), and remove the 300 fallback.
+- `swim-up` must press `jump` (`bot.setControlState("jump", true)`) while active and release it when done. It must never leave jump held after a stop.
+- **Audit every number the reflexes and defend read** against `node_modules/mineflayer/docs/api.md`: `health` 0–20, `food` 0–20, `foodSaturation`, `oxygenLevel` 0–20, `entity.isInWater`, entity `health` when present. Add one test per field that names its documented range.
 
-### WP2 — Survival reflexes (no LLM, runs on the tick): resume here
+### R18-C — Wire gather (probe X3)
+- Chat: owner-only, addressed, whole-intent, using the same parser rules as follow/come/stop. "elix get 5 dirt", "elix get wood", "elix mine 10 stone" run the skill. Nothing reaches the chat model.
+- **Protection rule update:** now that places exist, protect remembered places (`protectedRadius`, default 24). **Do not** protect the owner's surroundings. Gathering next to the owner must work. Never dig the block another player stands on, or any block within 2 blocks of another player (Elix himself does not count).
+- Runtime: find a candidate with `bot.findBlocks`, walk there with a **real** `GoalGetToBlock` or `GoalNear`, equip the best tool from `harvestTools` (`bot.equip`), call `bot.dig(block)`, and collect the drops by walking over them. Cap at 64 items or 5 minutes. Progress lines go through `gateOwnLine`, at most one every 60 s. `elix stop` cancels it within one tick, including mid-dig (`bot.stopDigging()`).
+- **BotSession tests:** owner's line → `setGoal` and then `dig` on an allow-listed block; a non-owner gets nothing; the wellbeing floor beats it; stop cancels a dig in progress; a block inside a remembered place's radius is refused.
 
-New `src/reflexes/`. Each reflex is a pure decision function plus thin wiring. They run in this priority order, and a higher one interrupts a lower one and any follow or skill. Follow resumes after, if it was active.
+### R18-D — Wire craft
+- "elix make a crafting table", "elix craft 4 sticks", "elix make a wooden pickaxe" use the real `bot.recipesFor(itemId, null, 1, table)` and `bot.craft(recipe, count, table)` with vendored 26.2 data.
+- Place a crafting table only on a valid solid block next to Elix (`bot.placeBlock`), and pick it back up after.
+- **BotSession tests:** a recipe is found and `craft` is called with the real argument order; missing materials get one honest line and no craft; stop cancels.
 
-1. **Breathe:** oxygen low in water → swim up.
-2. **Creeper:** a creeper within 4 blocks → back away to 7 or more blocks. Never melee a creeper.
-3. **Hazards:** keep the existing lava and fall checks.
-4. **Eat:** food ≤ 14 and no hostile within 6 blocks → eat the best food in the inventory, ranked by vendored `foods.json` `effectiveQuality`. Never eat rotten flesh, spider eye, poisonous potato, pufferfish, raw chicken or suspicious stew unless food ≤ 4 and nothing else exists.
-5. **Armor:** equip the best armour and weapon after picking items up, using the `ARMOR_POINTS` and `MELEE_DAMAGE` tables from §1 Q1. Never unequip something better. Unverified items are never auto-equipped.
+### R18-E — Wire give and deposit (probe X4)
+- "elix give me <item> [count]" → walk to the asker (real `GoalNear`), then, on arrival (`goal_reached`, or the distance check on the tick), `bot.toss(type, null, count)`. Only to the asker.
+- "elix put your stuff in the chest" → `bot.openContainer(chestBlock)`, then `container.deposit(...)` for each stack, then `container.close()`. **Never withdraw.**
+- **BotSession tests** for both, including "never withdraw" and stop.
 
-**Acceptance:**
-- one named test per reflex, using a mineflayer-shaped bot (`food`, `oxygenLevel`, `inventory.items()` returning real item names from vendored 26.2);
-- a priority test (a creeper interrupts eating);
-- a stop test (`elix stop` cancels an in-progress eat or flee within one tick);
-- the table completeness test;
-- a test that golden armour never replaces iron or chainmail;
-- real-library contract tests for `bot.equip` and `bot.consume` argument shapes.
+### R18-F — Wire world memory (probe X5)
+- "elix remember this place as <name>", "elix where is <name>", "elix take me to <name>" / "go to <name>", and "elix where did i die" use the memory store's `places` table and the death events (`bot.on("death")`, plus `entityDead` for players).
+- Coordinates go **only** to owners, **only** by `bot.whisper`. Public chat gets a short line with no numbers.
+- **BotSession tests** for each line, plus: no public line ever matches a three-integer coordinate pattern; and a non-owner asking "where is home" gets nothing useful.
 
-### WP3 — Protect the owner (combat, humanized)
+### R18-G — Wire model tool calls (probe X6)
+- The bridge parses the fenced `tool_calls` block from the model's reply, **strips it from the text before anything is said**, and hands valid calls to the **same executor** the chat commands use. One code path, so the allow-list, owner-only rule, protection rules and stop all apply identically.
+- The owner's system prompt documents the tool format briefly. A non-owner's prompt does not mention tools at all.
+- A dropped reply (any gate) drops its calls. Gentle mode allows only `stop` and `follow`. Rate limits as before.
+- **BotSession tests** with a real `ChatBridge` and a fake fetch, like the probe: owner → executed; non-owner → ignored; the block never appears in chat; a dropped reply executes nothing.
 
-New `src/reflexes/defend.ts`. When an owner is within 16 blocks, attack **hostile** mobs (from `minecraft-data` entity categories, not a hand-written name list) that are within 8 blocks of the owner or of Elix.
-
-- Never creepers (WP2 handles them), players, pets, villagers, golems or passive mobs.
-- Humanized: reaction delay 180–320 ms, `skillCap` changes it (casual slower, tryhard faster), respect the 1.9+ attack cooldown, face the target smoothly (WP4's look helper, or a simple eased look if WP4 is not done yet).
-- Retreat toward the owner at health ≤ 6. Stop when the target dies or leaves range. `elix stop` cancels it.
-- If a **player** hits Elix, he does not fight back. He steps away and may say one short line through `gateOwnLine`.
-
-**Acceptance:** tests for target selection (hostile yes; villager, wolf and player no), reaction-delay bounds per `skillCap`, cooldown respected, retreat at low health, stop cancels, and never hitting a player even after being hit by one.
-
-### WP4 — Human-like gaze and body language
-
-New `src/humanizer/look.ts`:
-
-- **Eased head rotation:** move towards a target yaw and pitch over 150–400 ms, with no single-tick turn larger than 40°.
-- **Look at the speaker** when someone addresses Elix and is within 16 blocks.
-- **Crouch-greet:** toggle sneak 2–3 times when an owner joins or says hi.
-- **Idle glances** at a nearby player or mob every 8–20 s, only while idle.
-- All of it is paused during combat, follow, and while a wellbeing reply is being sent. No crouch-greets during gentle mode.
-
-**Acceptance:** tests on the yaw sequence (never above 40° per tick, finishes within 400 ms), speaker look, crouch-greet count, and suppression rules.
-
-### WP5 — Skills: gather, craft, give (owner commands, deterministic)
-
-New `src/skills/`, three sub-packages. Commit each one separately as WP5a, WP5b and WP5c.
-
-- **WP5a, gather:** "elix get wood" / "elix get me 10 cobblestone" / "elix get 5 dirt". Only from a **natural-block allow-list**:
-  - logs, but only when leaves are within 2 blocks (a tree, not a house);
-  - stone, cobblestone, deepslate, dirt, grass_block, sand, gravel;
-  - coal, iron and copper ores, including the deepslate variants.
-
-  Use the best tool (`minecraft-data` `harvestTools`). Never dig within `protectedRadius` of a remembered place (WP6; until WP6 exists, of the owner's position). Cap at 64 items or 5 minutes. Progress lines are rare (at most one every 60 s) and go through `gateOwnLine`.
-- **WP5b, craft:** planks, sticks, crafting table, and wooden and stone pickaxe, axe and sword, via `bot.recipesFor` / `bot.craft` with the real recipe data. Place a crafting table only on a valid solid block next to Elix, and pick it back up after.
-- **WP5c, give / deposit:** "elix give me <item>" → walk to the owner and toss it, only to the owner who asked. "elix put your stuff in the chest" → deposit into the nearest chest within 16 blocks. Never withdraw.
-
-All three: owner-only, addressed, whole-intent (the WP1 parser rules), cancellable by stop, and never run on a wellbeing-floor line.
-
-**Acceptance:** per sub-package, tests with real `minecraft-data` 26.2 recipes, block and tool data; the allow-list refuses planks, glass, wool and any block near a protected place; contract tests for `bot.dig`, `bot.craft` and `bot.toss` argument shapes; stop cancels mid-dig.
-
-### WP6 — World memory: places and deaths
-
-New `src/world/`, stored in the existing SQLite store through a migration that is tested on a copy of an old schema.
-
-- "elix remember this place as home|base|farm|<word>" stores the coordinates, dimension and timestamp.
-- "elix take me home" / "elix go to farm" → GoalNear to that place.
-- Record Elix's and each player's **death position** when the server reports a death. "elix where did i die" answers from memory.
-- Coordinates are told **only to owners, by whisper** (`/msg`), never in public chat.
-- `elix memory places` in the CLI lists them.
-- WP5's `protectedRadius` now uses these places.
-
-**Acceptance:** migration test, command tests, whisper-only test (a public reply never contains three integers in coordinate form), and a gather test that refuses inside a protected radius.
-
-### WP7 — The missing brain tiers: NVIDIA and local Ollama
-
-The vision's order is **Groq → NVIDIA → Hugging Face → local**, but only Groq and HF exist.
-
-- Add an NVIDIA provider (`https://integrate.api.nvidia.com/v1`, OpenAI-compatible, `NVIDIA_API_KEY`). Treat 402 as "credits exhausted": breaker open 24 h.
-- Add an Ollama provider (`http://127.0.0.1:11434/v1`, no key). It is enabled only if reachable at startup; otherwise it is silently absent.
-- Put both in `models.yaml` per role. Choose models from `GET /v1/models` at startup, never hard-coded IDs.
+### R18-H — Wire NVIDIA and Ollama (probe X7)
+- `buildBrain()` constructs `nvidia` when `NVIDIA_API_KEY` is set.
+- `ollama` is added only after an async reachability probe at startup (`GET http://127.0.0.1:11434/v1/models`, 1 s timeout). It is silently absent otherwise.
 - `elix doctor` reports both.
-- `.env.example` gains `NVIDIA_API_KEY=`, with the same "never commit" comment.
+- Tests: the providers map with each env combination; the full fall-through order through `buildBrain` (not just through the router with hand-built providers).
 
-**Acceptance:** fake-fetch tests for the full fall-through order (Groq 429 → NVIDIA → NVIDIA 402 → HF → HF out of credit → Ollama → Ollama down → builtin); the 402 breaker duration; Ollama absent when unreachable; the guard role never falls through to a model that cannot return the JSON verdict.
+### R18-I — Wiring audit (stops this class of bug for good)
+- Add a test that lists every exported function in `src/skills/`, `src/world/`, `src/reflexes/`, `src/brain/toolCalls.ts`, `src/brain/providers/` and `src/humanizer/`, and fails if one is imported by nothing outside its own module and tests.
+- The allow-list (`tests/unit/wiring-allowlist.ts`) holds each intentional exception with a one-line reason. Pure helpers used inside their own module should not be exported at all.
 
-### WP8 — Let the brain ask for actions (constrained tool calls)
+### R18-J — First-run wizard for a non-technical owner
+- `pnpm elix setup` (and `elix.cmd setup`) does the following:
+  - asks for the owner's Minecraft name and writes `owners` in `config/elix.yaml`, keeping comments;
+  - checks which keys are present in `.env` **by name only**, never printing values;
+  - runs `elix doctor`;
+  - prints the next three steps in plain words.
+- Tests with a temp project dir; no real `.env` is read in tests.
 
-The LLM can request actions, but only from a fixed, zod-validated list: `follow`, `come`, `stop`, `gather`, `craft`, `give`, `goTo(place)`, `rememberPlace`. The request is a JSON block that is parsed and validated, never executed as code.
+### R18-K — Sleep when the owner sleeps
+- At night, if an owner is in a bed within 16 blocks and a free bed is within 16 blocks of Elix, walk to it and `bot.sleep(bedBlock)`. Wake on `bot.on("wake")` or at day.
+- Never sleep while a hostile is within 8 blocks, while following, or mid-skill. Stop cancels.
+- **BotSession test** with a mineflayer-shaped bed block.
 
-- Owner-only.
-- A dropped reply (any gate) drops its tool calls.
-- Gentle mode allows only `stop` and `follow`.
-- At most 1 tool call per reply and 6 per minute.
-- Every tool call is logged, without message text.
-- Unknown tools or bad arguments are ignored, with one log line.
+### R18-L — Finish splitting `bot.ts` and `bridge.ts` (no behaviour change)
+- Carry on from the five extraction steps in `PROGRESS.md`. Target: no file over 800 lines.
+- Only import paths may change in tests. If behaviour would change, stop the item and mark it PARTIAL.
 
-**Acceptance:** tests for each rule above, plus: "elix can you grab some wood for us" from an owner leads to gather(wood) through the same code path as the WP5 command; the same line from a non-owner leads to nothing.
-
-### WP9 — Status and first-run safety
-
-- `elix status` (CLI) and an owner-only whispered `elix status` in game. They show: provider health and breaker state, today's call counts per provider, the current action, mood label, number of pending audits, and **no chat text and no keys**.
-- README "First run" checklist:
-  - add your name to `owners`;
-  - firewall the server to your IP;
-  - rotate keys if they were ever shared;
-  - run `pnpm e2e`.
-- `elix doctor` warns when `owners` is empty, and when `online-mode=false` is detected while the configured host is not localhost or a LAN address.
-
-**Acceptance:** tests on status redaction (no key-shaped string, no player message text) and on the doctor warnings.
-
-### WP10 — e2e rows for the owner to run
-
-Extend `scripts/e2e-chat.ts` (ElixTester stands still and only chats):
-
-- come/stop: Elix ends within 3 blocks of the tester within 20 s, then stops;
-- "elix give me <item>" when Elix has one;
-- "elix remember this place as testspot", then "elix where is testspot" (whispered);
-- a non-owner command gets the refusal once.
-
-Owners for the run come from `--owners ElixTester` only. Do **not** run it if you cannot reach the server. Write the exact commands into the final report.
-
-### WP11 — Make `bot.ts` and `bridge.ts` maintainable (no behaviour change)
-
-Purely mechanical. Move code out of `bot.ts` into `src/connection/` modules: chat dispatch, initiative wiring, presence, crash guards, command routing. Move code out of `bridge.ts` into `src/brain/` modules: audit store and gate, chat reply, wellbeing reply. Target: no file over 800 lines.
-
-- Test changes are allowed **only** in import paths.
-- The full suite and every probe file must stay green.
-- If any behaviour change is needed, stop the WP and mark it PARTIAL.
-
-### WP12 — (stretch, only if time remains) Voice plan
-
-Write `docs/VOICE_PLAN.md`: how Elix would join Simple Voice Chat (the 26.2 build), with the handshake, the UDP port, Opus 48 kHz 20 ms frames, encryption, the STT/TTS choices (Groq Whisper with a local fallback; local Kokoro/Piper), the risks, and a test plan. Include a minimal, **disabled-by-default** spike behind `voice.enabled`, if and only if it can be tested without a live server. No partial voice code may run when `voice.enabled` is false.
+### R18-M — (stretch) Voice, step 1
+Only if everything above is DONE or PARTIAL. Implement the offline-testable half of `docs/VOICE_PLAN.md`: packet encoding and decoding, and the Opus frame pipeline, against recorded or constructed packets. Keep it **disabled by default** behind `voice.enabled`, and run no voice code when it is false.
 
 ---
 
 ## 4. The final report (only once, at the very end)
 
-1. Fresh-clone gates on your final commit: typecheck, lint, test counts.
-2. A WP table: status, commit hash, tests added (file and count), minutes spent.
-3. Probe files: round13 / 14 / 15 / 16 results.
-4. Deviations (every changed test of your own, with a reason).
-5. Questions for the owner.
-6. **What the owner must test live, as exact steps:** server commands, `pnpm start`, `pnpm e2e --owners ElixTester`, and the in-game lines to type, with expected results.
-7. The vision checklist with Code / Test / Live columns. "Live" is ❌ unless it ran against the real server.
-8. Secret scan result, run immediately before the final commit. Do not push.
+1. **Fresh-clone** gates on the final commit (from `.fresh/`): typecheck, lint, test counts. Also the working-tree gates.
+2. An item table: status by the §1 definition, commit, tests added, minutes.
+3. Probe files: round13 / 14 / 15 / 16 / 18 results.
+4. The wiring audit output (R18-I): the allow-list entries, with reasons.
+5. Deviations, and questions for the owner.
+6. **Live-test steps for the owner, only for DONE items:** exact server commands, `pnpm start`, `pnpm exec tsx scripts/e2e-chat.ts --owners ElixTester`, the in-game lines to type, and the expected results.
+7. The vision checklist with Code / BotSession test / Live columns. Live is ❌ unless it ran on the real server.
+8. Secret scan, run immediately before the final commit. Do not push.
