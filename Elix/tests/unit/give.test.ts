@@ -7,9 +7,8 @@
  * `bot.toss` is checked against the real mineflayer source, and every item name comes from
  * the real vendored 26.2 data.
  */
+import { mineflayerSourceText } from "./mineflayerPaths.js";
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
   ALLOWED_CHEST_ACTION,
   CHEST_RANGE,
@@ -244,20 +243,14 @@ describe("WP5c — stop", () => {
 
 describe("WP5c — the real mineflayer toss API", () => {
   it("bot.toss takes (itemType, metadata, count, callback)", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("../../node_modules/.pnpm/mineflayer@4.39.0_patch_has_35aecfaab97a4f23b1bf82c1e8d684cc/node_modules/mineflayer/lib/plugins/simple_inventory.js", import.meta.url)),
-      "utf8",
-    );
+    const source = mineflayerSourceText("lib", "plugins", "simple_inventory.js");
     expect(source).toMatch(/async function toss \(itemType, metadata, count\)/u);
     // The count is handed straight to bot.transfer(), which has NO guard of its own for a
     // zero count - it only throws on an empty SOURCE or a full destination. So a zero count
     // reaching toss is a silent no-op at best, and Elix must never produce one. This test
     // pins that the real library has no check we were relying on.
     expect(source).toMatch(/count,/u);
-    const transfer = readFileSync(
-      fileURLToPath(new URL("../../node_modules/.pnpm/mineflayer@4.39.0_patch_has_35aecfaab97a4f23b1bf82c1e8d684cc/node_modules/mineflayer/lib/plugins/inventory.js", import.meta.url)),
-      "utf8",
-    );
+    const transfer = mineflayerSourceText("lib", "plugins", "inventory.js");
     expect(transfer).toMatch(/destination full/iu);
     expect(transfer).not.toMatch(/count must be|count <= 0|Count is NaN/iu);
   });

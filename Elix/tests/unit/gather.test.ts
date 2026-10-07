@@ -7,9 +7,8 @@
  * Block names and tool ids come from the real vendored 26.2 data, and the `bot.dig`
  * arguments are checked against the real mineflayer source at the bottom.
  */
+import { mineflayerSourceText } from "./mineflayerPaths.js";
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { Vec3 } from "vec3";
 import {
   ALLOWED_BLOCKS,
@@ -378,10 +377,7 @@ describe("WP5a — the controller, and stop", () => {
 describe("WP5a — the real mineflayer, not a fake", () => {
   it("bot.dig's first check is a null block, so Elix must never hand it one", () => {
     // Read from the real source, so a mineflayer change is caught rather than assumed.
-    const source = readFileSync(
-      fileURLToPath(new URL("../../node_modules/.pnpm/mineflayer@4.39.0_patch_has_35aecfaab97a4f23b1bf82c1e8d684cc/node_modules/mineflayer/lib/plugins/digging.js", import.meta.url)),
-      "utf8",
-    );
+    const source = mineflayerSourceText("lib", "plugins", "digging.js");
     expect(source).toMatch(/dig was called with an undefined or null block/u);
     expect(source).toMatch(/bot\.digTime\(block\)/u);
     // digTime is Infinity for a block the bot cannot break - air, water, and anything with a

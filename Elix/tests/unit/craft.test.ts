@@ -5,6 +5,7 @@
  * fact this file reads rather than a belief it holds. The `bot.craft` / `bot.recipesFor`
  * contract is checked against the real mineflayer source.
  */
+import { mineflayerSourceText } from "./mineflayerPaths.js";
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -294,10 +295,7 @@ describe("WP5b — the controller, and stop", () => {
 
 describe("WP5b — the real mineflayer craft API", () => {
   it("recipesFor takes (itemType, metadata, minResultCount, craftingTable)", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("../../node_modules/.pnpm/mineflayer@4.39.0_patch_has_35aecfaab97a4f23b1bf82c1e8d684cc/node_modules/mineflayer/lib/plugins/craft.js", import.meta.url)),
-      "utf8",
-    );
+    const source = mineflayerSourceText("lib", "plugins", "craft.js");
     expect(source).toMatch(/function recipesFor \(itemType, metadata, minResultCount, craftingTable\)/u);
     // A table-less recipe is only returned when the table argument is null, which is why the
     // `needsTable` flag is not optional in this module.
