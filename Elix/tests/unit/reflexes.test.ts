@@ -92,7 +92,7 @@ function view(over: Partial<ReflexView> = {}): ReflexView {
   return {
     position: new Vec3(0, 65, 0),
     inWater: false,
-    oxygenLevel: 300,
+    oxygenLevel: 20,
     food: 20,
     hostile: null,
     creeper: null,
@@ -119,6 +119,8 @@ class FakeBot extends EventEmitter {
   readonly equipCalls: Array<{ name: string; destination: EquipSlot; slot: number }> = [];
   readonly consumeCalls: number[] = [];
   readonly lookCalls: Vec3[] = [];
+  /** Every setControlState call, so a test can prove jump is pressed AND released. */
+  readonly controls: Array<[string, boolean]> = [];
   clearedControlStates = 0;
 
   /** mineflayer 4.39.0 `lib/plugins/simple_inventory.js`: these are the only names. */
@@ -211,6 +213,10 @@ class FakeBot extends EventEmitter {
     this.lookCalls.push(target);
   }
 
+  setControlState(control: string, state: boolean): void {
+    this.controls.push([control, state]);
+  }
+
   clearControlStates(): void {
     this.clearedControlStates += 1;
   }
@@ -230,6 +236,7 @@ function runnerFor(bot: FakeBot): ReflexRunner {
     equip: (item, destination) => bot.equip(item, destination),
     consume: () => bot.consume(),
     lookAt: (target) => bot.lookAt(target),
+    setControlState: (control, state) => bot.setControlState(control, state),
     clearControlStates: () => bot.clearControlStates(),
     findItem: (name) => bot.findItem(name),
   });
@@ -255,7 +262,7 @@ describe("WP2 — breathe", () => {
   it("the runner looks up and clears its state on stop", async () => {
     const bot = new FakeBot();
     bot.isInWater = true;
-    bot.oxygenLevel = 30;
+    bot.oxygenLevel = 2;
     const runner = runnerFor(bot);
     const tick = await runner.tick();
     expect(tick.reflex).toBe("breathe");
@@ -516,7 +523,10 @@ describe("WP2 — the priority order", () => {
   it("breathe beats creeper, which beats eat", () => {
     const drowning = view({
       inWater: true,
-      oxygenLevel: 10,
+      // mineflayer's oxygenLevel is 0-20, so 2 is genuinely low air. The old fixture used
+      // 10 on a 0-300 scale, which is FULL air on the real one, and this test was quietly
+      // asserting that a drowning Elix is not treated as drowning.
+      oxygenLevel: 2,
       food: 5,
       creeper: { name: "creeper", distance: 2, position: new Vec3(2, 65, 0) },
       inventory: [{ name: "bread", count: 1 }],
@@ -596,6 +606,7 @@ describe("WP2 — elix stop cancels an in-progress reflex within one tick", () =
       equip: async () => undefined,
       consume: async () => undefined,
       lookAt: () => undefined,
+      setControlState: () => undefined,
       clearControlStates: () => {
         throw new Error("connection already gone");
       },

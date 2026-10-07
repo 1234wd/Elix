@@ -43,6 +43,12 @@ export interface ReflexBot {
   consume(): Promise<void>;
   /** Look at a point. Easing and per-tick limits are WP4's job, not this file's. */
   lookAt(target: Vec3): void;
+  /**
+   * mineflayer's bot.setControlState. Swimming up REQUIRES holding jump - looking up is not
+   * swimming up, and the first version of this only looked, so Elix sank while appearing to
+   * do something about it.
+   */
+  setControlState(control: string, state: boolean): void;
   /** Leave control states: stop sneaking, stop looking up. Called on `stop`. */
   clearControlStates(): void;
   /** Find an item object in the real inventory, so `equip` gets a real Item. */
@@ -58,9 +64,22 @@ export interface ReflexTick {
 /** Reasons a run ended, for the log and for tests. */
 export type ReflexEndReason = "stopped" | "finished" | "failed";
 
+/**
+ * How many ticks the jump key is held while swimming up. At 50 ms a tick that is 400 ms,
+ * long enough to break the surface from ordinary depths and short enough that Elix is not
+ * bunny-hopping along the sea bed if the water is shallow.
+ */
+export const JUMP_HOLD_TICKS = 8;
+
 export class ReflexRunner {
   /** What is running right now, or null. */
   private running: ReflexTick | null = null;
+
+  /** Ticks of held jump left, so the key is released again. */
+  private jumpTicksLeft = 0;
+
+  /** What THIS tick decided about follow, read by the caller before the action completes. */
+  private pendingHoldingFollow = false;
 
   /** Set by `stop()`; cleared by the next `resume()`. */
   private stopped = false;
@@ -83,9 +102,15 @@ export class ReflexRunner {
     return this.running !== null;
   }
 
-  /** True while a reflex is holding follow off. */
+  /**
+   * True while a reflex is holding follow off.
+   *
+   * Reads the value THIS tick settled, falling back to the last completed one, so a caller
+   * that asks synchronously after calling `tick()` gets the current answer and not the
+   * previous tick's.
+   */
   get interruptedFollow(): boolean {
-    return this.holdingFollow;
+    return this.pendingHoldingFollow || this.holdingFollow;
   }
 
   /** The last end, for assertions and the log. */
@@ -99,11 +124,28 @@ export class ReflexRunner {
    * Armour is not treated as an interruption of follow - picking up a better sword while
    * walking somewhere is what Elix should do, not a reason to stop walking.
    */
+  /**
+   * One reflex tick: decide SYNCHRONOUSLY, then act.
+   *
+   * The decision half used to be inside the async body, which made
+   * `interruptedFollow` a flag that the caller read one tick LATE - `runReflexes` does
+   * `void runner.tick()` and immediately asks whether follow is being held off, and it was
+   * always being told about the previous tick. Now `holdingFollow` is settled before the
+   * first await, so the caller reads the truth about THIS tick.
+   */
   async tick(): Promise<ReflexTick> {
     if (this.stopped) return { reflex: "hazards", action: { kind: "none" } };
+    // Release the jump key as soon as the swim is over. This runs FIRST, before the decision,
+    // so a stop mid-swim cannot leave jump held.
+    if (this.jumpTicksLeft > 0) {
+      this.jumpTicksLeft -= 1;
+      if (this.jumpTicksLeft === 0) this.bot.setControlState("jump", false);
+    }
     const view = this.bot.view();
     const decision = decideReflex(view);
     const { reflex, action } = decision;
+    // Settled before any await, on purpose - see the doc comment above.
+    this.pendingHoldingFollow = reflex !== "armour" && reflex !== "hazards" && action.kind !== "none";
     if (action.kind === "none") {
       // Nothing to do. The threat is gone, so follow may resume, and anything stale is
       // cleared so nothing is left half-running.
@@ -136,8 +178,15 @@ export class ReflexRunner {
   private async perform(reflex: ReflexName, action: ReflexAction): Promise<void> {
     switch (action.kind) {
       case "swim-up": {
-        // Point the head up and hold the jump key: that is what surfaces in water.
-        this.bot.lookAt(new Vec3(this.bot.view().position.x, this.bot.view().position.y + 2, this.bot.view().position.z));
+        // Looking up is NOT swimming up. Holding jump while looking up is what actually
+        // surfaces in water - the first version of this only looked, so Elix sank while
+        // appearing to do something about it.
+        const me = this.bot.view().position;
+        this.bot.lookAt(new Vec3(me.x, me.y + 2, me.z));
+        this.bot.setControlState("jump", true);
+        // Hold it briefly, then let go: a jump key held forever is Elix bunny-hopping along
+        // the sea bed and skipping every other reflex.
+        this.jumpTicksLeft = JUMP_HOLD_TICKS;
         break;
       }
       case "flee": {
@@ -185,6 +234,20 @@ export class ReflexRunner {
     this.stopped = true;
     this.running = null;
     this.holdingFollow = false;
+    // Both flags, not one. `interruptedFollow` reads either, so clearing only the completed
+    // one would leave a stopped runner still claiming it is holding follow off - which stops
+    // nothing, but reports something false, and a report that can be wrong is worse.
+    this.pendingHoldingFollow = false;
+    // Never leave jump held. A stop that releases the control states but not the key Elix is
+    // physically holding leaves him jumping in place with nothing driving him.
+    if (this.jumpTicksLeft > 0) {
+      this.jumpTicksLeft = 0;
+      try {
+        this.bot.setControlState("jump", false);
+      } catch {
+        // A bot that cannot release its controls is already gone.
+      }
+    }
     try {
       this.bot.clearControlStates();
     } catch {

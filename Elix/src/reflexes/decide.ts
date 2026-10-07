@@ -78,8 +78,38 @@ export type ReflexAction =
 /** Which reflex produced a decision. */
 export type ReflexName = "breathe" | "creeper" | "hazards" | "eat" | "armour";
 
-/** Oxygen at or below this, while in water, means swim up. Of 300. */
-export const LOW_OXYGEN = 120;
+/**
+ * Oxygen at or below this, while in water, means swim up.
+ *
+ * **On mineflayer's 0-20 scale, not 0-300.** `bot.oxygenLevel` is set in
+ * `lib/plugins/breath.js` as `Math.round(air_supply / 15)`, so 20 is a full bar and 0 is
+ * empty. The first version of this threshold was 120, on a 0-300 scale - which meant that in
+ * ANY water, at FULL air, the breathe reflex fired on every tick and outranked follow, defend
+ * and everything else. The symptom on a live server is a bot that swims up constantly and
+ * ignores its owner.
+ *
+ * 6 of 20 leaves roughly 45 seconds of air, which is enough to reach the surface from any
+ * depth a player can dig to. Chosen from the documented scale, not by feel.
+ */
+export const LOW_OXYGEN = 6;
+
+/**
+ * The documented mineflayer ranges every reflex and defend reads.
+ *
+ * These are in one place so a future reader has one place to check them against
+ * `node_modules/mineflayer/docs/api.md`, and so `tests/unit/reflexScales.test.ts` can assert
+ * that the constants still match the library rather than the constants drifting alone.
+ */
+export const MINECRAFT_SCALES = Object.freeze({
+  /** bot.health, and entity.health: 20 is full. defend's RETREAT_AT is on this scale. */
+  health: { min: 0, max: 20 },
+  /** bot.food: 20 is full. decideEat's EAT_AT_FOOD is on this scale. */
+  food: { min: 0, max: 20 },
+  /** bot.oxygenLevel: 20 is full. LOW_OXYGEN is on this scale. */
+  oxygenLevel: { min: 0, max: 20 },
+  /** bot.foodSaturation: 0-20, and it never exceeds food. */
+  foodSaturation: { min: 0, max: 20 },
+});
 
 /** A creeper this close starts a retreat. */
 export const CREEPER_FLEE_AT = 4;

@@ -54,7 +54,10 @@ export function reflexViewOf(bot: BotLike): ReflexView {
   return {
     position: me,
     inWater,
-    oxygenLevel: numberField(bot, "oxygenLevel", 300),
+    // 20 is a FULL bar on mineflayer's scale, so this is the "cannot tell" reading - and it
+    // means "never drowns on a guess", which is the safe direction.
+    oxygenLevel: numberField(bot, "oxygenLevel", 20),
+    // 20 is full. Same reasoning as oxygen: an unknown field reads as not hungry.
     food: numberField(bot, "food", 20),
     hostile,
     creeper,
@@ -67,9 +70,9 @@ export function reflexViewOf(bot: BotLike): ReflexView {
  * One numeric field off the bot, read through a guard, with the SAFE default when absent.
  *
  * `food` and `oxygenLevel` are real mineflayer bot fields, but BotLike does not declare
- * them and several unit-test fakes do not set them. The defaults matter: no food field
- * reads as 20 (never hungry, never eats by accident) and no oxygen field reads as 300
- * (never drowns on a guess).
+ * them and several unit-test fakes do not set them. The defaults matter: an unknown field
+ * reads as 20 - full on BOTH scales - so an absent field means "never hungry, never drowning"
+ * rather than the 300 that once made the breathe reflex fire on every tick in water.
  */
 export function numberField(bot: BotLike, key: "food" | "oxygenLevel" | "health", fallback: number): number {
   const raw = (bot as unknown as Record<string, unknown>)[key];
@@ -183,6 +186,23 @@ export function lookAtOf(bot: BotLike, target: { x: number; y: number; z: number
     look.call(bot, yaw, pitch, true);
   } catch {
     // A look the server rejects is not worth a tick.
+  }
+}
+
+/**
+ * mineflayer's `bot.setControlState`, guarded.
+ *
+ * Used by the WP4 crouch-greet and, through the reflex runner, by the breathe reflex - which is
+ * why "jump" has to be RELEASABLE, and why every call is wrapped: a fake bot without the
+ * method, or a real one whose connection has gone, must not throw on a 50 ms tick.
+ */
+export function setControlStateOf(bot: BotLike, control: string, state: boolean): void {
+  const set = (bot as { setControlState?: (k: string, v: boolean) => void }).setControlState;
+  if (typeof set !== "function") return;
+  try {
+    set.call(bot, control, state);
+  } catch {
+    // Nothing to do about it.
   }
 }
 

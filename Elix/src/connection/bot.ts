@@ -42,6 +42,7 @@ import {
   findItemOf,
   lookAtOf,
   reflexViewOf,
+  setControlStateOf,
 } from "./reflexAdapters.js";
 import {
   HeadTurner,
@@ -674,6 +675,7 @@ export {
   lookAtOf,
   clearControlStatesOf,
   findItemOf,
+  setControlStateOf,
 } from "./reflexAdapters.js";
 
 export class BotSession {
@@ -932,13 +934,7 @@ export class BotSession {
 
   /** mineflayer's setControlState, guarded. A bot that cannot sneak is not a crash. */
   private setSneak(bot: BotLike, on: boolean): void {
-    const set = (bot as { setControlState?: (k: string, v: boolean) => void }).setControlState;
-    if (typeof set !== "function") return;
-    try {
-      set.call(bot, "sneak", on);
-    } catch {
-      // Nothing to do about it.
-    }
+    setControlStateOf(bot, "sneak", on);
   }
 
   /** Players and mobs close enough to be worth looking at. */
@@ -1128,6 +1124,7 @@ export class BotSession {
       },
       consume: () => consumeOf(bot),
       lookAt: (target) => lookAtOf(bot, target),
+      setControlState: (control, state) => setControlStateOf(bot, control, state),
       clearControlStates: () => clearControlStatesOf(bot),
       findItem: (name) => findItemOf(bot, name),
     });
