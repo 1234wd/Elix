@@ -91,6 +91,8 @@ export async function checkFfmpeg(
 export const PROVIDER_KEYS: ReadonlyArray<readonly [env: string, label: string, baseUrl: string]> = [
   ["GROQ_API_KEY", "Groq", "https://api.groq.com/openai/v1"],
   ["HF_TOKEN", "Hugging Face", "https://router.huggingface.co/v1"],
+  // R18-H: NVIDIA was in models.yaml and buildBrain now builds it, so doctor must report it.
+  ["NVIDIA_API_KEY", "NVIDIA", "https://integrate.api.nvidia.com/v1"],
 ];
 
 export function checkApiKeys(env: NodeJS.ProcessEnv = process.env): CheckResult {
