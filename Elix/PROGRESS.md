@@ -38,7 +38,7 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | --- | --- | --- | --- |
 | R18-A portability | **DONE** | `f99b70b` | X0 ✅ |
 | R18-B reflex units | **DONE** | `f4432c9` | X1 ✅ X2 ✅ |
-| R18-C wire gather | **NEXT** | — | X3 ❌ |
+| R18-C wire gather | **DONE** | `3e8bee9` | X3 pass (17 new tests) |
 | R18-D wire craft | **NEXT** | - | - |
 | R18-E wire give/deposit | TODO | | X4 ❌ |
 | R18-F wire world memory | TODO | | X5 ❌ |
