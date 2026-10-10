@@ -31,6 +31,16 @@ import {
 import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { ReflexRunner } from "../reflexes/runner.js";
 import { DefendController } from "../reflexes/defend.js";
+import {
+  GatherRunner,
+  otherPlayerPositions,
+  type GatherBot,
+  type GatherWorld,
+} from "../skills/gatherRuntime.js";
+import { parseGather, PROTECTED_RADIUS } from "../skills/gather.js";
+import { protectedPlacesFrom } from "../world/memory.js";
+import { blockIdOf, blockNameOf } from "../world/blockIds.js";
+import type { MemoryStore } from "../memory/store.js";
 import { pickWalkDirection, stopForHazard } from "./hazards.js";
 import type { WalkOutcome } from "./hazards.js";
 import {
@@ -211,6 +221,15 @@ export interface SessionDeps {
     recallImportant?(player: string, importance: number): string | null;
   };
   exitOnPermanent?: boolean;
+  /**
+   * R18-C: the memory store itself, not just the `recallImportant` helper above.
+   *
+   * WP6 built the places table but nothing in the RUNNING bot could read it, so the
+   * protectedRadius rule had no places to protect and gathering was unprotected in practice.
+   * Optional, because a bare unit test has no store - and a missing store means "no places
+   * remembered yet", which is the same thing as "nothing to protect".
+   */
+  memoryStore?: MemoryStore;
   /** Test seam: called every time a new bot instance is created. */
   onBotCreated?: (bot: BotLike) => void;
   /**
@@ -521,6 +540,27 @@ export function requirePathfinder(): PathfinderModule {
  */
 const movementsReady = new WeakSet<object>();
 
+/**
+ * The world the gather rules read: where Elix is, who is near enough to matter, and every
+ * REMEMBERED PLACE.
+ *
+ * Places protect places - NOT the owner's surroundings. Round 17 protected the owner, which
+ * made "get me some dirt" refuse to work while the owner was watching, which is the single
+ * most ordinary thing an owner can ask for. Elix himself is excluded from the player list, so
+ * standing next to the block he is about to dig does not count as somebody being stood on.
+ */
+export function gatherWorldOf(bot: BotLike, memory: MemoryStore | null): GatherWorld {
+  const me = bot.entity?.position;
+  const position: Vec3Like = me ?? { x: 0, y: 64, z: 0 };
+  const places = memory === null ? [] : protectedPlacesFrom(memory, position);
+  return {
+    position: { x: position.x, y: position.y, z: position.z },
+    playerPositions: otherPlayerPositions(bot.players, bot.username ?? ""),
+    protectedPlaces: places.map((p) => ({ x: p.x, y: p.y, z: p.z })),
+    protectedRadius: PROTECTED_RADIUS,
+  };
+}
+
 /** Can this bot's Movements be built at all? Real mineflayer bots always can. */
 export function canConfigureMovements(bot: BotLike): boolean {
   const registry = (bot as { registry?: unknown }).registry;
@@ -680,6 +720,8 @@ export {
 
 export class BotSession {
   private readonly deps: SessionDeps;
+  /** R18-C: the store, so the protectedRadius rule has real places to read. */
+  private readonly memory: MemoryStore | null;
   private readonly scheduler = new ReconnectScheduler();
   /** Per-session outbound chat queue; created on first spawn. */
   private say: SayQueue | null = null;
@@ -734,6 +776,8 @@ export class BotSession {
   private sneakTogglesLeft = 0;
   /** WP4: when the last sneak toggle was sent. */
   private lastSneakAt = 0;
+  /** R18-C: the gather runtime, created per request. */
+  private gather: GatherRunner | null = null;
   /** WP3: the defender. */
   private defend: DefendController | null = null;
   /** WP3: when a player last hit Elix. Zero means nobody has. */
@@ -765,6 +809,114 @@ export class BotSession {
         this.deps.log.warn("reflex tick threw - nothing left running");
       });
     return runner.interruptedFollow;
+  }
+
+  /** One gather step. Fire-and-forget: the tick must never block on a dig. */
+  private runGather(): boolean {
+    const gather = this.gather;
+    if (gather === null || !gather.busy) return false;
+    void gather
+      .step(Date.now())
+      .then((outcome) => {
+        if (outcome?.kind === "done" || outcome?.kind === "refused") {
+          const reason = outcome.kind === "refused" ? outcome.reason : "done";
+          this.deps.log.info({ reason, gathered: gather.count }, "gather finished");
+          this.gather = null;
+        }
+      })
+      .catch(() => {
+        this.deps.log.warn("gather step threw - nothing left running");
+        gather.stop();
+        this.gather = null;
+      });
+    return true;
+  }
+
+  /**
+   * R18-C: is this line a gather request, and may this person run one?
+   *
+   * Returns true when the line was a gather line, whether or not it was allowed - so a
+   * refusal is a refusal and not a fall-through to the chat model, which would have Elix
+   * apologise in prose for something he simply declined to do.
+   *
+   * The rules, in order:
+   *   - ADDRESSED and WHOLE INTENT, by the same parser as follow/come/stop;
+   *   - OWNER ONLY. A stranger gets the same one short refusal, and nothing moves;
+   *   - on the allow-list, which `parseGather` already enforced.
+   */
+  private dispatchGather(bot: BotLike, username: string, message: string): boolean {
+    const request = parseGather(message, this.deps.profile.username);
+    if (request === null) return false;
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    if (!owners.includes(username.toLowerCase())) {
+      this.deps.log.info({ username }, "gather refused: not an owner");
+      this.say?.say(NOT_AN_OWNER);
+      return true;
+    }
+    this.gather = new GatherRunner({
+      bot: bot as unknown as GatherBot,
+      goals: {},
+      nameOf: (id) => blockNameOf(id),
+      idOf: (name) => blockIdOf(name),
+      now: () => Date.now(),
+      walkGoal: (position) => this.walkGoalTo(position),
+      say: (line) => this.ownLine(username, line),
+    });
+    this.gather.start(request, gatherWorldOf(bot, this.memory ?? null), Date.now());
+    this.deps.log.info({ username, block: request.block, count: request.count }, "gather started");
+    return true;
+  }
+
+  /**
+   * The real library's goal for walking to a block.
+   *
+   * `GoalGetToBlock` when the library has it, because it paths around the block rather than
+   * trying to stand on it - and a plain `GoalNear` when it does not, which is still a real
+   * goal rather than a description of one.
+   */
+  private walkGoalTo(position: Vec3Like): unknown {
+    try {
+      const goals = requirePathfinder().goals as {
+        GoalGetToBlock?: new (x: number, y: number, z: number) => unknown;
+        GoalNear?: new (x: number, y: number, z: number, range: number) => unknown;
+      };
+      // THREE NUMBERS, not a position object. mineflayer-pathfinder's `GoalGetToBlock`
+      // constructor is `(x, y, z)` and does `Math.floor` on each - so passing an object
+      // silently produces NaN coordinates and a pathfinder goal that paths nowhere. This is
+      // exactly the shape of bug the real-library contract rule exists to catch.
+      if (typeof goals.GoalGetToBlock === "function") {
+        return new goals.GoalGetToBlock(position.x, position.y, position.z);
+      }
+      if (typeof goals.GoalNear === "function") {
+        return new goals.GoalNear(position.x, position.y, position.z, 1);
+      }
+    } catch {
+      // No pathfinder loaded. The runner treats a null goal as "cannot move", and says so.
+    }
+    return null;
+  }
+
+  /**
+   * One short line that is ELIX's own words.
+   *
+   * `gateOwnLine`, never `gateScriptedReply` - the latter CLASSIFIES its argument as the
+   * player's own words, so a progress line through it files a safety record against the owner
+   * for something the owner never said.
+   */
+  private ownLine(player: string, line: string): void {
+    const bridge = this.deps.chatBridge;
+    if (!bridge?.gateOwnLine) {
+      this.say?.say(line);
+      return;
+    }
+    void bridge
+      .gateOwnLine(player)
+      .then((suppressed: boolean) => {
+        if (!suppressed) this.say?.say(line);
+      })
+      .catch(() => {
+        // A failed gate must not throw into the tick.
+      });
   }
 
   /**
@@ -971,6 +1123,7 @@ export class BotSession {
 
   constructor(deps: SessionDeps) {
     this.deps = deps;
+    this.memory = deps.memoryStore ?? null;
   }
 
   /** For tests: how many status intervals are currently live (must stay 1). */
@@ -1140,6 +1293,8 @@ export class BotSession {
     this.glances.schedule(Date.now(), "startup");
     this.followTimer = setInterval(() => {
       if (this.shutdownRequested || this.ended) return;
+      // R18-C: the gather steps first, because it owns the body while it is mid-dig.
+      if (this.runGather()) return;
       // WP3 first: a hostile mob next to the owner outranks everything below.
       if (this.runDefend(bot)) {
         return;
@@ -1315,6 +1470,11 @@ export class BotSession {
     //   "stop" inside "wait for me guys" and inside a question about creepers. Only a line
     //   addressed to Elix whose whole content, bar two filler words, IS a command counts.
     //   Everything else falls through to the brain, which is where a question belongs.
+    // R18-C: a SKILL line runs the skill. This sits between the wellbeing floor and the
+    // command parse, so "elix get 5 dirt" never reaches the chat model - which is what the
+    // reviewer's X3 probe measures, and what "nothing happens" looked like on a live server.
+    if (this.dispatchGather(bot, username, message)) return;
+
     const command = parseAddressedCommand(message, profile.username);
     if (command) {
       void this.runCommand(bot, username, command.action, command.matched);
@@ -1646,6 +1806,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // WP2: a stop cancels an in-progress eat or flee inside the same tick and drops the
     // control states, so nothing is left half-applied.
     this.reflexes?.stop();
+    // R18-C: a stop reaches a dig already in flight, not just the plan.
+    this.gather?.stop();
+    this.gather = null;
     // WP3: and it clears the engagement, so the next tick cannot swing on the strength of a
     // reaction delay that started before the stop.
     this.defend?.stop();
