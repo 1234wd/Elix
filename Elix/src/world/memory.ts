@@ -158,7 +158,9 @@ export function parseRemember(message: string, botName: string): { key: string; 
 export function parseGoTo(message: string, botName: string): string | null {
   const rest = stripName(message, botName);
   if (rest === null) return null;
-  const m = /^(?:take me|go|come|walk|head|bring me)\s+(?:to\s+)?(?:the\s+)?([a-z_ ]+?)(?:\s+please)?$/u.exec(rest);
+  // NO `come`: "come here" is a follow-family command, and a parser that swallows it
+  // means the command never runs. Places are named after go/walk/head/take me.
+  const m = /^(?:take me|go|walk|head|bring me)\s+(?:to\s+)?(?:the\s+)?([a-z_ ]+?)(?:\s+please)?$/u.exec(rest);
   if (m === null) return null;
   const key = (m[1] ?? "").trim().replace(/\s+/gu, "_");
   return key === "" ? null : key;

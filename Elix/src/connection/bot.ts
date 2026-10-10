@@ -40,6 +40,8 @@ import {
 import { parseGather, PROTECTED_RADIUS } from "../skills/gather.js";
 import { CraftRunner, inventoryItemNames, TABLE_ITEM, type CraftBot } from "../skills/craftRuntime.js";
 import { GiveRunner, type GiveBot } from "../skills/giveRuntime.js";
+import { MemoryRunner, PlaceBook, type MemoryBot } from "../world/memoryRuntime.js";
+import { parseRemember, parseWhereIs, parseGoTo, parseWhereDied } from "../world/memory.js";
 import { parseGive, parseChestAction, GIVE_REFUSALS, CHEST_RANGE } from "../skills/give.js";
 import { craftRequest } from "../skills/craft.js";
 import { itemIdOf } from "../world/itemIds.js";
@@ -895,6 +897,8 @@ export class BotSession {
   private craft: CraftRunner | null = null;
   /** R18-E: the give/deposit runtime, created per request. */
   private give: GiveRunner | null = null;
+  /** R18-F: the place book. Created once per session, because a place outlives a line. */
+  private readonly memoryRunner: MemoryRunner;
   /** WP3: the defender. */
   private defend: DefendController | null = null;
   /** WP3: when a player last hit Elix. Zero means nobody has. */
@@ -946,6 +950,88 @@ export class BotSession {
         gather.stop();
         this.gather = null;
       });
+    return true;
+  }
+
+  /**
+   * R18-F: record where Elix died, from the real events.
+   *
+   * `death` is Elix's own death and `entityDead` covers a player Elix is watching die, so
+   * "where did I die" has an answer either way. Neither handler is allowed to throw into
+   * mineflayer's event loop.
+   */
+  private watchDeaths(bot: BotLike): void {
+    const on = (bot as { on?: (event: string, fn: (...args: unknown[]) => void) => void }).on;
+    if (typeof on !== "function") return;
+    try {
+      on.call(bot, "death", () => {
+        const position = bot.entity?.position;
+        if (position === undefined) return;
+        this.memoryRunner.book.recordDeath(
+          this.deps.profile.username,
+          { x: position.x, y: position.y, z: position.z },
+          this.dimensionOf(bot),
+          Date.now(),
+        );
+      });
+      on.call(bot, "entityDead", (entity: unknown) => {
+        if (entity === null || typeof entity !== "object") return;
+        const type = (entity as { type?: unknown }).type;
+        if (type !== "player") return;
+        const position = (entity as { position?: unknown }).position;
+        if (position === null || typeof position !== "object") return;
+        const p = position as { x?: unknown; y?: unknown; z?: unknown };
+        if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") return;
+        this.memoryRunner.book.recordDeath(
+          "someone",
+          { x: p.x, y: p.y, z: p.z },
+          this.dimensionOf(bot),
+          Date.now(),
+        );
+      });
+    } catch {
+      this.deps.log.warn("could not watch death events");
+    }
+  }
+
+  /** The current dimension, through a guard. */
+  private dimensionOf(bot: BotLike): string | null {
+    const dimension = (bot as { game?: { dimension?: unknown } }).game?.dimension;
+    return typeof dimension === "string" ? dimension : null;
+  }
+
+  /**
+   * R18-F: is this line about a place Elix remembers?
+   *
+   * Coordinates are the sensitive part, and they are handled inside the runtime: an owner
+   * is whispered them, a stranger gets nothing useful, and the public line never contains a
+   * number. A refusal returns TRUE so the line never falls through to the chat model.
+   */
+  private dispatchMemory(bot: BotLike, username: string, message: string): boolean {
+    const name = this.deps.profile.username;
+    const remember = parseRemember(message, name);
+    const whereIs = parseWhereIs(message, name);
+    const goTo = parseGoTo(message, name);
+    const whereDied = parseWhereDied(message, name);
+    if (remember === null && whereIs === null && goTo === null && !whereDied) return false;
+
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    const isOwner = owners.includes(username.toLowerCase());
+    // ONLY an owner is the recipient of a whisper. A stranger is set to null here, so even
+    // a later refactor that reached the whisper path cannot address it to them.
+    this.memoryRunner.setRecipient(isOwner ? username : null);
+    const memoryBot = bot as unknown as MemoryBot & { chat?: (text: string) => void };
+    let outcome;
+    if (remember !== null) {
+      outcome = this.memoryRunner.rememberHere(memoryBot, remember.key, remember.kind, isOwner);
+    } else if (whereIs !== null) {
+      outcome = this.memoryRunner.whereIs(memoryBot, whereIs, isOwner);
+    } else if (goTo !== null) {
+      outcome = this.memoryRunner.goTo(memoryBot, goTo, isOwner);
+    } else {
+      outcome = this.memoryRunner.whereDied(memoryBot, isOwner);
+    }
+    this.deps.log.info({ username, kind: outcome.kind }, "memory line handled");
     return true;
   }
 
@@ -1386,6 +1472,10 @@ export class BotSession {
   constructor(deps: SessionDeps) {
     this.deps = deps;
     this.memory = deps.memoryStore ?? null;
+    this.memoryRunner = new MemoryRunner(
+      { store: this.memory, goals: pathfinderGoals(), now: () => Date.now() },
+      new PlaceBook(this.memory),
+    );
   }
 
   /** For tests: how many status intervals are currently live (must stay 1). */
@@ -1447,6 +1537,9 @@ export class BotSession {
 
     bot.on("error", (err: Error) => this.handleBotError(err));
     bot.once("spawn", () => this.handleSpawn(bot));
+    // R18-F: death events are bound here, once, beside every other bot event. Without
+    // this "where did i die" has nothing to answer from.
+    this.watchDeaths(bot);
     bot.on("chat", ((username: string, message: string) =>
       this.handleChat(bot, username, message)) as never);
     bot.on("kicked", ((raw: unknown) => this.handleKicked(raw)) as never);
@@ -1744,12 +1837,16 @@ export class BotSession {
     if (this.dispatchCraft(bot, username, message)) return;
     // R18-E: give and deposit, in the same place, with the same owner rule.
     if (this.dispatchGive(bot, username, message)) return;
-
     const command = parseAddressedCommand(message, profile.username);
     if (command) {
       void this.runCommand(bot, username, command.action, command.matched);
       return;
     }
+
+    // R18-F: world memory LAST, after the commands. follow/come/stop are the primary
+    // vocabulary, and no parser added later may be allowed to shadow them - which is
+    // exactly what happened when parseGoTo claimed "come here" for a place called here.
+    if (this.dispatchMemory(bot, username, message)) return;
 
     // C4 HARD RULE: a sincere question about what he IS gets the scripted honest
     // answer, never a model reply.
