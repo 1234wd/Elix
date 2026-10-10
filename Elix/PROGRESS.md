@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R18-C — wire gather (probe X3).** R18-A and R18-B are DONE. X3–X7 remain:
+**RESUME HERE: R18-D - wire craft.** R18-A, R18-B and R18-C are DONE. X4-X7 remain (give, memory, tool calls, NVIDIA/Ollama).
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -39,7 +39,7 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R18-A portability | **DONE** | `f99b70b` | X0 ✅ |
 | R18-B reflex units | **DONE** | `f4432c9` | X1 ✅ X2 ✅ |
 | R18-C wire gather | **NEXT** | — | X3 ❌ |
-| R18-D wire craft | TODO | | — |
+| R18-D wire craft | **NEXT** | - | - |
 | R18-E wire give/deposit | TODO | | X4 ❌ |
 | R18-F wire world memory | TODO | | X5 ❌ |
 | R18-G wire tool calls | TODO | | X6 ❌ |
@@ -276,3 +276,18 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
   the file with `readFileSync`.
 - `packages/` test files cannot import a transitive dependency directly. `better-sqlite3` is
   resolved through `tests/unit/sqliteLoader.ts`, which fails loudly if it cannot find a driver.
+### R18-C - what the gather rules cost, and two real bugs the tests found
+
+- `GoalGetToBlock(x, y, z)` takes **three numbers**, not a position object. Passing an object
+  silently yields NaN coordinates (`Math.floor({})` is NaN), so the goal paths nowhere. This is
+  exactly the bug class the real-library contract rule exists for - the fake accepted a shape the
+  real library rejects. Assert the goal's four per-tick methods AND its numeric fields.
+- Player clearance is `<= PLAYER_CLEARANCE`, not `<`. "Within 2 blocks of a player" includes the
+  block exactly two away; the test caught the boundary being read the other way.
+- **Test-fake trap:** mineflayer's `heldItem` changes when you equip. A fake that does not update it
+  makes the WEAPON reflex re-equip on every single tick - 149 equip calls for 5 digs - and any
+  equip assertion then measures the reflex, not the skill. Keep heldItem faithful.
+- To prove the GATHER equipped a pickaxe (not the reflex), hold a sword too: the reflex has a reason
+  to equip the sword, so a pickaxe in hand afterwards can only have come from the dig.
+- **A stop after a gather FINISHED proves nothing.** Ask for 64 items so the gather is still running
+  when the stop lands.
