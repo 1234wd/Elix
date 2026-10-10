@@ -64,7 +64,7 @@ export interface CraftDeps {
 }
 
 /** Why a craft did not happen, in words the owner can read. */
-export const CRAFT_REFUSAL_TEXT: Readonly<Record<string, string>> = Object.freeze({
+const CRAFT_REFUSAL_TEXT: Readonly<Record<string, string>> = Object.freeze({
   "not-craftable": "i don't know how to make that",
   "no-table-spot": "nowhere here to put a crafting table",
   "no-recipe": "there's no recipe for that in this version",

@@ -31,13 +31,9 @@ import type {
 
 /** NVIDIA's OpenAI-compatible endpoint. */
 export const NVIDIA_BASE = "https://integrate.api.nvidia.com/v1";
-export const NVIDIA_CHAT_URL = `${NVIDIA_BASE}/chat/completions`;
-export const NVIDIA_MODELS_URL = `${NVIDIA_BASE}/models`;
 
 /** Ollama's OpenAI-compatible endpoint. Loopback only - never a remote host. */
 export const OLLAMA_BASE = "http://127.0.0.1:11434/v1";
-export const OLLAMA_CHAT_URL = `${OLLAMA_BASE}/chat/completions`;
-export const OLLAMA_MODELS_URL = `${OLLAMA_BASE}/models`;
 
 /** A 402 from NVIDIA means the credits are gone, so stop asking for a day. */
 export const NVIDIA_CREDITS_BREAKER_MS = 24 * 60 * 60_000;
@@ -53,7 +49,7 @@ export const OLLAMA_PROBE_TIMEOUT_MS = 1_500;
  * and that is the exact failure the owner reproduced. The Ollama startup probe has its own,
  * shorter one above, because a local model that is not running must not cost 30 seconds.
  */
-export const TIER_TIMEOUT_MS = 30_000;
+const TIER_TIMEOUT_MS = 30_000;
 
 /** A signal that aborts after `ms`, merged with any caller signal. */
 function deadline(ms: number, caller?: AbortSignal): AbortSignal {
@@ -330,7 +326,7 @@ export function chooseModel(available: readonly string[], prefer: readonly strin
  *   qwen         Qwen 3 is JSON-trained and is this project's second guard fallback
  *   llama-3.1/3.3+chat  the Llama chat and instruct checkpoints
  */
-export const JSON_CAPABLE_HINTS: readonly string[] = Object.freeze([
+const JSON_CAPABLE_HINTS: readonly string[] = Object.freeze([
   "instruct",
   "chat",
   "gpt-oss",

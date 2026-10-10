@@ -92,25 +92,6 @@ export type ReflexName = "breathe" | "creeper" | "hazards" | "eat" | "armour";
  * depth a player can dig to. Chosen from the documented scale, not by feel.
  */
 export const LOW_OXYGEN = 6;
-
-/**
- * The documented mineflayer ranges every reflex and defend reads.
- *
- * These are in one place so a future reader has one place to check them against
- * `node_modules/mineflayer/docs/api.md`, and so `tests/unit/reflexScales.test.ts` can assert
- * that the constants still match the library rather than the constants drifting alone.
- */
-export const MINECRAFT_SCALES = Object.freeze({
-  /** bot.health, and entity.health: 20 is full. defend's RETREAT_AT is on this scale. */
-  health: { min: 0, max: 20 },
-  /** bot.food: 20 is full. decideEat's EAT_AT_FOOD is on this scale. */
-  food: { min: 0, max: 20 },
-  /** bot.oxygenLevel: 20 is full. LOW_OXYGEN is on this scale. */
-  oxygenLevel: { min: 0, max: 20 },
-  /** bot.foodSaturation: 0-20, and it never exceeds food. */
-  foodSaturation: { min: 0, max: 20 },
-});
-
 /** A creeper this close starts a retreat. */
 export const CREEPER_FLEE_AT = 4;
 
@@ -137,7 +118,7 @@ export const DANGEROUS_FOOD_AT_FOOD = 4;
  * Names are the vendored 26.2 item names. `chicken` is raw chicken - there is no
  * `raw_chicken` item in the game.
  */
-export const RISKY_FOOD: ReadonlySet<string> = Object.freeze(
+const RISKY_FOOD: ReadonlySet<string> = Object.freeze(
   new Set([
     "rotten_flesh",
     "spider_eye",
@@ -147,12 +128,6 @@ export const RISKY_FOOD: ReadonlySet<string> = Object.freeze(
     "suspicious_stew",
   ]),
 );
-
-/** True when the entity name is a creeper, without a hard-coded mob list elsewhere. */
-export function isCreeper(entity: CreatureLike): boolean {
-  return entity.name === "creeper" || entity.type === "creeper";
-}
-
 /** 1. breathe: oxygen running out, in water. Nothing else gets a look in. */
 export function decideBreathe(view: ReflexView): ReflexAction {
   if (!view.inWater) return { kind: "none" };
@@ -290,7 +265,7 @@ export function decideArmour(view: ReflexView): ReflexAction {
 }
 
 /** Armour slots, in the order they are checked. Helmet first: it protects the head. */
-export const ARMOUR_SLOTS: readonly EquipSlot[] = Object.freeze(["head", "torso", "legs", "feet"]);
+const ARMOUR_SLOTS: readonly EquipSlot[] = Object.freeze(["head", "torso", "legs", "feet"]);
 
 /**
  * The whole reflex ladder, in order.

@@ -53,7 +53,7 @@ export const RETREAT_AT = 6;
 export type SkillCap = "casual" | "normal" | "tryhard";
 
 /** The brief's reaction window, per skillCap. Slower casual, faster tryhard. */
-export const REACTION_MS: Readonly<Record<SkillCap, readonly [number, number]>> = Object.freeze({
+const REACTION_MS: Readonly<Record<SkillCap, readonly [number, number]>> = Object.freeze({
   casual: [280, 320],
   normal: [230, 290],
   tryhard: [180, 230],
@@ -78,7 +78,7 @@ export const REACTION_FLOOR_MS = 180;
  * the slower and therefore the safer assumption: it means Elix waits longer than he has to
  * rather than swinging into the cooldown.
  */
-export const ATTACK_SPEED: Readonly<Record<string, number>> = Object.freeze({
+const ATTACK_SPEED: Readonly<Record<string, number>> = Object.freeze({
   wooden_sword: 1.6,
   golden_sword: 1.6,
   stone_sword: 1.6,
@@ -144,7 +144,7 @@ function distanceXZ(a: Vec3Like, b: Vec3Like): number {
 }
 
 /** An owner close enough to be worth defending. */
-export function nearestOwnerInRange(view: DefendView): DefendView["owners"][number] | null {
+function nearestOwnerInRange(view: DefendView): DefendView["owners"][number] | null {
   let best: DefendView["owners"][number] | null = null;
   for (const owner of view.owners) {
     if (owner.distance > DEFEND_OWNER_RADIUS) continue;

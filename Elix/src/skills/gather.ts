@@ -17,7 +17,6 @@
  * `gateOwnLine`, because it is ELIX's own words and `gateScriptedReply` would file a safety
  * record against the owner for something the owner never said.
  */
-import { Vec3 } from "vec3";
 import { allItems, blockNames, dataForVersion } from "../world/mcdata.js";
 
 /** A position, in the shape mineflayer and vec3 agree on. */
@@ -106,7 +105,7 @@ export const LOG_BLOCKS: readonly string[] = Object.freeze([
 ]);
 
 /** Leaves, for the "is this log a tree?" check. */
-export const LEAF_BLOCKS: readonly string[] = Object.freeze([
+const LEAF_BLOCKS: readonly string[] = Object.freeze([
   "oak_leaves",
   "spruce_leaves",
   "birch_leaves",
@@ -140,7 +139,7 @@ export const NEVER_GATHERED: readonly string[] = Object.freeze([
 ]);
 
 /** The full set this skill may ever dig. */
-export const GATHERABLE: ReadonlySet<string> = Object.freeze(
+const GATHERABLE: ReadonlySet<string> = Object.freeze(
   new Set([...ALLOWED_BLOCKS, ...LOG_BLOCKS]),
 );
 
@@ -275,7 +274,7 @@ export interface GatherRequest {
 }
 
 /** Common words a player uses for a block, mapped to the real 26.2 name. */
-export const BLOCK_WORDS: Readonly<Record<string, string>> = Object.freeze({
+const BLOCK_WORDS: Readonly<Record<string, string>> = Object.freeze({
   wood: "oak_log",
   log: "oak_log",
   logs: "oak_log",
@@ -445,9 +444,4 @@ export class GatherController {
     this.stopped = false;
     if (this.end.kind === "stopped") this.end = { kind: "idle" };
   }
-}
-
-/** A block position helper, so the caller and the checks agree on the arithmetic. */
-export function blockPos(x: number, y: number, z: number): Vec3 {
-  return new Vec3(x, y, z);
 }

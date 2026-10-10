@@ -55,10 +55,10 @@ export interface Vec3Like {
 export const PLAYER_CLEARANCE = 2;
 
 /** How far away Elix looks for a block at all. */
-export const SEARCH_RADIUS = 32;
+const SEARCH_RADIUS = 32;
 
 /** Blocks Elix will not dig, whatever the allow-list says. */
-export const UNDIGGABLE = new Set(["air", "cave_air", "void_air", "water", "lava", "bedrock", "fire"]);
+const UNDIGGABLE = new Set(["air", "cave_air", "void_air", "water", "lava", "bedrock", "fire"]);
 
 /** A remembered place, as far as this file cares. */
 export interface ProtectedPlace {
@@ -102,7 +102,7 @@ export interface GatherWorld {
 }
 
 /** True when Elix is standing on, or within PLAYER_CLEARANCE of, somebody else's block. */
-export function playerTooClose(target: Vec3Like, world: GatherWorld): boolean {
+function playerTooClose(target: Vec3Like, world: GatherWorld): boolean {
   for (const player of world.playerPositions) {
     const distance = Math.hypot(player.x - target.x, player.z - target.z);
     // Same column, or the block somebody is standing on.
@@ -116,7 +116,7 @@ export function playerTooClose(target: Vec3Like, world: GatherWorld): boolean {
 }
 
 /** True when the target is inside a remembered place's radius. */
-export function insideProtectedPlace(target: Vec3Like, world: GatherWorld): boolean {
+function insideProtectedPlace(target: Vec3Like, world: GatherWorld): boolean {
   for (const place of world.protectedPlaces) {
     if (Math.hypot(place.x - target.x, place.z - target.z) < world.protectedRadius) return true;
   }
@@ -130,7 +130,7 @@ export function insideProtectedPlace(target: Vec3Like, world: GatherWorld): bool
  * and the cheap rejection is "is this a block Elix would ever dig" - not "is this near a
  * player", which needs positions this function does not have yet.
  */
-export function diggableMatcher(nameOf: NameOf, allowed: ReadonlySet<string>): (block: unknown) => boolean {
+function diggableMatcher(nameOf: NameOf, allowed: ReadonlySet<string>): (block: unknown) => boolean {
   return (block: unknown): boolean => {
     if (block === null || typeof block !== "object") return false;
     const raw = block as { name?: unknown; type?: unknown };
@@ -146,7 +146,7 @@ export function diggableMatcher(nameOf: NameOf, allowed: ReadonlySet<string>): (
  * Real mineflayer's `findBlocks` returns Block objects; some fakes and some versions return
  * positions. Both are handled here so no caller has to know which it got.
  */
-export function candidatePositions(found: unknown, blockAt: (p: Vec3Like) => { name?: string } | null): Vec3[] {
+function candidatePositions(found: unknown, blockAt: (p: Vec3Like) => { name?: string } | null): Vec3[] {
   if (!Array.isArray(found)) return [];
   const out: Vec3[] = [];
   for (const entry of found) {

@@ -104,12 +104,6 @@ export function itemNames(version: string = VENDORED_VERSION): string[] {
 export function itemDef(name: string, version: string = VENDORED_VERSION): ItemDef | null {
   return dataForVersion(version)?.itemsByName[name] ?? null;
 }
-
-/** True when `version` has data at all. Used to fail loudly, never to guess. */
-export function hasItemData(version: string = VENDORED_VERSION): boolean {
-  return dataForVersion(version) !== null;
-}
-
 /**
  * Food facts by item NAME, joined on the numeric id inside one data version.
  *
@@ -148,12 +142,6 @@ export function foodQuality(name: string, version: string = VENDORED_VERSION): n
 export function allItems(version: string = VENDORED_VERSION): ItemDef[] {
   return Object.values(dataForVersion(version)?.items ?? {});
 }
-
-/** One item by numeric id, or null. `harvestTools` is keyed by these ids. */
-export function itemById(id: number | string, version: string = VENDORED_VERSION): ItemDef | null {
-  return dataForVersion(version)?.items[String(id)] ?? null;
-}
-
 /** Block facts by name, or an empty map. */
 export function blockNames(version: string = VENDORED_VERSION): Set<string> {
   const data = dataForVersion(version);
@@ -162,7 +150,7 @@ export function blockNames(version: string = VENDORED_VERSION): Set<string> {
 }
 
 /** The categories minecraft-data records for an entity, e.g. ["Hostile mobs"]. */
-export function entityCategories(
+function entityCategories(
   name: string,
   version: string = VENDORED_VERSION,
 ): string[] {

@@ -27,7 +27,6 @@
  *      iron 15, diamond 20, netherite 20 - all of which match the page, which is also how
  *      we know gold is genuinely weaker than chainmail and iron.
  */
-import type { ItemDef } from "../world/mcdata.js";
 
 /** Where Elix equips a piece, using mineflayer's own destination names. */
 export type EquipSlot = "head" | "torso" | "legs" | "feet" | "hand";
@@ -140,13 +139,6 @@ export function armorPointsFor(name: string): number | null {
   const found = ARMOR_POINTS[name];
   return found === undefined ? null : found.points;
 }
-
-/** Armour toughness for one item, or null. */
-export function armorToughnessFor(name: string): number | null {
-  const found = ARMOR_POINTS[name];
-  return found === undefined ? null : found.toughness;
-}
-
 /** Melee attack damage for one item, or null when the item is not a verified weapon. */
 export function meleeDamageFor(name: string): number | null {
   const found = MELEE_DAMAGE[name];
@@ -162,12 +154,6 @@ export function armorSlotFor(name: string): EquipSlot | null {
   // The turtle helmet is the one item whose name does not end in _helmet.
   return name === "turtle_helmet" ? "head" : null;
 }
-
-/** True when this item is a weapon Elix may hold. */
-export function isMeleeWeapon(name: string): boolean {
-  return MELEE_DAMAGE[name] !== undefined;
-}
-
 /**
  * Comparison key for armour in one slot: points first, toughness as the tie-break.
  *
@@ -201,16 +187,4 @@ export function armorAndMeleeItemNames(
   }
   if (allItemNames.includes("trident")) melee.push("trident");
   return { armor, melee };
-}
-
-/** The item's own name, when the runtime value really is an item-ish object. */
-export function itemNameOf(value: unknown): string | null {
-  if (value === null || typeof value !== "object") return null;
-  const named = value as { name?: unknown };
-  return typeof named.name === "string" ? named.name : null;
-}
-
-/** True when `item` is the vendored 26.2 item of that name. Used by the tests, not the reflex. */
-export function isVendoredItem(item: ItemDef | null, name: string): boolean {
-  return item !== null && item.name === name;
 }

@@ -41,7 +41,7 @@ export interface DepositRequest {
 }
 
 /** Words a player uses for an item, mapped to the real 26.2 name. */
-export const ITEM_WORDS: Readonly<Record<string, string>> = Object.freeze({
+const ITEM_WORDS: Readonly<Record<string, string>> = Object.freeze({
   cobble: "cobblestone",
   cobblestone: "cobblestone",
   dirt: "dirt",

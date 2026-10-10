@@ -53,7 +53,7 @@ export const RATE_WINDOW_MS = 60_000;
  * `z.discriminatedUnion` on the tool name is what makes "an unknown tool" and "a known tool
  * with the wrong arguments" two different, separately-tested failures.
  */
-export const toolCallSchema = z.discriminatedUnion("tool", [
+const toolCallSchema = z.discriminatedUnion("tool", [
   z.object({
     tool: z.literal("follow"),
     /** Who to follow. Resolved against the tracked players by the caller. */

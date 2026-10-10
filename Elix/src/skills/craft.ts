@@ -156,7 +156,7 @@ export function canPlaceTableHere(standOn: string | null, above: string | null, 
 }
 
 /** Words a player uses, mapped to the real 26.2 item name. */
-export const CRAFT_WORDS: Readonly<Record<string, string>> = Object.freeze({
+const CRAFT_WORDS: Readonly<Record<string, string>> = Object.freeze({
   planks: "oak_planks",
   plank: "oak_planks",
   sticks: "stick",

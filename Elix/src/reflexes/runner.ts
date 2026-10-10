@@ -69,7 +69,7 @@ export type ReflexEndReason = "stopped" | "finished" | "failed";
  * long enough to break the surface from ordinary depths and short enough that Elix is not
  * bunny-hopping along the sea bed if the water is shallow.
  */
-export const JUMP_HOLD_TICKS = 8;
+const JUMP_HOLD_TICKS = 8;
 
 export class ReflexRunner {
   /** What is running right now, or null. */

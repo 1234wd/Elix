@@ -20,7 +20,7 @@
 import { isHostileByCategory, isKnownEntity } from "../world/mcdata.js";
 
 /** Mobs that attack Elix. The good-friend rules decide what happens next. */
-export const HOSTILE_MOBS: ReadonlySet<string> = Object.freeze(
+const HOSTILE_MOBS: ReadonlySet<string> = Object.freeze(
   new Set([
     "zombie",
     "husk",

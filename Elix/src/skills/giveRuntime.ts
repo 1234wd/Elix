@@ -73,7 +73,7 @@ export interface GiveDeps {
  * The asker's OWN record, never "the nearest player": handing an item to the wrong child
  * because somebody else was closer would be the worst bug this file could have.
  */
-export function positionOf(players: Record<string, unknown> | undefined, name: string): Vec3 | null {
+function positionOf(players: Record<string, unknown> | undefined, name: string): Vec3 | null {
   const player = players?.[name];
   if (player === null || typeof player !== "object") return null;
   const entity = (player as { entity?: unknown }).entity;

@@ -54,15 +54,6 @@ export interface LookSuppression {
   /** Gentle mode: quiet for a while, so no greeting at all. */
   gentleMode: boolean;
 }
-
-/** Nothing is going on, so the gaze may wander. */
-export const IDLE_SUPPRESSION: LookSuppression = Object.freeze({
-  combat: false,
-  following: false,
-  wellbeingReply: false,
-  gentleMode: false,
-});
-
 /** True when nothing may fidget. Combat, follow and a wellbeing reply all count. */
 export function isSuppressed(state: LookSuppression): boolean {
   return state.combat || state.following || state.wellbeingReply;

@@ -37,7 +37,7 @@ export interface DeathRecord {
 }
 
 /** What kind of place this is. Free-form words are allowed too. */
-export const PLACE_KINDS: readonly string[] = Object.freeze(["home", "base", "farm", "mine", "shop", "note"]);
+const PLACE_KINDS: readonly string[] = Object.freeze(["home", "base", "farm", "mine", "shop", "note"]);
 
 /** Never dig within this many blocks of a remembered place. */
 export const PROTECTED_RADIUS = 24;
