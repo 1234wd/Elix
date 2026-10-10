@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R18-D - wire craft.** R18-A, R18-B and R18-C are DONE. X4-X7 remain (give, memory, tool calls, NVIDIA/Ollama).
+**RESUME HERE: R18-H - wire NVIDIA/Ollama (X7), then R18-G tool calls (X6), then R18-I wiring audit.** R18-A..R18-F DONE.
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -39,11 +39,11 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R18-A portability | **DONE** | `f99b70b` | X0 ✅ |
 | R18-B reflex units | **DONE** | `f4432c9` | X1 ✅ X2 ✅ |
 | R18-C wire gather | **DONE** | `3e8bee9` | X3 pass (17 new tests) |
-| R18-D wire craft | **NEXT** | - | - |
-| R18-E wire give/deposit | TODO | | X4 ❌ |
-| R18-F wire world memory | TODO | | X5 ❌ |
-| R18-G wire tool calls | TODO | | X6 ❌ |
-| R18-H wire NVIDIA/Ollama | TODO | | X7 ❌ |
+| R18-D wire craft | **DONE** | `b4f1f93` | 16 new tests, real-lib contract |
+| R18-E wire give/deposit | **DONE** | `cc46aab` | 17 new tests (X4 pass) |
+| R18-F wire world memory | **DONE** | `573f5e8` | 17 new tests (X5 pass) |
+| R18-G wire tool calls | **NEXT** | - | X6 |
+| R18-H wire NVIDIA/Ollama | **NEXT** | - | X7 |
 | R18-I wiring audit | TODO | | — |
 | R18-J setup wizard | TODO | | — |
 | R18-K sleep | TODO | | — |
@@ -198,6 +198,18 @@ Each of these was a real defect, not a test problem:
 | WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
 | WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
 
+## Deviations this round (test changes I made)
+
+- `tests/unit/craft.test.ts` - two assertions changed from `needsTable("crafting_table") === true`
+  to `false`, and the same for `recipeFor("crafting_table").needsTable`. Reason: a 2x2 recipe is an
+  inventory recipe; the old value made "make a crafting table" impossible. My own Round 17 tests,
+  encoding the bug this backlog fixes.
+- `src/skills/give.ts` - no test change, but `HAND_CRAFTABLE` in `craft.ts` gained
+  `crafting_table`, which changes `needsTable()` behaviour on purpose (see above).
+- Test fakes changed to be MORE faithful to mineflayer, never less: the gather/craft/give fakes
+  now update `heldItem` on equip, because a fake that does not makes the weapon reflex re-equip
+  every tick and any equip assertion then measures the reflex instead of the skill.
+
 ## Deviations
 
 Changes to tests I wrote myself, each one encoded a bug or a rule this backlog changed.
@@ -291,3 +303,28 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
   to equip the sword, so a pickaxe in hand afterwards can only have come from the dig.
 - **A stop after a gather FINISHED proves nothing.** Ask for 64 items so the gather is still running
   when the stop lands.
+### R18-D..R18-F - the real mineflayer API, read rather than assumed
+
+- **`bot.placeBlock(referenceBlock, faceVector)` takes NO item.** It places the HELD item.
+  So placing a table is equip-then-place, and a runtime that forgets the equip does nothing
+  while looking like it worked. `docs/api.md` is explicit about this.
+- **`bot.recipesFor(...)` is SYNCHRONOUS** and returns an array; `bot.craft(recipe, count, table)`
+  THROWS `Recipe requires craftingTable` when the table argument is null. The recipe object handed
+  to `craft` must come from `bot.recipesFor` - minecraft-data's recipe is a DIFFERENT shape and
+  the real library would reject it while every fake accepted it.
+- **`GoalGetToBlock(x,y,z)` and `GoalNear(x,y,z,range)` take NUMBERS.** Passing a position object
+  gives NaN coordinates through `Math.floor`, and Elix walks confidently in the wrong direction.
+- **A crafting table is a 2x2 recipe**, i.e. the INVENTORY grid. Round 17 listed it as needing a
+  table, which made "make a crafting table" impossible. Changed `HAND_CRAFTABLE`; two of my own
+  Round 17 assertions said the opposite and were corrected (see Deviations).
+- **`bot.toss(itemType, metadata, count)` / `window.deposit(itemType, metadata, count, nbt)`.**
+  The chest is a one-way door: `giveRuntime.ts` contains no `withdraw` call and a test asserts
+  that at the source level as well as in behaviour.
+- **A regression the read-only round16 probe caught:** `parseGoTo` listed `come` as a verb, so
+  "elix come here" became "walk to a place called here" and the real follow command never ran.
+  Removed `come`, and moved world memory AFTER `parseAddressedCommand` so no parser added later
+  can shadow follow/come/stop.
+- **The place book lives in MEMORY first and the store second.** A session with no store (every
+  bare unit test, and a bot whose data dir does not exist yet) must still remember a place told
+  to it thirty seconds ago, or "remember this place" silently does nothing.
+
