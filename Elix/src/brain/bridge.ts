@@ -15,6 +15,14 @@ import type { Logger } from "../core/logger.js";
 import type { BrainRouter } from "./router.js";
 import { SayQueue } from "../social/say.js";
 import { buildChatMessages, isAddressedToElix, loadPersonaLite } from "./persona.js";
+import {
+  MAX_TOOLS_PER_MINUTE,
+  RATE_WINDOW_MS,
+  TOOL_INSTRUCTIONS,
+  selectToolCalls,
+  stripToolBlock,
+  type ToolCall,
+} from "./toolCalls.js";
 import { checkInputSafety, BLOCKED_LINES } from "./fallback.js";
 import { isGreetingLine, manipulationProblem } from "../social/emotion.js";
 import type { WellbeingLevel } from "../social/wellbeing.js";
@@ -148,6 +156,10 @@ export interface ChatBridgeOptions {
    * it was supposed to match ran for twenty minutes.
    */
   gentleModeMs?: number;
+  /**
+   * R18-G: who may give Elix tool calls. Only an owner is told the format exists at all.
+   */
+  owners?: readonly string[];
   /**
    * C3: seedable, so the 1-in-15 typo rate is assertable instead of being a
    * thing you can only observe by luck.
@@ -298,6 +310,93 @@ export class ChatBridge {
     this.opts = opts;
     this.random = opts.random ?? Math.random;
     this.persona = opts.personaLite ?? loadPersonaLite(PROJECT_ROOT);
+
+  }
+
+  /** R18-G: tool calls the model asked for, with the minute they were asked. */
+  private toolStamps: number[] = [];
+  /**
+   * R18-G: the ONE executor for tool calls, set by the session that owns the body.
+   *
+   * The bridge has no bot and cannot have one - it is the chat half - so it hands valid
+   * calls to whatever the running session registered. That is what makes tool calls and chat
+   * commands share ONE code path, with the same owner rule, the same allow-list and the
+   * same stop.
+   */
+  private toolExecutor: ((call: ToolCall, askedBy: string) => void | Promise<void>) | null = null;
+
+  /**
+   * R18-G: the owner list, when the SESSION supplies it.
+   *
+   * The bridge is built before the session exists and does not read the Elix config, so the
+   * owner list arrives from `BotSession` - which is the thing that has the config. `opts.owners`
+   * still works for a caller that has one; neither being set means nobody is an owner, which is
+   * the safe direction: no tool call runs rather than every tool call running.
+   */
+  private sessionOwners: readonly string[] | null = null;
+
+  /** R18-G: called by BotSession once it has read the config. */
+  setOwners(owners: readonly string[]): void {
+    this.sessionOwners = owners;
+  }
+
+  /** R18-G: register the executor. Called by BotSession, once per bot. */
+  setToolExecutor(fn: (call: ToolCall, askedBy: string) => void | Promise<void>): void {
+    this.toolExecutor = fn;
+  }
+
+  /** Is this sender an owner? Case-insensitive, because Minecraft names are not. */
+  private isOwner(sender: string): boolean {
+    const owners = this.sessionOwners ?? this.opts.owners ?? [];
+    const lower = sender.toLowerCase();
+    return owners.some((name) => name.toLowerCase() === lower);
+  }
+
+  /**
+   * The persona for one sender.
+   *
+   * Only an owner is told the tool format exists. A stranger's prompt does not mention it, so
+   * a stranger cannot talk Elix into acting by describing the format back to him.
+   */
+  private personaFor(sender: string): string {
+    if (!this.isOwner(sender)) return this.persona;
+    return `${this.persona}\n\n${TOOL_INSTRUCTIONS}`;
+  }
+
+  /** How many tool calls have run in the last minute. */
+  private callsThisMinute(now = Date.now()): number {
+    this.toolStamps = this.toolStamps.filter((at) => now - at < RATE_WINDOW_MS);
+    return this.toolStamps.length;
+  }
+
+  /**
+   * Run the calls a reply asked for - and only if that reply is actually going out.
+   *
+   * Called after every gate, so a DROPPED reply drops its calls with it: a line the safety
+   * filter or the classifier refused must not be able to move Elix anyway.
+   */
+  private async runToolCalls(sender: string, raw: string): Promise<void> {
+    if (this.toolExecutor === null) return;
+    const now = Date.now();
+    const selection = selectToolCalls(raw, {
+      askedBy: sender,
+      isOwner: this.isOwner(sender),
+      replyDropped: false,
+      gentleMode: this.isGentleWindow(sender),
+      callsThisMinute: this.callsThisMinute(now),
+    });
+    for (const call of selection.calls) {
+      if (this.callsThisMinute(now) >= MAX_TOOLS_PER_MINUTE) break;
+      this.toolStamps.push(now);
+      try {
+        await this.toolExecutor(call, sender);
+      } catch {
+        // A tool that throws must not take the reply down with it.
+      }
+    }
+    if (selection.refused !== null) {
+      this.opts.log?.debug?.({ sender, reason: selection.refused }, "tool call refused");
+    }
   }
 
   get replyCount(): number {
@@ -1231,7 +1330,7 @@ private async phraseWellbeing(
         messages: buildChatMessages(
           sender,
           message,
-          this.persona,
+          this.personaFor(sender),
           memoryBlock,
           // R6: a normal model reply in gentle mode, rather than replacing the line with a
           // template. The template path is for a line the gate BLOCKED; a line that simply
@@ -1300,7 +1399,16 @@ private async phraseWellbeing(
 
       // A4: chat is not a place for a paragraph. Cap it after the safety
       // check, so a leak is detected in the FULL text, not the trimmed one.
-      const text = trimChatReply(raw, this.opts.maxReplyChars ?? 200);
+      // R18-G: the tool block is stripped HERE, before the text is trimmed, recorded,
+      // audited or said. A block that reaches public chat as text teaches every player on
+      // the server how to type one, and makes Elix look like he is printing his own
+      // instructions.
+      const text = trimChatReply(stripToolBlock(raw), this.opts.maxReplyChars ?? 200);
+      //
+      // Every gate has passed by this line, so the calls in this reply may run. A dropped
+      // reply returned above and never reaches here - which is the whole reason this sits
+      // AFTER gateReply rather than next to the parse.
+      await this.runToolCalls(sender, raw);
 
       // D7/A6: Elix's own line is an episode too, so he remembers what he said.
       // Recorded AFTER the leak filter, so a deflected line is never stored.

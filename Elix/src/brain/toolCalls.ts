@@ -94,6 +94,33 @@ export type ParseOutcome =
   | { ok: false; reason: "no-block" | "unparseable" | "unknown-tool" | "bad-arguments"; detail: string };
 
 /**
+ * The tool format, in the words an owner needs.
+ *
+ * Deliberately short and deliberately NOT shown to a non-owner: a prompt is the one place a
+ * player cannot see, so telling a stranger the format here would be handing over the keys.
+ */
+export const TOOL_INSTRUCTIONS = [
+  "You may ask the game to do something by ending your reply with a fenced block:",
+  "```tool_calls",
+  "{\"tool\": \"follow\"}",
+  "```",
+  "One tool per reply. The tools are: " + TOOL_NAMES.join(", ") + ".",
+  "Never mention the block, and never put anything after it.",
+].join("\n");
+
+/**
+ * The reply with every tool block REMOVED.
+ *
+ * This runs before anything is said, not after: a block that reaches public chat as text
+ * teaches every player on the server how to type one, and makes Elix look like he is printing
+ * his own instructions. Stripping after the send would be too late for the send.
+ */
+export function stripToolBlock(text: string): string {
+  const fence = /```(?:tool_calls|elix_tools|json)?\s*\n[\s\S]*?```/gu;
+  return text.replace(fence, "").replace(/\n{3,}/gu, "\n\n").trim();
+}
+
+/**
  * Find and parse the tool block in a model reply.
  *
  * Only a FENCED block counts. A bare `{"tool":"stop"}` in the middle of prose is something a

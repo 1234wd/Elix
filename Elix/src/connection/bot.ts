@@ -41,6 +41,7 @@ import { parseGather, PROTECTED_RADIUS } from "../skills/gather.js";
 import { CraftRunner, inventoryItemNames, TABLE_ITEM, type CraftBot } from "../skills/craftRuntime.js";
 import { GiveRunner, type GiveBot } from "../skills/giveRuntime.js";
 import { MemoryRunner, PlaceBook, type MemoryBot } from "../world/memoryRuntime.js";
+import type { ToolCall } from "../brain/toolCalls.js";
 import { parseRemember, parseWhereIs, parseGoTo, parseWhereDied } from "../world/memory.js";
 import { parseGive, parseChestAction, GIVE_REFUSALS, CHEST_RANGE } from "../skills/give.js";
 import { craftRequest } from "../skills/craft.js";
@@ -290,6 +291,17 @@ export const SNEAK_TOGGLE_MS = 220;
 export const PRESENCE_POLL_MS = 2_000;
 
 export interface ChatBridgeLike {
+  /**
+   * R18-G: register the ONE executor for model tool calls.
+   *
+   * Optional, so a bridge that predates tool calls still works. The session registers one
+   * that routes into `runCommand`, which is the same executor the CHAT commands use - so
+   * the owner rule, the allow-list, the protection rules and `stop` all apply to a tool
+   * call exactly as they apply to a typed line, with no second path to keep in step.
+   */
+  setToolExecutor?(fn: (call: ToolCall, askedBy: string) => void | Promise<void>): void;
+  /** R18-G: the owner list, from the Elix config the session already read. */
+  setOwners?(owners: readonly string[]): void;
   handle(
     sender: string,
     message: string,
@@ -581,6 +593,19 @@ function findPlacedTable(bot: BotLike): unknown {
   }
   return bot.blockAt({ x: position.x, y: position.y, z: position.z });
 }
+
+/**
+ * Tool name -> the command action a typed line would produce.
+ *
+ * Only the commands that already exist. A tool with no entry here is logged and refused
+ * rather than approximated: "close enough" between two action vocabularies is how a bot
+ * ends up doing something nobody asked for.
+ */
+const TOOL_COMMAND: Readonly<Record<string, ActionName>> = Object.freeze({
+  follow: "follow",
+  come: "come",
+  stop: "stop",
+});
 
 /** Every block that counts as a chest, as real ids from the vendored data. */
 const CHEST_BLOCK_NAMES = ["chest", "trapped_chest", "barrel"] as const;
@@ -1033,6 +1058,37 @@ export class BotSession {
     }
     this.deps.log.info({ username, kind: outcome.kind }, "memory line handled");
     return true;
+  }
+
+  /**
+   * R18-G: run one tool call the model asked for.
+   *
+   * Three rules, and all three are safety:
+   *
+   *   - OWNER ONLY, checked here as well as in the bridge, because a caller that skips the
+   *     bridge's gate must not get a free pass;
+   *   - the `player` field may only ever be the person Elix is TALKING TO. A model that
+   *     names somebody else is asking Elix to walk to a stranger, and that is refused;
+   *   - `stop` maps to the same command, so it cancels whatever is running, mid-dig
+   *     included.
+   */
+  private runToolCall(bot: BotLike, call: ToolCall, askedBy: string): void {
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    if (!owners.includes(askedBy.toLowerCase())) {
+      this.deps.log.info({ askedBy, tool: call.tool }, "tool call refused: not an owner");
+      return;
+    }
+    const named = (call as { player?: unknown }).player;
+    if (typeof named === "string" && named.toLowerCase() !== askedBy.toLowerCase()) {
+      this.deps.log.warn({ askedBy, named }, "tool call named somebody else - refused");
+      return;
+    }
+    const action = TOOL_COMMAND[call.tool];
+    if (action === undefined) {
+      this.deps.log.info({ tool: call.tool }, "tool call has no command yet");
+      return;
+    }
+    void this.runCommand(bot, askedBy, action, askedBy);
   }
 
   /** One give/deposit step. Fire-and-forget, like every other runtime step. */
@@ -1540,6 +1596,11 @@ export class BotSession {
     // R18-F: death events are bound here, once, beside every other bot event. Without
     // this "where did i die" has nothing to answer from.
     this.watchDeaths(bot);
+    // R18-G: and the model's tool calls come in through the same door as typed commands.
+    this.deps.chatBridge?.setToolExecutor?.((call, askedBy) => {
+      this.runToolCall(bot, call, askedBy);
+    });
+    this.deps.chatBridge?.setOwners?.(this.deps.config.owners ?? []);
     bot.on("chat", ((username: string, message: string) =>
       this.handleChat(bot, username, message)) as never);
     bot.on("kicked", ((raw: unknown) => this.handleKicked(raw)) as never);
