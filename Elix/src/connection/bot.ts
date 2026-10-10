@@ -39,6 +39,8 @@ import {
 } from "../skills/gatherRuntime.js";
 import { parseGather, PROTECTED_RADIUS } from "../skills/gather.js";
 import { CraftRunner, inventoryItemNames, TABLE_ITEM, type CraftBot } from "../skills/craftRuntime.js";
+import { GiveRunner, type GiveBot } from "../skills/giveRuntime.js";
+import { parseGive, parseChestAction, GIVE_REFUSALS, CHEST_RANGE } from "../skills/give.js";
 import { craftRequest } from "../skills/craft.js";
 import { itemIdOf } from "../world/itemIds.js";
 import { protectedPlacesFrom } from "../world/memory.js";
@@ -578,6 +580,67 @@ function findPlacedTable(bot: BotLike): unknown {
   return bot.blockAt({ x: position.x, y: position.y, z: position.z });
 }
 
+/** Every block that counts as a chest, as real ids from the vendored data. */
+const CHEST_BLOCK_NAMES = ["chest", "trapped_chest", "barrel"] as const;
+
+let chestIdsCache: number[] | null = null;
+
+/** The chest ids, resolved once. An empty list means "no chest is findable", which the
+ * deposit path treats as a refusal rather than as a crash. */
+function chestBlockIds(): number[] {
+  if (chestIdsCache !== null) return chestIdsCache;
+  const ids: number[] = [];
+  for (const name of CHEST_BLOCK_NAMES) {
+    const id = blockIdOf(name);
+    if (id !== null) ids.push(id);
+  }
+  chestIdsCache = ids;
+  return ids;
+}
+
+/** The real pathfinder goal classes, or none when the plugin is not loaded. */
+function pathfinderGoals(): { GoalNear?: new (x: number, y: number, z: number, range: number) => unknown; GoalGetToBlock?: new (x: number, y: number, z: number) => unknown } {
+  try {
+    return requirePathfinder().goals as {
+      GoalNear?: new (x: number, y: number, z: number, range: number) => unknown;
+      GoalGetToBlock?: new (x: number, y: number, z: number) => unknown;
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The nearest chest Elix could reach, as `decideGive` wants to see it.
+ *
+ * `canHold` is true whenever a chest is in range: whether it has room is only knowable by
+ * opening it, and refusing on a GUESS would mean the deposit never works at all. The
+ * per-stack deposit in the runtime handles a full chest honestly - the stacks that do not
+ * fit stay in Elix's inventory.
+ */
+function chestViewOf(bot: BotLike, ids: number[]): { distance: number; canHold: boolean } | null {
+  if (ids.length === 0) return null;
+  const find = (bot as { findBlocks?: (opts: unknown) => unknown }).findBlocks;
+  if (typeof find !== "function") return null;
+  let found: unknown;
+  try {
+    found = find.call(bot, { matching: ids, maxDistance: CHEST_RANGE, count: 1 });
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(found) || found.length === 0) return null;
+  const position = (found[0] as { position?: unknown } | null)?.position;
+  if (position === null || typeof position !== "object") return null;
+  const p = position as { x?: unknown; y?: unknown; z?: unknown };
+  if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") return null;
+  const me = bot.entity?.position;
+  const distance =
+    me === undefined
+      ? 0
+      : Math.hypot(me.x - p.x, me.y - p.y, me.z - p.z);
+  return { distance, canHold: true };
+}
+
 /**
  * A block's name, or null when Elix cannot see it.
  *
@@ -830,6 +893,8 @@ export class BotSession {
   private gather: GatherRunner | null = null;
   /** R18-D: the craft runtime, created per request. */
   private craft: CraftRunner | null = null;
+  /** R18-E: the give/deposit runtime, created per request. */
+  private give: GiveRunner | null = null;
   /** WP3: the defender. */
   private defend: DefendController | null = null;
   /** WP3: when a player last hit Elix. Zero means nobody has. */
@@ -881,6 +946,77 @@ export class BotSession {
         gather.stop();
         this.gather = null;
       });
+    return true;
+  }
+
+  /** One give/deposit step. Fire-and-forget, like every other runtime step. */
+  private runGive(): boolean {
+    const give = this.give;
+    if (give === null || !give.busy) return false;
+    void give
+      .step()
+      .then((outcome) => {
+        if (outcome.kind === "given") this.deps.log.info({ item: outcome.item, count: outcome.count, to: outcome.to }, "gave");
+        if (outcome.kind === "deposited") this.deps.log.info({ stacks: outcome.stacks }, "deposited");
+        if (outcome.kind === "refused") this.deps.log.info({ reason: outcome.reason }, "give refused");
+        if (outcome.kind !== "walking") this.give = null;
+      })
+      .catch(() => {
+        this.deps.log.warn("give step threw - nothing left running");
+        give.stop();
+        this.give = null;
+      });
+    return true;
+  }
+
+  /**
+   * R18-E: is this line a give or a deposit, and may this person ask?
+   *
+   * Owner-only and addressed, like every other skill. A refusal returns TRUE so the line
+   * never falls through to the chat model.
+   */
+  private dispatchGive(bot: BotLike, username: string, message: string): boolean {
+    const request = parseGive(message, this.deps.profile.username) ?? parseChestAction(message, this.deps.profile.username);
+    if (request === null) return false;
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    const isOwner = owners.includes(username.toLowerCase());
+    const giveBot = bot as unknown as GiveBot & { inventory?: { items?: () => unknown[] } };
+    const counts: Record<string, number> = {};
+    const list = typeof giveBot.inventory?.items === "function" ? giveBot.inventory.items() : [];
+    if (Array.isArray(list)) {
+      for (const entry of list) {
+        if (entry === null || typeof entry !== "object") continue;
+        const name = (entry as { name?: unknown }).name;
+        const count = (entry as { count?: unknown }).count;
+        if (typeof name === "string" && typeof count === "number") counts[name] = (counts[name] ?? 0) + count;
+      }
+    }
+    const runner = new GiveRunner({
+      bot: giveBot,
+      itemIdOf,
+      chestIds: chestBlockIds(),
+      goals: pathfinderGoals(),
+    });
+    this.give = runner;
+    const outcome = runner.start(request, {
+      askedBy: username,
+      isOwner,
+      counts,
+      chest: chestViewOf(bot, chestBlockIds()),
+      // The floor already had its say in handleChat before this ran, so by the time a line
+      // reaches here it did NOT match - and saying so explicitly keeps the runtime honest
+      // when it is driven from somewhere else.
+      wellbeingFloor: false,
+    });
+    this.deps.log.info({ username, kind: outcome.kind }, "give started");
+    if (outcome.kind === "refused") {
+      // A refusal is Elix's OWN words about his own limits, so it goes through gateOwnLine.
+      // Silence here is the worst answer: "give me" with no reply reads as "i ignored you".
+      this.ownLine(
+        username,
+        outcome.reason === "not-an-owner" ? NOT_AN_OWNER : (GIVE_REFUSALS[outcome.reason] ?? "i cannot do that"),
+      );
+    }
     return true;
   }
 
@@ -1423,6 +1559,8 @@ export class BotSession {
       if (this.runGather()) return;
       // R18-D: and craft next, because it owns the body while the table window is open.
       if (this.runCraft()) return;
+      // R18-E: giving away an item is a short walk, so it goes after the skills that dig.
+      if (this.runGive()) return;
       // WP3 first: a hostile mob next to the owner outranks everything below.
       if (this.runDefend(bot)) {
         return;
@@ -1604,6 +1742,8 @@ export class BotSession {
     if (this.dispatchGather(bot, username, message)) return;
     // R18-D: same rules, same place - craft is a skill line, not a chat line.
     if (this.dispatchCraft(bot, username, message)) return;
+    // R18-E: give and deposit, in the same place, with the same owner rule.
+    if (this.dispatchGive(bot, username, message)) return;
 
     const command = parseAddressedCommand(message, profile.username);
     if (command) {
@@ -1943,6 +2083,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // left in somebody's house, so the runtime is dropped whole.
     this.craft?.stop();
     this.craft = null;
+    // R18-E: and the give runtime, which may be halfway to somebody with an item in hand.
+    this.give?.stop();
+    this.give = null;
     // WP3: and it clears the engagement, so the next tick cannot swing on the strength of a
     // reaction delay that started before the stop.
     this.defend?.stop();
