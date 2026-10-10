@@ -240,9 +240,11 @@ describe("A3 — the model id's slash must survive URL encoding", () => {
   });
 });
 
-describe("provider list — Groq and Hugging Face only", () => {
-  it("checks exactly two cloud providers", () => {
-    expect(PROVIDER_KEYS.map(([env]) => env)).toEqual(["GROQ_API_KEY", "HF_TOKEN"]);
+describe("provider list - the cloud providers that take a key", () => {
+  it("checks Groq, Hugging Face and NVIDIA", () => {
+    // R18-H: buildBrain constructs nvidia when NVIDIA_API_KEY is set, so a doctor that does not
+    // mention NVIDIA tells the owner their key is unused. Round 17 asserted exactly two.
+    expect(PROVIDER_KEYS.map(([env]) => env)).toEqual(["GROQ_API_KEY", "HF_TOKEN", "NVIDIA_API_KEY"]);
   });
 
   it("never probes a provider without a key", async () => {
