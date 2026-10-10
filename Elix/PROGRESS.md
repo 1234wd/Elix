@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R18-H - wire NVIDIA/Ollama (X7), then R18-G tool calls (X6), then R18-I wiring audit.** R18-A..R18-F DONE.
+**RESUME HERE: R18-J (setup wizard), R18-K (sleep), R18-L (finish splitting), R18-M (voice).** R18-A..R18-I DONE; all 9 reviewer probes pass and the fresh-clone gate is green.
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -42,13 +42,13 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R18-D wire craft | **DONE** | `b4f1f93` | 16 new tests, real-lib contract |
 | R18-E wire give/deposit | **DONE** | `cc46aab` | 17 new tests (X4 pass) |
 | R18-F wire world memory | **DONE** | `573f5e8` | 17 new tests (X5 pass) |
-| R18-G wire tool calls | **NEXT** | - | X6 |
-| R18-H wire NVIDIA/Ollama | **NEXT** | - | X7 |
-| R18-I wiring audit | TODO | | — |
-| R18-J setup wizard | TODO | | — |
-| R18-K sleep | TODO | | — |
-| R18-L finish splitting | TODO | | — |
-| R18-M voice step 1 | TODO | | — |
+| R18-G wire tool calls | **DONE** | `348de6c` | X6 pass (10 new tests) |
+| R18-H wire NVIDIA/Ollama | **DONE** | `fb549cd` | X7 pass (16 new tests) |
+| R18-I wiring audit | **DONE** | `eeba438` | 50 exports removed, 6 audit tests |
+| R18-J setup wizard | NOT REACHED | - | - |
+| R18-K sleep | NOT REACHED | - | - |
+| R18-L finish splitting | NOT REACHED | - | - |
+| R18-M voice step 1 | NOT REACHED | - | - |
 
 Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
 fixture check).
@@ -198,6 +198,24 @@ Each of these was a real defect, not a test problem:
 | WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
 | WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
 
+## Deviations this round (every test change I made)
+
+- `tests/unit/craft.test.ts` - `needsTable("crafting_table")` asserted `true`, now `false`, in two
+  places. Reason: a 2x2 recipe is an inventory recipe; the old value made "make a crafting
+  table" impossible. My own Round 17 tests encoding the bug this backlog fixes.
+- `tests/unit/doctor.test.ts` - the provider list asserted exactly `GROQ_API_KEY, HF_TOKEN`;
+  now includes `NVIDIA_API_KEY`. Reason: R18-H builds the NVIDIA provider, so a doctor that does
+  not mention it tells the owner their key is unused.
+- `tests/unit/worldMemoryWiring.test.ts` - the "dropped reply" case could NOT be driven through
+  the classifier fake (`speakIfAuditFinds` decides on new-detection state that earlier tests
+  leave behind), so it is asserted two other ways instead: a source-order assertion that
+  `runToolCalls` sits after the `gateReply` early return, and the pure gate refusing every call
+  when `replyDropped` is true. **The end-to-end dropped-reply path is therefore NOT verified** -
+  it is verified structurally and at the gate, not by driving a real drop.
+- No probe file was edited: round13/14/15/16/18 probes were read-only throughout and all nine
+  R18 probes pass unmodified.
+- Test fakes were made MORE faithful to mineflayer, never less (`heldItem` updates on equip).
+
 ## Deviations this round (test changes I made)
 
 - `tests/unit/craft.test.ts` - two assertions changed from `needsTable("crafting_table") === true`
@@ -327,4 +345,29 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
 - **The place book lives in MEMORY first and the store second.** A session with no store (every
   bare unit test, and a bot whose data dir does not exist yet) must still remember a place told
   to it thirty seconds ago, or "remember this place" silently does nothing.
+
+### R18-G..R18-I - what the last three items cost, and the tooling trap that nearly hid it
+
+- **The bridge has no bot and cannot have one.** It is the chat half. So the session registers
+  ONE executor (`setToolExecutor`) and the owner list (`setOwners`) on it, and the tool calls
+  land in `runCommand` - literally the same function a typed line lands in. That is what makes
+  the owner rule, the allow-list and `stop` apply identically with no second code path.
+- **Strip the tool block BEFORE anything is said**, not after: trimming, recording, the audit and
+  the send all use the stripped text. A block that reaches public chat teaches the whole server
+  how to type one.
+- **The owner prompt gets the tool format; a stranger's prompt does not mention tools at all.**
+- **`parseToolCalls` needs `player` for `follow`.** The probe passes it; I guessed without it and
+  the failure looked exactly like a gate refusal - a parse failure and a policy failure are
+  indistinguishable from the outside unless you read the schema.
+- **R18-I found 50 exports that nothing outside their own module imported** - 39 of them with no
+  test either, which are now simply not exported, and 11 more that were not even used inside
+  their own module and are deleted. `tests/unit/wiring.test.ts` now fails the build if a new
+  one appears. That is the point of the whole round.
+- **TOOLING TRAP (cost ~25 minutes):** in `String.replace`, the replacement `"$1 $name"` is a
+  group reference, not a literal. A loop that un-exported 39 names rewrote all 39 to the
+  literal text `$name` across 13 files. Every patch script must (a) verify every anchor BEFORE
+  writing, and (b) use a REPLACER FUNCTION, never a string with `$` in it.
+- **Second trap:** a cut heuristic that searched for the next `\n  }\n` found the wrong brace and
+  injected class members inside a constructor. `tsc` caught it in seconds; a heuristic that
+  "saves time" is not worth it.
 
