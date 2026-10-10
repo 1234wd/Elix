@@ -73,7 +73,10 @@ describe("WP5b — the craftable list is real", () => {
 
   it("a crafting table really is four planks in a 2x2, shaped", () => {
     const table = recipeFor("crafting_table");
-    expect(table?.needsTable).toBe(true);
+    // A 2x2 grid is the INVENTORY grid, so no table is needed to make one. This asserted
+    // the opposite, which made "make a crafting table" impossible - you cannot place a
+    // table you cannot craft. R18-D, Deviations.
+    expect(table?.needsTable).toBe(false);
     expect(table?.shape).toHaveLength(2);
     // `recipes.json` holds one row per plank variant under the crafting_table key, and the
     // first is cherry. The shape is the fact; the particular plank is the recipe chosen.
@@ -104,7 +107,8 @@ describe("WP5b — the craftable list is real", () => {
   it("a hand makes planks and sticks; everything else needs a table", () => {
     expect(needsTable("oak_planks")).toBe(false);
     expect(needsTable("stick")).toBe(false);
-    expect(needsTable("crafting_table")).toBe(true);
+    // Same correction as above, read through the helper rather than the recipe.
+  expect(needsTable("crafting_table")).toBe(false);
     expect(needsTable("stone_pickaxe")).toBe(true);
     expect(needsTable("stone_axe")).toBe(true);
     expect(needsTable("stone_sword")).toBe(true);

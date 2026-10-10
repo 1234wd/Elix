@@ -38,6 +38,9 @@ import {
   type GatherWorld,
 } from "../skills/gatherRuntime.js";
 import { parseGather, PROTECTED_RADIUS } from "../skills/gather.js";
+import { CraftRunner, inventoryItemNames, TABLE_ITEM, type CraftBot } from "../skills/craftRuntime.js";
+import { craftRequest } from "../skills/craft.js";
+import { itemIdOf } from "../world/itemIds.js";
 import { protectedPlacesFrom } from "../world/memory.js";
 import { blockIdOf, blockNameOf } from "../world/blockIds.js";
 import type { MemoryStore } from "../memory/store.js";
@@ -540,6 +543,53 @@ export function requirePathfinder(): PathfinderModule {
  */
 const movementsReady = new WeakSet<object>();
 
+/** How far Elix looks for a table somebody else already placed. */
+const EXISTING_TABLE_RANGE = 4;
+
+/**
+ * The nearest placed crafting table, as a real Block, or null.
+ *
+ * `findBlocks` returns Blocks in real mineflayer but some versions hand back positions, so
+ * both are handled and the Block is re-read through `blockAt` either way - the thing that
+ * must reach `bot.craft` is a Block, and a position is not one.
+ */
+function findPlacedTable(bot: BotLike): unknown {
+  const id = blockIdOf(TABLE_ITEM);
+  if (id === null) return null;
+  // Not every build exposes findBlocks on the declared surface, so it is read through a
+  // guard: a missing search means "no table found", which is the safe direction.
+  const search = (bot as { findBlocks?: (opts: unknown) => unknown }).findBlocks;
+  if (typeof search !== "function") return null;
+  let found: unknown;
+  try {
+    found = search.call(bot, { matching: id, maxDistance: EXISTING_TABLE_RANGE, count: 1 });
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(found) || found.length === 0) return null;
+  const first = found[0];
+  const name = (first as { name?: unknown } | null)?.name;
+  if (typeof name === "string") return first;
+  const position = first as { x?: unknown; y?: unknown; z?: unknown } | null;
+  if (position === null || typeof position !== "object") return null;
+  if (typeof position.x !== "number" || typeof position.y !== "number" || typeof position.z !== "number") {
+    return null;
+  }
+  return bot.blockAt({ x: position.x, y: position.y, z: position.z });
+}
+
+/**
+ * A block's name, or null when Elix cannot see it.
+ *
+ * The rule that decides whether a table may be placed is a NAME rule, so the world it reads is
+ * names - not BlockLike objects, which cannot tell a reader what the rule is looking at.
+ */
+function namedBlock(block: unknown): { name: string } | null {
+  if (block === null || typeof block !== "object") return null;
+  const name = (block as { name?: unknown }).name;
+  return typeof name === "string" ? { name } : null;
+}
+
 /**
  * The world the gather rules read: where Elix is, who is near enough to matter, and every
  * REMEMBERED PLACE.
@@ -778,6 +828,8 @@ export class BotSession {
   private lastSneakAt = 0;
   /** R18-C: the gather runtime, created per request. */
   private gather: GatherRunner | null = null;
+  /** R18-D: the craft runtime, created per request. */
+  private craft: CraftRunner | null = null;
   /** WP3: the defender. */
   private defend: DefendController | null = null;
   /** WP3: when a player last hit Elix. Zero means nobody has. */
@@ -829,6 +881,80 @@ export class BotSession {
         gather.stop();
         this.gather = null;
       });
+    return true;
+  }
+
+  /** One craft step. Fire-and-forget, for the same reason the gather step is. */
+  private runCraft(): boolean {
+    const craft = this.craft;
+    if (craft === null || !craft.busy) return false;
+    void craft
+      .run()
+      .then((outcome) => {
+        if (outcome.kind === "done") this.deps.log.info({ item: outcome.item }, "craft finished");
+        if (outcome.kind === "refused") {
+          this.deps.log.info({ reason: outcome.reason }, "craft refused");
+          this.craft = null;
+        }
+      })
+      .catch(() => {
+        this.deps.log.warn("craft step threw - nothing left running");
+        craft.stop();
+        this.craft = null;
+      });
+    return true;
+  }
+
+  /**
+   * R18-D: is this line a craft request, and may this person run one?
+   *
+   * Owner-only and addressed, exactly like gather. A refusal returns TRUE so the line never
+   * falls through to the chat model, which would have Elix apologise in prose for something
+   * he simply declined to do.
+   */
+  private dispatchCraft(bot: BotLike, username: string, message: string): boolean {
+    const request = craftRequest(message, this.deps.profile.username);
+    if (request === null) return false;
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    if (!owners.includes(username.toLowerCase())) {
+      this.deps.log.info({ username }, "craft refused: not an owner");
+      this.say?.say(NOT_AN_OWNER);
+      return true;
+    }
+    const craftBot = bot as unknown as CraftBot;
+    const held = inventoryItemNames(craftBot);
+    const counts: Record<string, number> = {};
+    for (const name of held) counts[name] = (counts[name] ?? 0) + 1;
+    const me = bot.entity?.position ?? { x: 0, y: 64, z: 0 };
+    // A table ALREADY PLACED nearby is worth four planks and a trip. `findBlocks` gives
+    // real Blocks, which is exactly what `bot.craft` has to be handed.
+    const existingTable = findPlacedTable(bot);
+    // The spot is the block above the one Elix is standing on - beside him, not under him,
+    // so a placed table never lands in the space his own feet occupy.
+    const spot = { x: Math.floor(me.x) + 1, y: Math.floor(me.y), z: Math.floor(me.z) };
+    const runner = new CraftRunner({
+      bot: craftBot,
+      itemIdOf,
+      itemNamed: (name) => {
+        const inventory = craftBot.inventory;
+        if (inventory === undefined || typeof inventory.items !== "function") return null;
+        const list = inventory.items();
+        if (!Array.isArray(list)) return null;
+        for (const entry of list) if (entry !== null && typeof entry === "object" && (entry as { name?: unknown }).name === name) return entry;
+        return null;
+      },
+      say: (line) => this.ownLine(username, line),
+    });
+    this.craft = runner;
+    const step = runner.start(request, {
+      blockBelow: namedBlock(bot.blockAt({ x: spot.x, y: spot.y - 1, z: spot.z })),
+      blockAbove: namedBlock(bot.blockAt(spot)),
+      roomAround: true,
+      hasTable: existingTable !== null,
+      spot,
+      counts,
+    }, existingTable);
+    this.deps.log.info({ username, item: request.item, count: request.count, step: step.kind }, "craft started");
     return true;
   }
 
@@ -1295,6 +1421,8 @@ export class BotSession {
       if (this.shutdownRequested || this.ended) return;
       // R18-C: the gather steps first, because it owns the body while it is mid-dig.
       if (this.runGather()) return;
+      // R18-D: and craft next, because it owns the body while the table window is open.
+      if (this.runCraft()) return;
       // WP3 first: a hostile mob next to the owner outranks everything below.
       if (this.runDefend(bot)) {
         return;
@@ -1474,6 +1602,8 @@ export class BotSession {
     // command parse, so "elix get 5 dirt" never reaches the chat model - which is what the
     // reviewer's X3 probe measures, and what "nothing happens" looked like on a live server.
     if (this.dispatchGather(bot, username, message)) return;
+    // R18-D: same rules, same place - craft is a skill line, not a chat line.
+    if (this.dispatchCraft(bot, username, message)) return;
 
     const command = parseAddressedCommand(message, profile.username);
     if (command) {
@@ -1809,6 +1939,10 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // R18-C: a stop reaches a dig already in flight, not just the plan.
     this.gather?.stop();
     this.gather = null;
+    // R18-D: a craft has nothing in flight, but a half-placed table would be furniture
+    // left in somebody's house, so the runtime is dropped whole.
+    this.craft?.stop();
+    this.craft = null;
     // WP3: and it clears the engagement, so the next tick cannot swing on the strength of a
     // reaction delay that started before the stop.
     this.defend?.stop();

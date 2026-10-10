@@ -80,7 +80,21 @@ export const CRAFTABLE: readonly string[] = Object.freeze([
 
 /** Items a bare hand can make. Everything else needs a table. */
 const HAND_CRAFTABLE: ReadonlySet<string> = Object.freeze(
-  new Set(["oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks", "cherry_planks", "dark_oak_planks", "mangrove_planks", "stick"]),
+  new Set([
+    "oak_planks",
+    "spruce_planks",
+    "birch_planks",
+    "jungle_planks",
+    "acacia_planks",
+    "cherry_planks",
+    "dark_oak_planks",
+    "mangrove_planks",
+    "stick",
+    // A crafting table is FOUR PLANKS IN A 2x2 GRID - the inventory grid - so it is made
+    // in the inventory, not at a table. Round 17 listed it as needing a table, which made
+    // "make a crafting table" impossible: you cannot place a table you cannot craft.
+    "crafting_table",
+  ]),
 );
 
 /** True when this item needs a crafting table. */
