@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R18-J (setup wizard), R18-K (sleep), R18-L (finish splitting), R18-M (voice).** R18-A..R18-I DONE; all 9 reviewer probes pass and the fresh-clone gate is green.
+**RESUME HERE: R19-B (mineflayer contract file), then R19-C (split bot.ts/bridge.ts), R19-D wizard, R19-E sleep, R19-F smelting, R19-G e2e, R19-H voice.** R19-A DONE.
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -198,6 +198,13 @@ Each of these was a real defect, not a test problem:
 | WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
 | WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
 
+## Deviations — round 19 so far
+
+- `tests/unit/gatherWiring.test.ts` REWRITTEN against `RealSpeedBot`. The assertions are the
+  Round 18 ones; the fake is the one a game would give us. Reason: the old fake never moved
+  Elix and still expected a dig to happen, which is the exact bug R19-A fixes. Listed test by
+  test under the item table when R19-B finishes the fake audit.
+
 ## Deviations this round (every test change I made)
 
 - `tests/unit/craft.test.ts` - `needsTable("crafting_table")` asserted `true`, now `false`, in two
@@ -370,4 +377,22 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
 - **Second trap:** a cut heuristic that searched for the next `\n  }\n` found the wrong brace and
   injected class members inside a constructor. `tsc` caught it in seconds; a heuristic that
   "saves time" is not worth it.
+
+### R19-A - why 2027 green tests did not mean one working skill
+
+- **The whole round was ONE mistake wearing four costumes:** a 50 ms tick that assumes every
+  action finishes instantly. Real `dig` takes seconds, real `setGoal` RESETS the path and the
+  control states, and nothing is in reach until Elix has ARRIVED.
+- `src/skills/runtime.ts` is the fix and the only place the three rules live: ONE step in
+  flight (a tick that finds a step pending does nothing), ARRIVE before acting, and re-goal
+  only when the target has moved more than 2 blocks.
+- **`bot.findBlocks` returns COORDINATES.** Both `chestViewOf` (bot.ts) and `toBlock`
+  (giveRuntime.ts) were reading `.position` off the result, which is always undefined. The
+  chest never opened and no error ever appeared. `tests/helpers/realSpeedBot.ts` now returns
+  Vec3 and `openContainer` REJECTS a non-Block, exactly as mineflayer does.
+- **`RealSpeedBot` skips the DEFAULT landscape only.** A block the test places into `world` is
+  terrain the test chose, and must be findable even when its name is `stone` - the first
+  version filtered by name and made "mine 3 stone" unfindable.
+- **The wiring audit caught four of my own new dead exports** (`REACH`, `GOAL_MOVE_THRESHOLD`,
+  `eyeOf`, `reachDistance`) within minutes of writing them. It is doing its job.
 
