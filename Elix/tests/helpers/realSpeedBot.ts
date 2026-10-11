@@ -344,6 +344,12 @@ export class RealSpeedBot extends EventEmitter implements BotLike {
     this.stacks.push(makeItem(name, count, 40 + this.stacks.length));
   }
 
+  /** mineflayer's `bot.sleep(bedBlock)`. Overridden in the sleep tests to measure it. */
+  async sleep(block: unknown): Promise<void> {
+    void block;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
   _client = { on: (): void => {}, write: (): void => {} };
   quit(): void {
     queueMicrotask(() => this.emit("end", "socketClosed"));

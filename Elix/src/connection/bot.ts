@@ -31,6 +31,7 @@ import {
 import { COME_RADIUS, FollowController, realGoalFactory, type FollowTarget, type PathfinderLike } from "../actions/follow.js";
 import { ReflexRunner } from "../reflexes/runner.js";
 import { DefendController } from "../reflexes/defend.js";
+import { isHostileMob } from "../reflexes/hostile.js";
 import {
   GatherRunner,
   otherPlayerPositions,
@@ -46,6 +47,7 @@ import { parseRemember, parseWhereIs, parseGoTo, parseWhereDied } from "../world
 import { parseGive, parseChestAction, GIVE_REFUSALS, CHEST_RANGE } from "../skills/give.js";
 import { craftRequest } from "../skills/craft.js";
 import { itemIdOf } from "../world/itemIds.js";
+import { SleepRunner, type SleepBot, type SleepContext } from "../reflexes/sleep.js";
 import { protectedPlacesFrom } from "../world/memory.js";
 import { blockIdOf, blockNameOf } from "../world/blockIds.js";
 import type { MemoryStore } from "../memory/store.js";
@@ -607,6 +609,65 @@ const TOOL_COMMAND: Readonly<Record<string, ActionName>> = Object.freeze({
   stop: "stop",
 });
 
+/** Every block that counts as a bed, as real ids from the vendored data. */
+const BED_BLOCK_NAMES = [
+  "red_bed",
+  "blue_bed",
+  "white_bed",
+  "black_bed",
+  "yellow_bed",
+  "lime_bed",
+  "light_blue_bed",
+  "pink_bed",
+  "gray_bed",
+  "light_gray_bed",
+  "cyan_bed",
+  "purple_bed",
+  "blue_bed",
+  "green_bed",
+  "orange_bed",
+  "magenta_bed",
+  "brown_bed",
+] as const;
+
+let bedIdsCache: number[] | null = null;
+
+/** The bed ids, resolved once. Empty means "no bed is findable", which is a refusal, not a crash. */
+function bedBlockIds(): number[] {
+  if (bedIdsCache !== null) return bedIdsCache;
+  const ids: number[] = [];
+  for (const name of BED_BLOCK_NAMES) {
+    const id = blockIdOf(name);
+    if (id !== null) ids.push(id);
+  }
+  bedIdsCache = ids;
+  return ids;
+}
+
+/**
+ * Hostile entity positions, from mineflayer's own entity map.
+ *
+ * Elix's OWN defender decides what counts as hostile (`isHostileMob`, which asks minecraft-data
+ * first and then a hand-written set); this only collects the positions, so the sleep rule can
+ * measure a distance and the two never disagree about what "hostile" means.
+ */
+function hostilePositionsOf(bot: BotLike): Vec3Like[] {
+  const out: Vec3Like[] = [];
+  const entities = (bot as { entities?: Record<string, unknown> }).entities ?? {};
+  for (const entity of Object.values(entities)) {
+    if (entity === null || typeof entity !== "object") continue;
+    const name = (entity as { name?: unknown }).name;
+    if (typeof name !== "string" || name === "player" || name === "item") continue;
+    if (!isHostileMob(name)) continue;
+    const position = (entity as { position?: unknown }).position;
+    if (position === null || typeof position !== "object") continue;
+    const p = position as { x?: unknown; y?: unknown; z?: unknown };
+    if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") continue;
+    out.push({ x: p.x, y: p.y, z: p.z });
+  }
+  return out;
+}
+
 /** Every block that counts as a chest, as real ids from the vendored data. */
 const CHEST_BLOCK_NAMES = ["chest", "trapped_chest", "barrel"] as const;
 
@@ -884,6 +945,8 @@ export class BotSession {
   private readonly deps: SessionDeps;
   /** R18-C: the store, so the protectedRadius rule has real places to read. */
   private readonly memory: MemoryStore | null;
+  /** R19-E: the sleep runner. Created with the bot, like every other runtime. */
+  private sleep: SleepRunner | null = null;
   private readonly scheduler = new ReconnectScheduler();
   /** Per-session outbound chat queue; created on first spawn. */
   private say: SayQueue | null = null;
@@ -1111,6 +1174,46 @@ export class BotSession {
       return;
     }
     void this.runCommand(bot, askedBy, action, askedBy);
+  }
+
+  /**
+   * R19-E: what the sleep runner needs to know about the rest of the bot.
+   *
+   * Assembled fresh every tick, because "is a hostile nearby" and "is a skill running" are
+   * both questions whose answers change while Elix is walking to a bed.
+   */
+  private sleepContext(bot: BotLike): SleepContext {
+    const ownerPositions: Vec3Like[] = [];
+    const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
+    for (const [name, value] of Object.entries(bot.players ?? {})) {
+      if (name.toLowerCase() === (bot.username ?? "").toLowerCase()) continue;
+      if (!owners.includes(name.toLowerCase())) continue;
+      const at = playerPosition(value);
+      if (at !== undefined) ownerPositions.push(at);
+    }
+    return {
+      following: this.follow?.busy === true,
+      skillBusy: this.gather !== null || this.craft !== null || this.give !== null,
+      hostilePositions: hostilePositionsOf(bot),
+      ownerPositions,
+      bedIds: bedBlockIds(),
+    };
+  }
+
+  /** One sleep step. Silent unless something changed, which is almost never. */
+  private runSleep(): void {
+    const sleep = this.sleep;
+    if (sleep === null) return;
+    sleep.tick(Date.now(), (outcome, failed) => {
+      if (failed) {
+        sleep.stop();
+        this.sleep = null;
+        return;
+      }
+      if (outcome?.kind === "asleep") {
+        this.deps.log.info("elix is asleep");
+      }
+    });
   }
 
   /** One give/deposit step. Fire-and-forget, like every other runtime step. */
@@ -1618,6 +1721,17 @@ export class BotSession {
     this.deps.chatBridge?.setToolExecutor?.((call, askedBy) => {
       this.runToolCall(bot, call, askedBy);
     });
+    // R19-E: the sleep runner, on the shared real-speed base. The server's own `wake` event
+    // is the honest signal that the night is over, so it is bound here rather than guessed.
+    this.sleep = new SleepRunner({
+      bot: bot as unknown as SleepBot,
+      walkGoal: (position) => this.walkGoalTo(position),
+      context: (): SleepContext => this.sleepContext(bot),
+    });
+    const wake = (): void => {
+      this.sleep?.wake();
+    };
+    (bot as { on?: (event: string, fn: () => void) => void }).on?.call(bot, "wake", wake);
     this.deps.chatBridge?.setOwners?.(this.deps.config.owners ?? []);
     bot.on("chat", ((username: string, message: string) =>
       this.handleChat(bot, username, message)) as never);
@@ -1733,6 +1847,8 @@ export class BotSession {
       if (this.runCraft()) return;
       // R18-E: giving away an item is a short walk, so it goes after the skills that dig.
       if (this.runGive()) return;
+      // R19-E: and sleeping, which must never interrupt anything above it.
+      this.runSleep();
       // WP3 first: a hostile mob next to the owner outranks everything below.
       if (this.runDefend(bot)) {
         return;
@@ -2262,6 +2378,9 @@ private wellbeingLevelFromReason(reason: string | undefined): WellbeingLevel | n
     // R18-E: and the give runtime, which may be halfway to somebody with an item in hand.
     this.give?.stop();
     this.give = null;
+    // R19-E: and Elix himself, if he was asleep.
+    this.sleep?.stop();
+    this.sleep = null;
     // WP3: and it clears the engagement, so the next tick cannot swing on the strength of a
     // reaction delay that started before the stop.
     this.defend?.stop();
