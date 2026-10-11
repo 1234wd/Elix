@@ -16,6 +16,7 @@
  */
 import { GIVE_RANGE, decideGive, isGiveable, type DepositRequest, type GiveRefusal, type GiveRequest, type GiveView } from "./give.js";
 import { Vec3 } from "vec3";
+import { SkillRuntime, horizontalDistance, type SkillBot } from "./runtime.js";
 
 /** The mineflayer surface this file uses. Every member is reached through a guard. */
 export interface GiveBot {
@@ -91,15 +92,17 @@ function positionOf(players: Record<string, unknown> | undefined, name: string):
  * One step per tick, like every other runtime in this project, so `stop` lands within 50 ms
  * whatever stage Elix is in.
  */
-export class GiveRunner {
-  private request: GiveRequest | DepositRequest | null = null;
+export class GiveRunner extends SkillRuntime<GiveOutcome> {
+  /** The live request. Read by the session, which drives one tick at a time. */
+  request: GiveRequest | DepositRequest | null = null;
   private askedBy = "";
   private walked = false;
-  private stopping = false;
   private outcome: GiveOutcome = { kind: "stopped" };
   private openChest: unknown = null;
 
-  constructor(private readonly deps: GiveDeps) {}
+  constructor(private readonly deps: GiveDeps) {
+    super();
+  }
 
   /** The last thing that happened, for the log and the tests. */
   get last(): GiveOutcome {
@@ -107,8 +110,8 @@ export class GiveRunner {
   }
 
   /** True while Elix is on his way to somebody or busy with a chest. */
-  get busy(): boolean {
-    return this.request !== null && !this.stopping;
+  override get busy(): boolean {
+    return this.request !== null && !this.isStopped;
   }
 
   /**
@@ -128,7 +131,7 @@ export class GiveRunner {
     this.request = request;
     this.askedBy = view.askedBy;
     this.walked = false;
-    this.stopping = false;
+    this.resume();
     this.outcome = { kind: "walking", to: view.askedBy };
     if (decision.kind === "toss") {
       // Start walking immediately, so the goal is set on the first tick rather than the second.
@@ -138,8 +141,8 @@ export class GiveRunner {
   }
 
   /** One tick. */
-  async step(): Promise<GiveOutcome> {
-    if (this.stopping || this.request === null) return this.outcome;
+  protected override async step(): Promise<GiveOutcome> {
+    if (this.isStopped || this.request === null) return this.outcome;
     if (!("item" in this.request)) {
       const done = await this.depositAll();
       return done;
@@ -151,9 +154,9 @@ export class GiveRunner {
       return this.outcome;
     }
     const me = this.deps.bot.entity?.position ?? new Vec3(0, 64, 0);
-    const distance = me.distanceTo(target);
-    if (distance > GIVE_RANGE) {
-      this.walked = true;
+    // ARRIVAL before the toss, and a goal that is only re-issued when the asker has MOVED.
+    // setGoal resets the path, so a 50 ms re-issue means Elix never takes a step at all.
+    if (horizontalDistance(me, target) > GIVE_RANGE) {
       this.walkToAsker();
       this.outcome = { kind: "walking", to: this.askedBy };
       return this.outcome;
@@ -238,7 +241,15 @@ export class GiveRunner {
     return this.outcome;
   }
 
-  /** The nearest chest, through the real search. */
+  /**
+   * The nearest chest, as a real BLOCK.
+   *
+   * `bot.findBlocks` returns COORDINATES, not blocks (mineflayer `docs/api.md`: "the found
+   * block coordinates (not the blocks)"), and `bot.openContainer` wants "the block instance
+   * to open". Handing it the Vec3 is the single most common way to make a chest interaction
+   * fail with no visible reason, so the coordinate is turned into a Block here - once, in one
+   * place, where the rule is written down.
+   */
   private chestNear(from: Vec3): unknown {
     const find = this.deps.bot.findBlocks;
     if (typeof find !== "function" || this.deps.chestIds.length === 0) return null;
@@ -248,34 +259,60 @@ export class GiveRunner {
     } catch {
       return null;
     }
-    void from;
     if (!Array.isArray(found) || found.length === 0) return null;
-    const first = found[0];
-    return first !== null && typeof first === "object" ? first : null;
+    for (const entry of found) {
+      const block = this.toBlock(entry);
+      if (block !== null) return block;
+    }
+    void from;
+    return null;
+  }
+
+  /**
+   * A search result as a Block, whichever shape the search returned.
+   *
+   * Three shapes appear in the wild: a Block, something with a `position`, and a BARE
+   * COORDINATE - which is what `bot.findBlocks` actually returns.
+   */
+  private toBlock(entry: unknown): unknown {
+    if (entry === null || typeof entry !== "object") return null;
+    const record = entry as { name?: unknown; x?: unknown; y?: unknown; z?: unknown; position?: unknown };
+    if (typeof record.name === "string") return entry;
+    const source =
+      typeof record.x === "number" && typeof record.y === "number" && typeof record.z === "number"
+        ? record
+        : (record.position as { x?: unknown; y?: unknown; z?: unknown } | undefined);
+    if (source === undefined || source === null || typeof source !== "object") return null;
+    if (typeof source.x !== "number" || typeof source.y !== "number" || typeof source.z !== "number") return null;
+    const blockAt = this.deps.bot.blockAt;
+    if (typeof blockAt !== "function") return null;
+    try {
+      const block = blockAt.call(this.deps.bot, { x: source.x, y: source.y, z: source.z });
+      return typeof (block as { name?: unknown } | null)?.name === "string" ? block : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Set the real goal to the asker. Four NUMBERS - `GoalNear` takes no position object. */
   private walkToAsker(): void {
-    if (this.walked && this.outcome.kind === "given") return;
     const target = positionOf(this.deps.bot.players, this.askedBy);
-    const pathfinder = this.deps.bot.pathfinder;
-    if (target === null || pathfinder === undefined) return;
-    const { GoalNear } = this.deps.goals;
+    if (target === null) return;
+    this.goToIfChanged(this.deps.bot, target, (t) => this.goalFor(t));
+  }
+
+  /** The real goal for the asker, or null when no goal class is loaded. */
+  private goalFor(target: { x: number; y: number; z: number }): unknown {
+    const { GoalNear, GoalGetToBlock } = this.deps.goals;
     try {
-      const goal =
-        typeof GoalNear === "function"
-          ? new GoalNear(target.x, target.y, target.z, 1)
-          : new (this.deps.goals.GoalGetToBlock as new (x: number, y: number, z: number) => unknown)(
-              target.x,
-              target.y,
-              target.z,
-            );
-      pathfinder.setGoal(goal);
+      if (typeof GoalNear === "function") return new GoalNear(target.x, target.y, target.z, 1);
+      if (typeof GoalGetToBlock === "function") return new GoalGetToBlock(target.x, target.y, target.z);
     } catch {
       // No goal class available. Elix simply does not walk, and the distance check still
-      // decides when he is close enough - so a build with no pathfinder still hands the item
-      // over rather than silently keeping it.
+      // decides when he is close enough - so a build with no pathfinder still hands the
+      // item over rather than silently keeping it.
     }
+    return null;
   }
 
   /** How many of an item Elix is holding, through a guard. */
@@ -309,16 +346,10 @@ export class GiveRunner {
   }
 
   /** `elix stop`. Synchronous, and it leaves the pathfinder clean. */
-  stop(): void {
-    this.stopping = true;
+  override stop(): void {
+    super.stop(this.deps.bot as SkillBot);
     this.request = null;
-    this.walked = false;
     this.openChest = null;
-    try {
-      this.deps.bot.pathfinder?.stop();
-    } catch {
-      // Already gone.
-    }
     this.outcome = { kind: "stopped" };
   }
 }

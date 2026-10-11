@@ -21,6 +21,7 @@
  */
 import { Vec3 } from "vec3";
 import { CraftController, planCraft, type CraftRequest, type CraftStep, type CraftWorld } from "./craft.js";
+import { SkillRuntime, type SkillBot } from "./runtime.js";
 
 /** The mineflayer surface this file uses. Every member is read through a guard. */
 export interface CraftBot {
@@ -79,23 +80,26 @@ const CRAFT_REFUSAL_TEXT: Readonly<Record<string, string>> = Object.freeze({
  * half-done, and the table is never left behind because "collect-table" is a step in the plan
  * rather than a promise made afterwards.
  */
-export class CraftRunner {
+export class CraftRunner extends SkillRuntime<CraftOutcome> {
   private readonly controller = new CraftController();
-  private request: CraftRequest | null = null;
+  /** The live request. Read by the session, which drives one tick at a time. */
+  request: CraftRequest | null = null;
   private tableBlock: unknown = null;
   private placed = false;
   private said = false;
 
-  constructor(private readonly deps: CraftDeps) {}
+  constructor(private readonly deps: CraftDeps) {
+    super();
+  }
 
   /** The step in progress, for the log and the tests. */
-  get step(): CraftStep {
+  get current(): CraftStep {
     return this.controller.state;
   }
 
   /** True while a craft is running. */
-  get busy(): boolean {
-    return this.request !== null;
+  override get busy(): boolean {
+    return this.request !== null && !this.isStopped;
   }
 
   /**
@@ -121,8 +125,14 @@ export class CraftRunner {
     return step;
   }
 
-  /** One plan step. Never throws into the tick: a failure here is a refusal, not a crash. */
-  async run(): Promise<CraftOutcome> {
+  /**
+   * ONE plan step, and only after the previous one has finished.
+   *
+   * The base's in-flight guard is the fix for the bug this round is about: `placeBlock` takes
+   * about 400 ms, so without it the next tick advanced the plan while the table was still being
+   * placed, found no table, and refused the craft.
+   */
+  protected override async step(): Promise<CraftOutcome> {
     if (this.request === null) return { kind: "stopped" };
     const step = this.controller.advance();
     if (step === null) return { kind: "stopped" };
@@ -246,11 +256,18 @@ export class CraftRunner {
   }
 
   /** `elix stop`. Synchronous, and it leaves nothing running. */
-  stop(): void {
+  override stop(): void {
+    super.stop(this.deps.bot as SkillBot);
     this.request = null;
     this.tableBlock = null;
     this.placed = false;
     this.controller.stop();
+  }
+
+  /** The caller decides when Elix may craft again. */
+  override resume(): void {
+    super.resume();
+    this.controller.resume();
   }
 }
 

@@ -645,6 +645,34 @@ function pathfinderGoals(): { GoalNear?: new (x: number, y: number, z: number, r
  * per-stack deposit in the runtime handles a full chest honestly - the stacks that do not
  * fit stay in Elix's inventory.
  */
+/**
+ * The position of a search result, whichever shape the search returned.
+ *
+ * `bot.findBlocks` returns COORDINATES (mineflayer docs/api.md: "the found block coordinates
+ * (not the blocks)"), so reading `found[0].position` is always undefined and every chest looks
+ * like it is at 0,0,0. Some builds and some fakes hand back Blocks, so both are read here and
+ * the rule lives in exactly one place.
+ */
+function foundPosition(entry: unknown): { x: number; y: number; z: number } | null {
+  if (entry === null || typeof entry !== "object") return null;
+  const record = entry as { x?: unknown; y?: unknown; z?: unknown; position?: unknown };
+  const source =
+    typeof record.x === "number" && typeof record.y === "number" && typeof record.z === "number"
+      ? record
+      : (record.position as { x?: unknown; y?: unknown; z?: unknown } | undefined);
+  if (source === undefined || source === null || typeof source !== "object") return null;
+  if (typeof source.x !== "number" || typeof source.y !== "number" || typeof source.z !== "number") return null;
+  return { x: source.x, y: source.y, z: source.z };
+}
+
+/**
+ * The nearest chest Elix could reach, as `decideGive` wants to see it.
+ *
+ * `canHold` is true whenever a chest is in range: whether it has room is only knowable by
+ * opening it, and refusing on a GUESS would mean the deposit never works at all. The per-stack
+ * deposit in the runtime handles a full chest honestly - stacks that do not fit stay in Elix's
+ * inventory.
+ */
 function chestViewOf(bot: BotLike, ids: number[]): { distance: number; canHold: boolean } | null {
   if (ids.length === 0) return null;
   const find = (bot as { findBlocks?: (opts: unknown) => unknown }).findBlocks;
@@ -656,18 +684,12 @@ function chestViewOf(bot: BotLike, ids: number[]): { distance: number; canHold: 
     return null;
   }
   if (!Array.isArray(found) || found.length === 0) return null;
-  const position = (found[0] as { position?: unknown } | null)?.position;
-  if (position === null || typeof position !== "object") return null;
-  const p = position as { x?: unknown; y?: unknown; z?: unknown };
-  if (typeof p.x !== "number" || typeof p.y !== "number" || typeof p.z !== "number") return null;
+  const at = foundPosition(found[0]);
+  if (at === null) return null;
   const me = bot.entity?.position;
-  const distance =
-    me === undefined
-      ? 0
-      : Math.hypot(me.x - p.x, me.y - p.y, me.z - p.z);
+  const distance = me === undefined ? 0 : Math.hypot(me.x - at.x, me.y - at.y, me.z - at.z);
   return { distance, canHold: true };
 }
-
 /**
  * A block's name, or null when Elix cannot see it.
  *
@@ -960,22 +982,22 @@ export class BotSession {
   /** One gather step. Fire-and-forget: the tick must never block on a dig. */
   private runGather(): boolean {
     const gather = this.gather;
-    if (gather === null || !gather.busy) return false;
-    void gather
-      .step(Date.now())
-      .then((outcome) => {
-        if (outcome?.kind === "done" || outcome?.kind === "refused") {
-          const reason = outcome.kind === "refused" ? outcome.reason : "done";
-          this.deps.log.info({ reason, gathered: gather.count }, "gather finished");
-          this.gather = null;
-        }
-      })
-      .catch(() => {
-        this.deps.log.warn("gather step threw - nothing left running");
+    if (gather === null || gather.request === null) return false;
+    // ONE step in flight. `tick` refuses to start a second while the first is pending, which
+    // is what stops a 50 ms tick from digging on top of its own dig.
+    return gather.tick(Date.now(), (outcome, failed) => {
+      if (failed) {
+        this.deps.log.warn("gather step failed - nothing left running");
         gather.stop();
         this.gather = null;
-      });
-    return true;
+        return;
+      }
+      if (outcome?.kind === "done" || outcome?.kind === "refused") {
+        const reason = outcome.kind === "refused" ? outcome.reason : "done";
+        this.deps.log.info({ reason, gathered: gather.count }, "gather finished");
+        this.gather = null;
+      }
+    });
   }
 
   /**
@@ -1094,21 +1116,19 @@ export class BotSession {
   /** One give/deposit step. Fire-and-forget, like every other runtime step. */
   private runGive(): boolean {
     const give = this.give;
-    if (give === null || !give.busy) return false;
-    void give
-      .step()
-      .then((outcome) => {
-        if (outcome.kind === "given") this.deps.log.info({ item: outcome.item, count: outcome.count, to: outcome.to }, "gave");
-        if (outcome.kind === "deposited") this.deps.log.info({ stacks: outcome.stacks }, "deposited");
-        if (outcome.kind === "refused") this.deps.log.info({ reason: outcome.reason }, "give refused");
-        if (outcome.kind !== "walking") this.give = null;
-      })
-      .catch(() => {
-        this.deps.log.warn("give step threw - nothing left running");
+    if (give === null || give.request === null) return false;
+    return give.tick(Date.now(), (outcome, failed) => {
+      if (failed) {
+        this.deps.log.warn("give step failed - nothing left running");
         give.stop();
         this.give = null;
-      });
-    return true;
+        return;
+      }
+      if (outcome?.kind === "given") this.deps.log.info({ item: outcome.item, count: outcome.count, to: outcome.to }, "gave");
+      if (outcome?.kind === "deposited") this.deps.log.info({ stacks: outcome.stacks }, "deposited");
+      if (outcome?.kind === "refused") this.deps.log.info({ reason: outcome.reason }, "give refused");
+      if (outcome !== null && outcome.kind !== "walking") this.give = null;
+    });
   }
 
   /**
@@ -1165,22 +1185,20 @@ export class BotSession {
   /** One craft step. Fire-and-forget, for the same reason the gather step is. */
   private runCraft(): boolean {
     const craft = this.craft;
-    if (craft === null || !craft.busy) return false;
-    void craft
-      .run()
-      .then((outcome) => {
-        if (outcome.kind === "done") this.deps.log.info({ item: outcome.item }, "craft finished");
-        if (outcome.kind === "refused") {
-          this.deps.log.info({ reason: outcome.reason }, "craft refused");
-          this.craft = null;
-        }
-      })
-      .catch(() => {
-        this.deps.log.warn("craft step threw - nothing left running");
+    if (craft === null || craft.request === null) return false;
+    return craft.tick(Date.now(), (outcome, failed) => {
+      if (failed) {
+        this.deps.log.warn("craft step failed - nothing left running");
         craft.stop();
         this.craft = null;
-      });
-    return true;
+        return;
+      }
+      if (outcome?.kind === "done") this.deps.log.info({ item: outcome.item }, "craft finished");
+      if (outcome?.kind === "refused") {
+        this.deps.log.info({ reason: outcome.reason }, "craft refused");
+        this.craft = null;
+      }
+    });
   }
 
   /**

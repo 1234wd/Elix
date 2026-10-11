@@ -27,6 +27,7 @@ import {
   type GatherRequest,
 } from "./gather.js";
 import { bestToolFor } from "./gather.js";
+import { SkillRuntime, withinReach, type SkillBot } from "./runtime.js";
 
 /** The mineflayer surface this file uses. Every member is read through a guard. */
 export interface GatherBot {
@@ -195,11 +196,11 @@ export interface GatherDeps {
  * `bot.stopDigging()`, because "stop wins within one tick" is a promise about the dig
  * already in flight and not just about the next decision.
  */
-export class GatherRunner {
-  private request: GatherRequest | null = null;
+export class GatherRunner extends SkillRuntime<GatherTick | null> {
+  /** The live request. Read by the session, which drives one tick at a time. */
+  request: GatherRequest | null = null;
   private gathered = 0;
   private startedAt = 0;
-  private stopped = false;
   private lastLineAt = -PROGRESS_MIN_GAP_MS;
   private target: Vec3 | null = null;
   private targetName: string | null = null;
@@ -216,7 +217,9 @@ export class GatherRunner {
   /** Whether the drop-collection walk has started, so Elix does not dig and never collects. */
   private collecting = false;
 
-  constructor(private readonly deps: GatherDeps) {}
+  constructor(private readonly deps: GatherDeps) {
+    super();
+  }
 
   /** What Elix is doing, for the log and the tests. */
   get last(): GatherTick | null {
@@ -229,16 +232,15 @@ export class GatherRunner {
   }
 
   /** True while a gather is running. */
-  get busy(): boolean {
-    return this.request !== null && !this.stopped;
+  override get busy(): boolean {
+    return this.request !== null && !this.isStopped;
   }
 
   /** Start. Refuses immediately if the block is not on the allow-list at all. */
   start(request: GatherRequest, world: GatherWorld, now: number): void {
-    this.stopped = false;
+    this.resume();
     this.outcome = null;
     this.gathered = 0;
-    this.collecting = false;
     this.target = null;
     this.targetName = null;
     this.world = world;
@@ -259,8 +261,8 @@ export class GatherRunner {
    * so a `stop` between any two stages leaves nothing half-done and the pathfinder is never
    * retasked mid-swing.
    */
-  async step(now: number): Promise<GatherTick | null> {
-    if (this.stopped || this.request === null) return this.outcome;
+  protected override async step(now: number): Promise<GatherTick | null> {
+    if (this.isStopped || this.request === null) return this.outcome;
 
     // Caps first: an out-of-time gather stops before it starts the next dig.
     if (this.gathered >= this.request.count || this.gathered >= GATHER_MAX_ITEMS) {
@@ -275,7 +277,7 @@ export class GatherRunner {
     }
 
     // Nothing chosen yet: find a block, then refuse for a RULE, not for "nothing nearby".
-    if (!this.collecting && this.target === null) {
+    if (this.target === null) {
       const found = this.findOne();
       if (found === null) {
         // A rule turned it down, and that is worth reporting as itself: "protected-place"
@@ -288,12 +290,28 @@ export class GatherRunner {
       this.target = found.position;
       this.targetName = found.name;
       this.outcome = { kind: "walk-to", at: found.position, block: found.name };
-      this.deps.bot.pathfinder?.setGoal(this.deps.walkGoal(found.position));
+      this.goToIfChanged(this.deps.bot, found.position, this.deps.walkGoal);
       return this.outcome;
     }
 
-    // Arrived (or close enough): equip the right tool, then dig.
-    if (!this.collecting && this.target !== null) {
+    // ARRIVAL FIRST. A dig issued 50 ms after setGoal happens from wherever Elix is
+    // standing, and mineflayer counts that as out of reach. This check is the whole
+    // difference between "Elix gathers" and "Elix flails at the ground".
+    const me = this.deps.bot.entity?.position;
+    if (this.target !== null && me !== undefined && !withinReach(me, this.target)) {
+      this.outcome = { kind: "walk-to", at: this.target, block: this.targetName ?? "unknown" };
+      this.goToIfChanged(this.deps.bot, this.target, this.deps.walkGoal);
+      return this.outcome;
+    }
+
+    // Arrived, and the target is a DROP rather than a block to dig: stand on it, then
+    // hunt again. Cheap when Elix is already there, which is the usual case.
+    if (this.target !== null && this.targetName === null) {
+      this.target = null;
+      return this.step(now);
+    }
+
+    if (this.target !== null) {
       const blockName = this.targetName ?? "unknown";
       const position = this.target;
       const tool = this.bestToolFor(blockName);
@@ -319,17 +337,16 @@ export class GatherRunner {
       this.gathered += 1;
       this.target = null;
       this.targetName = null;
-      // Go and stand on the drop. The next tick walks there, then we look for the next block.
-      this.collecting = true;
-      const drop = new Vec3(position.x, position.y, position.z);
-      this.deps.bot.pathfinder?.setGoal(this.deps.walkGoal(drop));
+      // Stand on the drop so it is actually collected. `targetName` is null, which is how
+      // the next step knows this is a drop to walk onto and not a block to dig.
+      this.target = new Vec3(position.x, position.y, position.z);
+      this.targetName = null;
       this.maybeSay(now);
       return this.outcome;
     }
 
-    // Collected: back to hunting.
-    this.collecting = false;
-    return this.step(now);
+    // Nothing chosen and nothing to arrive at: the only way here is a block Elix cannot dig.
+    return this.outcome;
   }
 
   /** Search once, applying every rule to every candidate, nearest first. */
@@ -434,7 +451,7 @@ export class GatherRunner {
 
   /** At most one progress line a minute, and never after a stop. */
   private maybeSay(now: number): void {
-    if (this.stopped || this.request === null) return;
+    if (this.isStopped || this.request === null) return;
     if (now - this.lastLineAt < PROGRESS_MIN_GAP_MS) return;
     this.lastLineAt = now;
     const label = (this.request.block ?? "").replace(/_/gu, " ");
@@ -445,28 +462,19 @@ export class GatherRunner {
    * `elix stop`. Synchronous, and it reaches the dig IN FLIGHT - `bot.stopDigging()` - because
    * a stop that only cleared Elix's plan would leave him mining after the owner said stop.
    */
-  stop(): void {
-    this.stopped = true;
+  override stop(): void {
+    // The base does the three things a stop owes: halt the plan, abort a dig in flight,
+    // and stop the pathfinder.
+    super.stop(this.deps.bot as SkillBot);
     this.request = null;
     this.target = null;
     this.targetName = null;
-    this.collecting = false;
-    try {
-      this.deps.bot.stopDigging?.();
-    } catch {
-      // A bot that cannot stop digging is already gone.
-    }
-    try {
-      this.deps.bot.pathfinder?.stop();
-    } catch {
-      // Same.
-    }
     this.outcome = { kind: "refused", reason: "stopped" };
   }
 
   /** The caller decides when Elix may act again. */
-  resume(): void {
-    this.stopped = false;
+  override resume(): void {
+    super.resume();
     if (this.outcome?.kind === "refused" && this.outcome.reason === "stopped") this.outcome = null;
   }
 }
