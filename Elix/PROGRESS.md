@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R19-B (mineflayer contract file), then R19-C (split bot.ts/bridge.ts), R19-D wizard, R19-E sleep, R19-F smelting, R19-G e2e, R19-H voice.** R19-A DONE.
+**RESUME HERE: R19-C (split bot.ts/bridge.ts - the plan is written out below), then R19-D wizard, R19-E sleep, R19-F smelting, R19-G e2e, R19-H voice.** R19-A, R19-B DONE.
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -50,6 +50,8 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R18-L finish splitting | NOT REACHED | - | - |
 | R18-M voice step 1 | NOT REACHED | - | - |
 | R19-A skills at real speed | **DONE** | `0907851` | 16 real-speed tests; probes Z1-Z5 pass |
+| R19-B mineflayer contract file | **DONE** | `8bb1d55` | 31 contract tests |
+| R19-C split bot.ts / bridge.ts | **NOT DONE** | - | 0 |
 
 Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
 fixture check).
@@ -396,4 +398,37 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
   version filtered by name and made "mine 3 stone" unfindable.
 - **The wiring audit caught four of my own new dead exports** (`REACH`, `GOAL_MOVE_THRESHOLD`,
   `eyeOf`, `reachDistance`) within minutes of writing them. It is doing its job.
+
+### R19-B - the contract file caught four of my own wrong claims
+
+- `docs/MINEFLAYER_CONTRACTS.md` + `tests/unit/mineflayerContracts.test.ts`. Every line is
+  asserted against the installed package, and the file itself is asserted to cover every API
+  the brief names.
+- Writing it found four things I had WRITTEN DOWN WRONGLY, all now corrected to the library:
+  `Math.round(air / 15)` is really `Math.round(metadata.value / 15)`; `findBlocks` is
+  implemented in `lib/plugins/blocks.js`, not `find.js`; `resetPath` is in the pathfinder's
+  `index.js` at the PACKAGE ROOT, not `lib/index.js`; and api.md says "[0, 20]", not "0-20".
+- **Tooling trap:** stripping `/package.json` off a resolved path with a regex takes the path
+  SEPARATOR with it, and the ENOENT that follows names a path with no file in it. Use
+  `dirname`/`join`, which `tests/unit/mineflayerPaths.ts` already did - use that helper.
+
+### R19-C - NOT DONE, and here is exactly what remains
+
+`bot.ts` is 3,007 lines and `bridge.ts` 1,640. No code changed for this item. The split is
+four extractions, in this order, each re-exported verbatim from `bot.ts` so no import path in
+`src/` or `tests/` changes:
+
+1. `src/connection/skillDispatch.ts` - `dispatchGather`, `dispatchCraft`, `dispatchGive`,
+   `dispatchMemory`, `runGather`, `runCraft`, `runGive`, `runToolCall`, `watchDeaths`,
+   `chestViewOf`, `findPlacedTable`, `chestBlockIds`, `pathfinderGoals`, `namedBlock`,
+   `foundPosition`, `TOOL_COMMAND` (bot.ts L560-L1350, ~790 lines). They read `this.deps`,
+   `this.memory`, `this.say`, `this.ownLine` and the four runtime fields, so they need one
+   narrow context object passed in rather than a class.
+2. `src/connection/chatDispatch.ts` - `handleChat` and the shortcut tables.
+3. `src/connection/tick.ts` - the 50 ms loop and its runners.
+4. `src/brain/audit.ts` - the audit store, `gateReply`, `awaitSenderAudits`,
+   `speakIfAuditFinds`; and `src/brain/wellbeing.ts` - the wellbeing reply.
+
+Then add the `src/` line-limit test. **Until every file is under 800 that test must NOT be
+added**: a limit test that only covers the files already split reads as "done" and is not.
 
