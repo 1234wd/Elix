@@ -139,11 +139,12 @@ class FakeBot extends EventEmitter implements BotLike {
     if (pos.y < 63) return block("stone", pos);
     return block("air", pos);
   }
-  findBlocks(opts: { matching: unknown; count?: number }): unknown[] {
+  /** COORDINATES, not blocks - mineflayer docs/api.md. R19-B. */
+  findBlocks(opts: { matching: unknown; count?: number }): Vec3[] {
     const ids = Array.isArray(opts.matching) ? opts.matching : [opts.matching];
     if (!ids.includes(data.blocksByName["chest"]!.id)) return [];
     const here = this.blockAt(new Vec3(2, 64, 0));
-    return here !== null && here.name === "chest" ? [here] : [];
+    return here !== null && here.name === "chest" ? [new Vec3(2, 64, 0)] : [];
   }
   findBlock(): unknown {
     return null;
@@ -153,6 +154,10 @@ class FakeBot extends EventEmitter implements BotLike {
     this.tossed.push([itemType, metadata, count]);
   }
   async openContainer(b: unknown): Promise<unknown> {
+    const candidate = b as { name?: unknown } | null;
+    if (candidate === null || typeof candidate.name !== "string") {
+      throw new Error("openContainer needs a Block, got " + JSON.stringify(b));
+    }
     this.opened.push(b);
     return {
       deposit: async (...args: unknown[]) => {

@@ -32,6 +32,8 @@ export interface McData {
   blocksByName: Record<string, McDef | undefined>;
   itemsByName: Record<string, McDef | undefined>;
   items: Record<number, { name: string } | undefined>;
+  /** Keyed by RESULT NUMERIC ID, several rows per key - not by item name. */
+  recipes: Record<number, Array<{ inShape?: number[][]; result?: { id: number; count: number } }>>;
 }
 
 export const mcData = (createRequire(import.meta.url)("minecraft-data") as (v: string) => McData)("26.2");
