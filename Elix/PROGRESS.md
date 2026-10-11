@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R19-C (split bot.ts/bridge.ts - the plan is written out below), then R19-D wizard, R19-E sleep, R19-F smelting, R19-G e2e, R19-H voice.** R19-A, R19-B DONE.
+**RESUME HERE: R19-C (split bot.ts/bridge.ts - plan below), R19-F (smelting and iron tools), R19-H (voice, stretch).** R19-A, R19-B, R19-D, R19-E, R19-G DONE.
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -52,6 +52,11 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R19-A skills at real speed | **DONE** | `0907851` | 16 real-speed tests; probes Z1-Z5 pass |
 | R19-B mineflayer contract file | **DONE** | `8bb1d55` | 31 contract tests |
 | R19-C split bot.ts / bridge.ts | **NOT DONE** | - | 0 |
+| R19-D first-run wizard | **DONE** | `208e92d` | 14 tests |
+| R19-E sleep when the owner sleeps | **DONE** | `88abd6b` | 12 real-speed tests |
+| R19-F smelting and iron tools | **NOT DONE** | `-` | 0 |
+| R19-G e2e rows for the owner | **DONE** | `f428552` | 6 new rows (S1-S6) |
+| R19-H voice, step 1 | **NOT DONE** | `-` | 0 |
 
 Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
 fixture check).
@@ -201,7 +206,7 @@ Each of these was a real defect, not a test problem:
 | WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
 | WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
 
-## Deviations — round 19 so far
+## Deviations — round 19 (extended) so far
 
 - `tests/unit/gatherWiring.test.ts` REWRITTEN against `RealSpeedBot`. The assertions are the
   Round 18 ones; the fake is the one a game would give us. Reason: the old fake never moved
@@ -411,6 +416,24 @@ Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 18
 - **Tooling trap:** stripping `/package.json` off a resolved path with a regex takes the path
   SEPARATOR with it, and the ENOENT that follows names a path with no file in it. Use
   `dirname`/`join`, which `tests/unit/mineflayerPaths.ts` already did - use that helper.
+
+### R19-D..R19-G - what each one taught, and the traps
+
+- **R19-D: there was ALREADY a `setup` command** - a stub that printed "coming soon". Adding
+  a second one makes commander throw at STARTUP, which broke all 9 CLI tests at once and looked
+  like an unrelated failure. The wizard REPLACED the stub's action. Always check whether the
+  command name is already taken before registering one.
+- **The wizard writes the YAML line in place.** A parse-and-reserialise round trip would delete
+  every comment the owner wrote in the one file they are ever asked to read.
+- **`envKeyReport` returns BOOLEANS.** There is no key value anywhere in the shape, so there is
+  nothing to leak by accident, and a test asserts the wizard's whole output for the values.
+- **R19-E: an entity carries `position` directly; only a PLAYER wraps one in `.entity`.** Using
+  the player helper for hostile mobs made every hostile look position-less, and Elix slept
+  through creepers. Found by a real-speed test, not by reading the code.
+- **R19-E: a follow that is already AT the player is not a follow**, so `following` is correctly
+  false and Elix correctly sleeps. Two "failures" here were tests that had not started a walk.
+- **A test that measures a total must clear it first.** Elix is asleep within a tick of
+  spawning at night, so "did he sleep during the dig" has to be a difference, not a zero.
 
 ### R19-C - NOT DONE, and here is exactly what remains
 
