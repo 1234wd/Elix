@@ -49,6 +49,7 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R18-K sleep | NOT REACHED | - | - |
 | R18-L finish splitting | NOT REACHED | - | - |
 | R18-M voice step 1 | NOT REACHED | - | - |
+| R19-A skills at real speed | **DONE** | `0907851` | 16 real-speed tests; probes Z1-Z5 pass |
 
 Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
 fixture check).
