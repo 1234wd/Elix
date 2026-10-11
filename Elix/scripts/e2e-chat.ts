@@ -1,8 +1,14 @@
 /**
  * Part C / D7 — the automated in-game chat test.
  *
- *     pnpm e2e                  rows 1-6 and 8, plus the memory setup for row 7
- *     pnpm e2e --after-restart  row 7, after you have restarted Elix
+ *     pnpm e2e                            every row
+ *     pnpm e2e --after-restart            row 7, after you have restarted Elix
+ *     pnpm e2e --owners <YourName>        the owner command rows too (C1-C6, S1-S6)
+ *
+ * R19-G: rows S1-S6 are the five skills from R18-R19 - gather, give, chest deposit, craft,
+ * remember and where-is - so the owner can see them pass or fail instead of trying each by
+ * hand. They run ONLY with --owners, because every one of them is an owner-only command and a
+ * stranger's refusal would otherwise be scored as a failure.
  *
  * A6 — row 8 is the memory test that does NOT need a restart: the tester states
  * one favourite block, then states a DIFFERENT one, then asks. The answer must
@@ -98,6 +104,44 @@ const COMMAND_ROWS: Row[] = [
     said: "wait for me guys",
     expect: "command",
     note: "no reaction at all - 'stop' inside a sentence is not a command",
+  },
+  // --- R19-G: the five round-18 skills, in the order a new owner meets them. Each one is a
+  // row the owner can see pass or fail, instead of five things to try by hand.
+  {
+    id: "S1",
+    said: "elix get 5 dirt",
+    expect: "command",
+    note: "Elix walks to a real dirt block and digs it - NOT from where he was standing",
+  },
+  {
+    id: "S2",
+    said: "elix give me cobblestone",
+    expect: "command",
+    note: "walks to YOU first, then tosses. A refusal is a pass if he has none.",
+  },
+  {
+    id: "S3",
+    said: "elix put your stuff in the chest",
+    expect: "command",
+    note: "opens the chest, deposits, closes - and never takes anything out",
+  },
+  {
+    id: "S4",
+    said: "elix make a wooden pickaxe",
+    expect: "command",
+    note: "places a table, crafts on it, picks the table back up",
+  },
+  {
+    id: "S5",
+    said: "elix remember this place as e2espot",
+    expect: "command",
+    note: "the spot is saved",
+  },
+  {
+    id: "S6",
+    said: "elix where is e2espot",
+    expect: "command",
+    note: "the coordinates come back WHISPERED. Nothing with numbers in it in public chat.",
   },
 ];
 
