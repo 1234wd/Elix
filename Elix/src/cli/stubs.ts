@@ -1,4 +1,7 @@
 import type { Command } from "commander";
+import { createInterface } from "node:readline/promises";
+import { runSetup } from "./setup.js";
+import { runDoctor, renderDoctor } from "../core/doctor.js";
 import { join, resolve } from "node:path";
 import type { ElixConfig } from "../core/config.js";
 import { getActiveProfile, loadModelsConfig, PROJECT_ROOT } from "../core/config.js";
@@ -198,8 +201,51 @@ function phaseStub(phase: number, feature: string) {
 export function registerStubs(program: Command): void {
   program
     .command("setup")
-    .description("First-run wizard: keys, username, server, voice, models")
-    .action(phaseStub(5, "The setup wizard"));
+    .description("First-run wizard: your Minecraft name, your keys, and what to do next")
+    .option("--name <name>", "answer the name question here, for scripts")
+    .option("--config <path>", "the elix.yaml to write", resolve(PROJECT_ROOT, "config", "elix.yaml"))
+    .option("--no-doctor", "skip the health check at the end")
+    // R19-D: this used to be a stub that printed "coming soon". It is now the wizard a
+    // non-technical owner actually runs, and it REPLACED the stub rather than registering a
+    // second `setup` - commander refuses two commands with one name, at startup.
+    .action(async (opts: { name?: string; config?: string; doctor?: boolean }, cmd: Command) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const code = await runSetup(
+          {
+            askName: async (prompt: string): Promise<string> => {
+              if (typeof opts.name === "string") return opts.name;
+              return (await rl.question(`${prompt} `)).trim();
+            },
+            say: (text: string): void => {
+              console.log(text);
+            },
+          },
+          {
+            configPath: opts.config ?? resolve(PROJECT_ROOT, "config", "elix.yaml"),
+            env: process.env,
+          },
+        );
+        if (code !== 0) {
+          process.exitCode = code;
+          return;
+        }
+        if (opts.doctor === false) return;
+        console.log("\nHealth check:");
+        const config = cmd.optsWithGlobals().elixConfig as ElixConfig | undefined;
+        if (config === undefined) {
+          console.log("  (run `pnpm elix doctor` once the server details are filled in)");
+          return;
+        }
+        const results = await runDoctor({ config });
+        console.log(renderDoctor(results));
+      } catch {
+        console.log("\nThe wizard could not finish. Nothing else was changed.");
+        process.exitCode = 1;
+      } finally {
+        rl.close();
+      }
+    });
 
   program
     .command("start")
