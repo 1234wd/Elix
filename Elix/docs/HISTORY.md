@@ -1,0 +1,444 @@
+
+
+---
+
+# Up to and including Round 19 (moved here verbatim on Round 20 Step 0)
+
+# Round 16/17 — long run progress
+
+Backlog WP1–WP12 from `docs/LONG_RUN_BRIEF.md`. One commit per WP: `WPn: <title>`. Never
+leave the tree red.
+
+Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
+
+**RESUME HERE: R20-A1 - extract the skill dispatch out of bot.ts into src/connection/skillDispatch.ts (the four-step plan is below), commit, then R20-A2 (chat dispatch), R20-A3 (tick loop), R20-A4 (bridge audit + wellbeing). Then R20-B sleep (probes W1-W4).**
+gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
+
+The single most important rule this round is §1 of the brief: **an item is DONE only with a
+BotSession-level test that drives the feature to a real mineflayer call.** Round 17 shipped 370
+tests and a whole feature set that the bot could not do, because nothing called it.
+
+Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`,
+`round15Probes.test.ts`, `round16Probes.test.ts`. All green after every WP.
+
+| WP | Status | Commit | Tests added | Notes |
+| --- | --- | --- | --- | --- |
+| WP1 Part C against the real pathfinder | **DONE** | `7f18574` | `pathfinderContract.test.ts` (7), `round16Probes.test.ts` (6, read-only) | U1–U5 |
+| WP2 Survival reflexes | **DONE** | `3599ae5` | `reflexTables.test.ts` (11), `reflexes.test.ts` (46), `mcdataSource.test.ts` (9) | breathe/creeper/eat/armour, priority, stop, table completeness, data-source guard |
+| WP3 Protect the owner | **DONE** | `360f476` | `defend.test.ts` (38) | target selection, reaction bounds per skillCap, cooldown, retreat, never a player |
+| WP4 Human-like gaze | **DONE** | `40ac355` | `look.test.ts` (33) | 40°/tick cap, 150–400 ms, speaker look, crouch-greet, idle glances, suppression |
+| WP5a gather | **DONE** | `0f2af6b` | `gather.test.ts` (46) | allow-list, leaves-or-not, protected places, real `harvestTools`, `bot.dig` contract |
+| WP5b craft | **DONE** | `f380555` | `craft.test.ts` (35) | real 26.2 recipes, table placement rules, `bot.recipesFor`/`bot.craft` contract |
+| WP5c give / deposit | **DONE** | `ae82a1a` | `give.test.ts` (34) | give only to the asker, deposit only, **never withdraw**, `bot.toss` contract |
+| WP6 World memory | **DONE** | `c5ed596` | `worldMemory.test.ts` (29) | tested migration on a copy of the old schema, whisper-only coordinates |
+| WP7 NVIDIA + Ollama | **DONE** | `bf1ce94` | `providers.test.ts` (34) | 24 h 402 breaker, silent-absent local probe, no hard-coded model ids, call deadlines |
+| WP8 Constrained tool calls | **DONE** | `95da322` | `toolCalls.test.ts` (26) | closed zod list, owner-only, dropped-reply drops calls, gentle mode, 1/reply + 6/min |
+| WP9 Status + first run | **DONE** | `2a939d7` | `status.test.ts` (27) | key redaction, no chat text, owner/offline-server warnings, README checklist |
+| WP10 e2e rows | **DONE** | `3564c4e` | — (script) | command rows, opt-in `--owners`, ❌ **not run** — no server reachable from here |
+| WP11 Split bot.ts / bridge.ts | **PARTIAL** | `0d74e79` | — (no test changes) | hazard + reflex-adapter blocks moved out, re-exported; bot.ts 2600 → 2249 |
+| WP12 Voice plan | **DONE** | see log | — (document) | `docs/VOICE_PLAN.md`; no code, no runtime deps |
+
+## Round 18 — item state
+
+| Item | Status | Commit | Probes |
+| --- | --- | --- | --- |
+| R18-A portability | **DONE** | `f99b70b` | X0 ✅ |
+| R18-B reflex units | **DONE** | `f4432c9` | X1 ✅ X2 ✅ |
+| R18-C wire gather | **DONE** | `3e8bee9` | X3 pass (17 new tests) |
+| R18-D wire craft | **DONE** | `b4f1f93` | 16 new tests, real-lib contract |
+| R18-E wire give/deposit | **DONE** | `cc46aab` | 17 new tests (X4 pass) |
+| R18-F wire world memory | **DONE** | `573f5e8` | 17 new tests (X5 pass) |
+| R18-G wire tool calls | **DONE** | `348de6c` | X6 pass (10 new tests) |
+| R18-H wire NVIDIA/Ollama | **DONE** | `fb549cd` | X7 pass (16 new tests) |
+| R18-I wiring audit | **DONE** | `eeba438` | 50 exports removed, 6 audit tests |
+| R18-J setup wizard | NOT REACHED | - | - |
+| R18-K sleep | NOT REACHED | - | - |
+| R18-L finish splitting | NOT REACHED | - | - |
+| R18-M voice step 1 | NOT REACHED | - | - |
+| R19-A skills at real speed | **DONE** | `0907851` | 16 real-speed tests; probes Z1-Z5 pass |
+| R19-B mineflayer contract file | **DONE** | `8bb1d55` | 31 contract tests |
+| R19-C split bot.ts / bridge.ts | **NOT DONE** | - | 0 |
+| R19-D first-run wizard | **DONE** | `208e92d` | 14 tests |
+| R19-E sleep when the owner sleeps | **DONE** | `88abd6b` | 12 real-speed tests |
+| R19-F smelting and iron tools | **NOT DONE** | `-` | 0 |
+| R19-G e2e rows for the owner | **DONE** | `f428552` | 6 new rows (S1-S6) |
+| R19-H voice, step 1 | **NOT DONE** | `-` | 0 |
+| R20-A split bot.ts/bridge.ts | **NEXT** | - | W1/W3/W4 failing |
+
+Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
+fixture check).
+
+### R18-A — how the fresh-clone gate works, and the ordering problem
+
+`scripts/fresh-gate.ps1` (git root) clones into `.fresh/`, installs, and runs the three gates.
+Two things that cost time and will again:
+
+- **It clones from git, so it can only see COMMITTED work.** Commit first, then gate. A gate run
+  before the commit tests the previous commit and will "fail" on work that is already correct.
+- PowerShell treats pnpm's stderr banner as a terminating error under `ErrorActionPreference =
+  'Stop'`. The script keeps `Continue` and judges each gate by its own exit code.
+
+### R18-B — the real bug, and the trap behind it
+
+`bot.oxygenLevel` is `Math.round(air_supply / 15)` — **0 to 20**. The threshold was 120, on a
+0-300 scale, so in ANY water at FULL air the breathe reflex fired every tick and outranked
+follow, defend and everything else. On a live server that is a bot that swims up constantly and
+ignores its owner. Now `LOW_OXYGEN = 6` and the unknown-field fallback is 20, not 300.
+
+`MINECRAFT_SCALES` in `src/reflexes/decide.ts` holds the documented ranges in one place
+(health 0-20, food 0-20, foodSaturation 0-20, oxygenLevel 0-20) so there is one place to check
+them against `node_modules/mineflayer/docs/api.md`.
+
+`swim-up` now calls `bot.setControlState("jump", true)` for `JUMP_HOLD_TICKS` (8 ticks =
+400 ms) and releases it. `stop()` releases jump too — a stop that clears control states but not
+the key Elix is physically holding leaves him jumping in place.
+
+Two more bugs found on the way:
+
+- **`runReflexes` read `interruptedFollow` one tick late.** It does `void runner.tick()` and
+  then asks whether follow is being held off, and the answer was always about the PREVIOUS
+  tick. `tick()` now settles that flag before its first await.
+- **A patch script aborted mid-run and wrote nothing**, which silently dropped the jump press
+  and cost twenty minutes of staring at correct code. **Every `.cjs` patch script must verify it
+  found every anchor before writing** — and if it throws, assume NOTHING landed.
+
+## WP11 — PARTIAL, and exactly what is left
+
+**Done (`0d74e79`):** two cohesive blocks moved out of `bot.ts` **verbatim**, with every moved
+name re-exported from `bot.ts` so that **no import path in `src/` or `tests/` changed**.
+That last part is the whole trick, and it is why this was safe: 1924 tests green with zero test
+edits, which is what WP11 allows.
+
+- `src/connection/hazards.ts` (172 lines) — `WALK_DISTANCES`, `HAZARD_BLOCKS`,
+  `HAZARD_PASSABLE_REJECTS`, `toVec3`, `stopForHazard`, `isSafeFloor`, `isPassable`,
+  `isStandable`, `pickWalkDirection`, and the `WalkOutcome`/`WalkSkipReason` types.
+- `src/connection/reflexAdapters.ts` (237 lines) — the WP2–WP4 view builders
+  (`reflexViewOf`, `defendViewOf`, `entityOf`, `inventoryOf`, `equippedOf`,
+  `numberField`) and the five guarded mineflayer calls (`equipOf`, `consumeOf`,
+  `lookAtOf`, `clearControlStatesOf`, `findItemOf`).
+
+**Still to do, and why it was not done in this session:** `BotSession` itself is ~1500 of
+bot.ts's remaining 2249 lines. Reaching the brief's ≤800 target means splitting a class that
+40-odd test files construct directly and poke at, which is exactly the case where a "mechanical"
+refactor starts quietly changing behaviour. The brief's own instruction for that situation is to
+stop and mark the WP PARTIAL, so that is what this is. Next session:
+
+1. `src/connection/chatDispatch.ts` — `handleChat` and `runCommand`.
+2. `src/connection/presence.ts` — `installCrashGuards`, `greetingFor`, `isGreetingFor`,
+   `hasFollowUp`, `lookAround`, the greeting tables.
+3. `src/connection/initiative.ts` — the 5 s poll and its wiring.
+4. `src/connection/followWiring.ts` — `runReflexes`, `runDefend`, `runGaze`,
+   `maybeSayHurtLine`, `gazeState`, `gazeCandidates`, `setSneak`, `startFollow`,
+   `startCome`.
+5. Then `bridge.ts` (1433): audit store and gate, chat reply, wellbeing reply — same
+   re-export trick.
+
+Rule unchanged: test edits are allowed **only** in import paths; if a move needs a behaviour
+change, stop and leave the WP PARTIAL rather than fixing it in place.
+
+## WP11 — original plan, for reference
+
+Target: no file over 800 lines. Measured at `3564c4e`:
+
+At the start of WP11:
+```
+2600  src/connection/bot.ts      <- the big one
+1433  src/brain/bridge.ts
+ 991  src/memory/store.ts
+ 967  src/brain/router.ts
+ 898  src/social/wellbeing.ts
+```
+
+The brief names what should move out of `bot.ts`: chat dispatch, initiative wiring, presence,
+crash guards, command routing. Out of `bridge.ts`: audit store and gate, chat reply, wellbeing
+reply.
+
+Wiring added in WP2–WP8 that WP11 will have to move along with it (all in `bot.ts`, all with
+thin local adapters next to them):
+
+- `reflexViewOf`, `entityOf`, `inventoryOf`, `equippedOf`, `numberField` → the WP2 reflex view
+- `equipOf`, `consumeOf`, `lookAtOf`, `clearControlStatesOf`, `findItemOf` → WP2 adapters
+- `defendViewOf` → WP3
+- `runReflexes`, `runDefend`, `maybeSayHurtLine`, `runGaze`, `gazeState`, `gazeCandidates`,
+  `setSneak` → WP2–WP4 tick wiring
+- `realGoalFactory` construction inside `start()` → WP1
+
+**Rule for WP11: test changes are allowed ONLY in import paths.** If any behaviour change is
+needed to make a move work, stop and mark the WP PARTIAL rather than fixing it in place.
+
+## Findings worth not rediscovering
+
+- **`minecraft-data.items` is an OBJECT keyed by numeric id** — not an array, not keyed by
+  name. `for (const item of data.items)` throws. Use `allItems()` in `src/world/mcdata.ts`.
+- **`entitiesByName[x].category` is a plain STRING** in 26.2 (`"Hostile mobs"`), not an array.
+  Reading only the array shape makes every mob look passive.
+- **`prismarine-item`'s export is a LOADER**, not a class: `require('prismarine-item')(registry)`
+  returns the Item class. Items are built from a **numeric id**; `new Item("bread", 1)` gives
+  `name: "unknown"`. Its `slot` is set by the inventory, so an item handed to `bot.equip` must
+  have one.
+- **`bot.consume()` throws `Food is full` at food 20**, so never start an eat there.
+- **`bot.dig(block)` throws on a null block** and on `digTime === Infinity`; it reads
+  `block.position` and `block.name`.
+- **`bot.toss(itemType, metadata, count)` has no zero-count guard of its own** — it relies on
+  `bot.transfer`, which only throws on an empty source or a full destination.
+- **26.2 crafts stone tools from `cobbled_deepslate`**, not from cobblestone.
+- **`recipes.json` is keyed by RESULT id** and holds several rows per key; the first row for
+  `crafting_table` is the cherry-planks one, so assert the shape, not the plank.
+- **`items.json` cannot be filtered by `enchantCategories` to find armour**: chestplates carry
+  only `equippable`/`armor`/`durability`/`vanishing`, with no `chest_armor`. Use name shape.
+- **`minecraft-data@1.21.4` disagrees with itself about ids** (`foods` vs `itemsByName`), which
+  is why everything reads the vendored 26.2 through `src/world/mcdata.ts`.
+- **The secret scanner flags credential-shaped strings in ANY file**, including tests. Build
+  fake keys from parts (`["sk","..."].join("-")`) — the scanner is not weakened, it just has
+  nothing to find in the file.
+- **`MemoryStore` holds the database open**, so a temp-dir cleanup on Windows needs an explicit
+  `close()` before `rmSync`.
+
+## Bugs the tests found this round (all fixed)
+
+Each of these was a real defect, not a test problem:
+
+| Found by | Bug |
+| --- | --- |
+| WP1 probes | `PathfinderModule.goals` declared only `GoalNear`, so `GoalFollow` was `undefined` and every follow silently failed |
+| WP1 probes | `parseAddressedCommand` lower-cased the line then matched the name case-sensitively, so **no command worked at all** while the probes passed |
+| WP2 tables | A material-tier tool ranking put **gold above iron** — the exact error the owner rejected for armour |
+| WP3 tests | `isPlayerEntity`'s username regex matched `"zombie"`, so Elix refused to defend the owner against a zombie |
+| WP3 tests | `bogged` was in the never-attacked list; the game data says it is hostile |
+| WP3 tests | `entityCategories` read only the array shape and ignored 26.2's plain-string category |
+| WP4 tests | `shouldCrouchGreet` used `0` as "never greeted", so nobody was greeted while the clock read 0 |
+| WP6 tests | `parseRemember` accepted "home and follow me" as one place name — two instructions in one hat |
+| WP7 tests | `.env` exists locally and is gitignored; the test asserted absence, which was the wrong invariant |
+| WP7 tests | `canReturnJson` did not know `openai/gpt-oss`, the guard role's own first choice |
+| WP9 tests | The localhost regex required end-of-string after `127.`, so `127.0.0.1` was reported as a **public** address |
+| WP9 secrets | My own status test contained credential-shaped literals, and the scanner was right to flag them |
+
+## Deviations — round 19 (extended) so far
+
+- `tests/unit/gatherWiring.test.ts` REWRITTEN against `RealSpeedBot`. The assertions are the
+  Round 18 ones; the fake is the one a game would give us. Reason: the old fake never moved
+  Elix and still expected a dig to happen, which is the exact bug R19-A fixes. Listed test by
+  test under the item table when R19-B finishes the fake audit.
+
+## Deviations this round (every test change I made)
+
+- `tests/unit/craft.test.ts` - `needsTable("crafting_table")` asserted `true`, now `false`, in two
+  places. Reason: a 2x2 recipe is an inventory recipe; the old value made "make a crafting
+  table" impossible. My own Round 17 tests encoding the bug this backlog fixes.
+- `tests/unit/doctor.test.ts` - the provider list asserted exactly `GROQ_API_KEY, HF_TOKEN`;
+  now includes `NVIDIA_API_KEY`. Reason: R18-H builds the NVIDIA provider, so a doctor that does
+  not mention it tells the owner their key is unused.
+- `tests/unit/worldMemoryWiring.test.ts` - the "dropped reply" case could NOT be driven through
+  the classifier fake (`speakIfAuditFinds` decides on new-detection state that earlier tests
+  leave behind), so it is asserted two other ways instead: a source-order assertion that
+  `runToolCalls` sits after the `gateReply` early return, and the pure gate refusing every call
+  when `replyDropped` is true. **The end-to-end dropped-reply path is therefore NOT verified** -
+  it is verified structurally and at the gate, not by driving a real drop.
+- No probe file was edited: round13/14/15/16/18 probes were read-only throughout and all nine
+  R18 probes pass unmodified.
+- Test fakes were made MORE faithful to mineflayer, never less (`heldItem` updates on equip).
+
+## Deviations this round (test changes I made)
+
+- `tests/unit/craft.test.ts` - two assertions changed from `needsTable("crafting_table") === true`
+  to `false`, and the same for `recipeFor("crafting_table").needsTable`. Reason: a 2x2 recipe is an
+  inventory recipe; the old value made "make a crafting table" impossible. My own Round 17 tests,
+  encoding the bug this backlog fixes.
+- `src/skills/give.ts` - no test change, but `HAND_CRAFTABLE` in `craft.ts` gained
+  `crafting_table`, which changes `needsTable()` behaviour on purpose (see above).
+- Test fakes changed to be MORE faithful to mineflayer, never less: the gather/craft/give fakes
+  now update `heldItem` on equip, because a fake that does not makes the weapon reflex re-equip
+  every tick and any equip assertion then measures the reflex instead of the skill.
+
+## Deviations
+
+Changes to tests I wrote myself, each one encoded a bug or a rule this backlog changed.
+
+- `tests/unit/actions.test.ts` — three changes, all WP1: the acknowledgement was asserted to go
+  through `gateScriptedReply` (the Round 15 **bug** — it classifies its input as the player's
+  words); the goal assertions described our own intent object rather than the library's real
+  `GoalFollow`/`rangeSq`; and entity stubs were `{ id: 1 }`, which the real `GoalFollow`
+  constructor throws on.
+- `tests/unit/config.test.ts` — "uses only the two cloud providers plus builtin" and
+  `removedVendorName()` both encoded the pre-WP7 world. The second used NVIDIA as its
+  "removed vendor" fixture, so after WP7 re-added NVIDIA it would have fed the schema a REAL
+  provider and proved nothing. Both now state the WP7 rule, and the guard-role list gained a
+  `canReturnJson` assertion.
+- `tests/unit/reflexes.test.ts` — my own new test asserted a `stop` leaves `endReason` null; a
+  flee completes on its own tick, which is what `finished` records.
+- `tests/unit/status.test.ts` — the fake key literals were assembled from parts because the
+  secret scanner flags credential-shaped strings in any file. The scanner is untouched.
+
+Production code changed outside the new-module rule — all wiring, signatures or types the
+brief itself required:
+
+- `src/connection/bot.ts` — the `PathfinderModule.goals` type, the spawn-walk gate, and the
+  `ACKNOWLEDGEMENTS` table made `Partial` as WP5 actions were added.
+- `src/actions/commands.ts` — `ActionName` grew the WP5/WP8 action names.
+- `src/memory/store.ts` — WP6 added `places()`, `addDeath`, `lastDeath`, `deaths`,
+  `deathCount`. Row type is spelled `Row` because `Record` is shadowed in that file.
+- `src/core/config.ts` — the provider enum gained `nvidia` and `ollama`.
+- `config/models.yaml`, `config/elix.yaml`, `.env.example`, `README.md` — WP7/WP9.
+
+## Questions for the owner (none was a stop condition)
+
+- **WP2:** the reflex tick runs on the existing 50 ms follow tick, and `armour` deliberately does
+  **not** interrupt follow — picking up a better sword while walking is what Elix should do.
+  Chosen; say if you want it to interrupt.
+- **WP3:** the brief asked for hostile mobs "from minecraft-data entity categories, not a
+  hand-written list". 26.2 *does* have `entitiesByName[x].category`, so `isHostileMob()` asks the
+  data first and keeps the hand-written set only as the fallback for a missing data pack.
+  `tests/unit/defend.test.ts` asserts every name in it agrees with the category.
+- **`owners` is global** (agreed). A per-profile list would let a test profile grant itself.
+- **WP10 command rows are opt-in** (agreed) via `--owners`, so a default run never grants
+  command rights.
+- **Still open from earlier rounds:** the owner's three manual in-game results are blank, and
+  **both API keys need rotating** (`.env` is gitignored but has been on this machine a long
+  time).
+
+## Gates
+
+At `3564c4e` (WP10):
+
+```
+pnpm typecheck  exit 0
+pnpm lint       exit 0
+pnpm test       Tests  1924 passed | 2 skipped (1926)
+round13Probes 8   round14Probes 6   round15Probes 5   round16Probes 6
+secret scan   9 passed
+```
+
+Progression this round: 1554 → 1620 → 1658 → 1691 → 1737 → 1772 → 1806 → 1835 → 1869 →
+1895 → 1922 → **1924** passed.
+
+## Notes for whoever picks this up
+
+- `tests/unit/round12A1.test.ts` and `partA.test.ts > counts a timeout toward the circuit
+  breaker` both contain **wall-clock / load-sensitive assertions**. Each failed once under
+  full-suite parallel load and passed alone and on re-run. Do not widen a threshold to make
+  them stable; the honest fix is fake timers for that measurement.
+- CRLF trap: `git checkout`/`git clone` restore CRLF, so any script that string-matches source
+  must `.replace(/\r\n/g,"\n")` first.
+- Quoting trap in `.cjs` patch scripts: apostrophes in emitted TypeScript break single-quoted JS
+  strings. The `write` and `edit` tools proved far more reliable in Round 17 — prefer them, and
+  when a patch script throws "not found", the anchor almost always has different indentation
+  than assumed. `Select-String -Context` shows **more** indentation than the file has.
+- vitest swallows `console.log`; write diagnostics to a file with `writeFileSync`.
+- `require()` is **not** available inside vitest test files (ESM). Import the module, or read
+  the file with `readFileSync`.
+- `packages/` test files cannot import a transitive dependency directly. `better-sqlite3` is
+  resolved through `tests/unit/sqliteLoader.ts`, which fails loudly if it cannot find a driver.
+### R18-C - what the gather rules cost, and two real bugs the tests found
+
+- `GoalGetToBlock(x, y, z)` takes **three numbers**, not a position object. Passing an object
+  silently yields NaN coordinates (`Math.floor({})` is NaN), so the goal paths nowhere. This is
+  exactly the bug class the real-library contract rule exists for - the fake accepted a shape the
+  real library rejects. Assert the goal's four per-tick methods AND its numeric fields.
+- Player clearance is `<= PLAYER_CLEARANCE`, not `<`. "Within 2 blocks of a player" includes the
+  block exactly two away; the test caught the boundary being read the other way.
+- **Test-fake trap:** mineflayer's `heldItem` changes when you equip. A fake that does not update it
+  makes the WEAPON reflex re-equip on every single tick - 149 equip calls for 5 digs - and any
+  equip assertion then measures the reflex, not the skill. Keep heldItem faithful.
+- To prove the GATHER equipped a pickaxe (not the reflex), hold a sword too: the reflex has a reason
+  to equip the sword, so a pickaxe in hand afterwards can only have come from the dig.
+- **A stop after a gather FINISHED proves nothing.** Ask for 64 items so the gather is still running
+  when the stop lands.
+### R18-D..R18-F - the real mineflayer API, read rather than assumed
+
+- **`bot.placeBlock(referenceBlock, faceVector)` takes NO item.** It places the HELD item.
+  So placing a table is equip-then-place, and a runtime that forgets the equip does nothing
+  while looking like it worked. `docs/api.md` is explicit about this.
+- **`bot.recipesFor(...)` is SYNCHRONOUS** and returns an array; `bot.craft(recipe, count, table)`
+  THROWS `Recipe requires craftingTable` when the table argument is null. The recipe object handed
+  to `craft` must come from `bot.recipesFor` - minecraft-data's recipe is a DIFFERENT shape and
+  the real library would reject it while every fake accepted it.
+- **`GoalGetToBlock(x,y,z)` and `GoalNear(x,y,z,range)` take NUMBERS.** Passing a position object
+  gives NaN coordinates through `Math.floor`, and Elix walks confidently in the wrong direction.
+- **A crafting table is a 2x2 recipe**, i.e. the INVENTORY grid. Round 17 listed it as needing a
+  table, which made "make a crafting table" impossible. Changed `HAND_CRAFTABLE`; two of my own
+  Round 17 assertions said the opposite and were corrected (see Deviations).
+- **`bot.toss(itemType, metadata, count)` / `window.deposit(itemType, metadata, count, nbt)`.**
+  The chest is a one-way door: `giveRuntime.ts` contains no `withdraw` call and a test asserts
+  that at the source level as well as in behaviour.
+- **A regression the read-only round16 probe caught:** `parseGoTo` listed `come` as a verb, so
+  "elix come here" became "walk to a place called here" and the real follow command never ran.
+  Removed `come`, and moved world memory AFTER `parseAddressedCommand` so no parser added later
+  can shadow follow/come/stop.
+- **The place book lives in MEMORY first and the store second.** A session with no store (every
+  bare unit test, and a bot whose data dir does not exist yet) must still remember a place told
+  to it thirty seconds ago, or "remember this place" silently does nothing.
+
+### R18-G..R18-I - what the last three items cost, and the tooling trap that nearly hid it
+
+- **The bridge has no bot and cannot have one.** It is the chat half. So the session registers
+  ONE executor (`setToolExecutor`) and the owner list (`setOwners`) on it, and the tool calls
+  land in `runCommand` - literally the same function a typed line lands in. That is what makes
+  the owner rule, the allow-list and `stop` apply identically with no second code path.
+- **Strip the tool block BEFORE anything is said**, not after: trimming, recording, the audit and
+  the send all use the stripped text. A block that reaches public chat teaches the whole server
+  how to type one.
+- **The owner prompt gets the tool format; a stranger's prompt does not mention tools at all.**
+- **`parseToolCalls` needs `player` for `follow`.** The probe passes it; I guessed without it and
+  the failure looked exactly like a gate refusal - a parse failure and a policy failure are
+  indistinguishable from the outside unless you read the schema.
+- **R18-I found 50 exports that nothing outside their own module imported** - 39 of them with no
+  test either, which are now simply not exported, and 11 more that were not even used inside
+  their own module and are deleted. `tests/unit/wiring.test.ts` now fails the build if a new
+  one appears. That is the point of the whole round.
+- **TOOLING TRAP (cost ~25 minutes):** in `String.replace`, the replacement `"$1 $name"` is a
+  group reference, not a literal. A loop that un-exported 39 names rewrote all 39 to the
+  literal text `$name` across 13 files. Every patch script must (a) verify every anchor BEFORE
+  writing, and (b) use a REPLACER FUNCTION, never a string with `$` in it.
+- **Second trap:** a cut heuristic that searched for the next `\n  }\n` found the wrong brace and
+  injected class members inside a constructor. `tsc` caught it in seconds; a heuristic that
+  "saves time" is not worth it.
+
+### R19-A - why 2027 green tests did not mean one working skill
+
+- **The whole round was ONE mistake wearing four costumes:** a 50 ms tick that assumes every
+  action finishes instantly. Real `dig` takes seconds, real `setGoal` RESETS the path and the
+  control states, and nothing is in reach until Elix has ARRIVED.
+- `src/skills/runtime.ts` is the fix and the only place the three rules live: ONE step in
+  flight (a tick that finds a step pending does nothing), ARRIVE before acting, and re-goal
+  only when the target has moved more than 2 blocks.
+- **`bot.findBlocks` returns COORDINATES.** Both `chestViewOf` (bot.ts) and `toBlock`
+  (giveRuntime.ts) were reading `.position` off the result, which is always undefined. The
+  chest never opened and no error ever appeared. `tests/helpers/realSpeedBot.ts` now returns
+  Vec3 and `openContainer` REJECTS a non-Block, exactly as mineflayer does.
+- **`RealSpeedBot` skips the DEFAULT landscape only.** A block the test places into `world` is
+  terrain the test chose, and must be findable even when its name is `stone` - the first
+  version filtered by name and made "mine 3 stone" unfindable.
+- **The wiring audit caught four of my own new dead exports** (`REACH`, `GOAL_MOVE_THRESHOLD`,
+  `eyeOf`, `reachDistance`) within minutes of writing them. It is doing its job.
+
+### R19-B - the contract file caught four of my own wrong claims
+
+- `docs/MINEFLAYER_CONTRACTS.md` + `tests/unit/mineflayerContracts.test.ts`. Every line is
+  asserted against the installed package, and the file itself is asserted to cover every API
+  the brief names.
+- Writing it found four things I had WRITTEN DOWN WRONGLY, all now corrected to the library:
+  `Math.round(air / 15)` is really `Math.round(metadata.value / 15)`; `findBlocks` is
+  implemented in `lib/plugins/blocks.js`, not `find.js`; `resetPath` is in the pathfinder's
+  `index.js` at the PACKAGE ROOT, not `lib/index.js`; and api.md says "[0, 20]", not "0-20".
+- **Tooling trap:** stripping `/package.json` off a resolved path with a regex takes the path
+  SEPARATOR with it, and the ENOENT that follows names a path with no file in it. Use
+  `dirname`/`join`, which `tests/unit/mineflayerPaths.ts` already did - use that helper.
+
+### R19-D..R19-G - what each one taught, and the traps
+
+- **R19-D: there was ALREADY a `setup` command** - a stub that printed "coming soon". Adding
+  a second one makes commander throw at STARTUP, which broke all 9 CLI tests at once and looked
+  like an unrelated failure. The wizard REPLACED the stub's action. Always check whether the
+  command name is already taken before registering one.
+- **The wizard writes the YAML line in place.** A parse-and-reserialise round trip would delete
+  every comment the owner wrote in the one file they are ever asked to read.
+- **`envKeyReport` returns BOOLEANS.** There is no key value anywhere in the shape, so there is
+  nothing to leak by accident, and a test asserts the wizard's whole output for the values.
+- **R19-E: an entity carries `position` directly; only a PLAYER wraps one in `.entity`.** Using
+  the player helper for hostile mobs made every hostile look position-less, and Elix slept
+  through creepers. Found by a real-speed test, not by reading the code.
+- **R19-E: a follow that is already AT the player is not a follow**, so `following` is correctly
+  false and Elix correctly sleeps. Two "failures" here were tests that had not started a walk.
+- **A test that measures a total must clear it first.** Elix is asleep within a tick of
+  spawning at night, so "did he sleep during the dig" has to be a difference, not a zero.
+
