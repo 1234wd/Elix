@@ -15,6 +15,12 @@ read at the start of every session, so it holds only what the next session needs
 |R20-E more crafting chains | TODO | - | 0 ||
 |R20-F voice step 1 | TODO | - | 0 ||
 
+- **R20-A1 is BLOCKED: the automated extraction does not work.** Two attempts (a naive brace
+  counter, then one that skips strings/comments) both produced a file that did not parse or
+  duplicated the file; the naive one cut a member in half on a `}` inside a template string.
+  It needs a hand edit that moves each member and rewires the call sites, which did not fit the
+  box. `tests/unit/fileSize.test.ts` IS in place as the ratchet, so no file can grow.
+  `bot.ts` is still 3,144 lines and `bridge.ts` 1,640.
 ## The R19-C / R20-A split plan
 
 `bot.ts` was 3,006 lines at the start of Round 20 and `bridge.ts` 1,640. Four extractions, each
