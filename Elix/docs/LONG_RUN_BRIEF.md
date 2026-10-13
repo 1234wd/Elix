@@ -1,62 +1,59 @@
-# ROUND 19 — LONG RUN (plan for 5+ hours of continuous work)
+# ROUND 20 — LONG RUN (built to go faster)
 
-You are continuing the Elix project at 8807eb8. The reviewer re-ran Round 18 on a fresh clone: typecheck 0, lint 0, 2027 passed / 2 skipped, and every probe file is green and unchanged. The wiring audit was a good idea and it worked: every Round 18 feature is now reachable from chat.
+You are continuing Elix at 9e14c28. The reviewer re-ran Round 19 on a fresh clone: typecheck 0, lint 0, 2103 passed / 2 skipped, every probe file green and unchanged. Gather, give, deposit and craft now pass the real-speed probes. The shared `realSpeedBot` helper and the contract file are exactly the right tools; keep using them.
 
-But the reviewer then ran the skills **at real speed**, and most of them do not work in a real game yet. The Round 18 fakes resolve `dig`, `toss`, `openContainer`, `placeBlock` and `craft` in the same microtask, and the fake pathfinder never moves. Real ones take hundreds of milliseconds to seconds. On top of that, the real mineflayer-pathfinder **clears the path and the control states on every `setGoal`** (`index.js` `resetPath('goal_updated')`, `clearStates = true`).
+This round runs inside an **automatic loop**. The owner starts `run-elix-agent.cmd`, which runs `opencode run --auto` again and again. Each session starts fresh and continues from `PROGRESS.md`. **You do not need to finish everything in one session.** Do one item properly, commit, update `PROGRESS.md`, and carry on until the session ends. The next session picks up where you stopped.
 
-`tests/unit/round19Probes.test.ts` uses a fake bot with real timing and real mineflayer rules. On 8807eb8, **5 fail and 1 passes**:
-
-- **Z1, gather.** `step()` runs every 50 ms with no in-flight guard and no arrival check. It digs 50 ms after setting the walk goal, out of reach, and the next tick's `dig` aborts the first one (mineflayer `digging.js` line 127). The gather ends with nothing gathered.
-- **Z2, give from far away.** `walkToAsker()` calls `setGoal` on every tick (measured: 400 resets in 20 s), so the real pathfinder never moves Elix. Nothing is given.
-- **Z3, give from close by.** `toss()` is re-entered while the first toss is awaited, so the owner gets the item 7 times.
-- **Z4, deposit.** It never starts. `bot.findBlocks` returns **coordinates, not blocks** (mineflayer `docs/api.md`), but `chestViewOf()` reads `found[0].position`, which is always undefined, so every chest is "too far". Behind that, `chestNear()` passes that Vec3 to `openContainer()`, which needs a Block, and `openContainer` would be re-entered every tick.
-- **Z5, craft.** `run()` advances the plan synchronously on each tick, so "crafting" starts while "place-table" is still awaiting `placeBlock`. It finds no table and refuses ("nowhere here to put a crafting table").
-
-Make all 6 pass by fixing the CODE.
+The reviewer found one new problem, in sleep. `tests/unit/round20Probes.test.ts` fails 3 of 5 on 9e14c28:
+- **W1.** "Owner in bed" is approximated as "an owner within 16 blocks of ANY bed". So at night near home, Elix gets into bed while the owner is awake. On a server, one sleeper does not skip the night, so he lies there until morning: no follow, no defend. mineflayer reports a real sleeper with the **`entitySleep`** event, and `entityWake` when they get up.
+- **W3.** Nothing ever calls **`bot.wake()`**. When a zombie comes close, the sleep runtime only clears its own flag. In the game Elix is still in the bed and cannot move.
+- **W4.** The same for "elix follow me" while asleep: he must get out of bed before walking.
+- W2 is the positive control and already passes.
 
 ---
 
-## 0. How to work for a long time without stopping
+## 0. How to work (faster than last round)
 
-**Step 0, before anything else:** overwrite `docs/LONG_RUN_BRIEF.md` with this whole message, unchanged, and commit it as `docs: round 19 brief`. After any reset, compaction or restart, read `docs/LONG_RUN_BRIEF.md` and `PROGRESS.md` first, and continue from the first unfinished item.
+**Step 0, once:** if `docs/LONG_RUN_BRIEF.md` does not already start with "# ROUND 20", overwrite it with this whole message, unchanged, and commit it as `docs: round 20 brief`. Every session starts by reading `docs/LONG_RUN_BRIEF.md` and `PROGRESS.md`.
 
-1. **Permissions are pre-approved, and questions are disabled.** Never wait for approval and never ask. Write questions into `PROGRESS.md`, take the safest default, record it under "Deviations", and keep going.
-2. **Fresh-clone gate inside the workspace**, as in Round 18 (`.fresh/elix`, gitignored). Run it at the end of **every** item.
-3. **One item at a time, no reports in between.** For each item:
+1. **Permissions are pre-approved, and questions are disabled.** Never wait and never ask. Write questions into `PROGRESS.md`, take the safest default, and keep going.
+2. **Faster gate cadence:**
+   - **While working on an item:** run only the test files you touched or that cover the code you changed (`pnpm exec vitest run <files>`), plus `pnpm typecheck`.
+   - **Before every commit:** the full working-tree gate (`pnpm typecheck`, `pnpm lint`, `pnpm test`) and `secrets.test.ts`.
+   - **Fresh-clone gate (`.fresh/elix`):** after R20-A, after every **third** item after that, and before the final report. Not after every item.
+3. **Keep context small.** Never read a whole file over 400 lines. Use `grep -n` and read only the ranges you need. R20-A comes first because it makes every later item cheaper.
+4. **Keep `PROGRESS.md` short.** Use one line per item: status, commit, test count. Add a "RESUME HERE" line naming the exact next step. Do not paste reports into it.
+5. **One item at a time:**
    1. Write the acceptance tests first and watch them fail.
    2. Implement.
-   3. Run the working-tree gates, then the fresh-clone gate, then `secrets.test.ts`.
-   4. Commit as `R19-<letter>: <title>`.
+   3. Run the gates.
+   4. Commit as `R20-<letter>: <title>`.
    5. Update `PROGRESS.md`.
-   6. **Go straight to the next item.**
-4. **Partial beats blocked.** **90-minute time box** per item; after that, reset to the last item commit and mark the item BLOCKED. Never commit red.
-5. **Stop only when:**
-   - every item is DONE, PARTIAL or BLOCKED;
-   - a gate cannot be made green even after reverting; or
-   - a step needs a secret, a push, or deleting anything outside the repo.
+   6. Go to the next item.
+6. **90-minute time box** per item. After that, reset to the last commit, mark the item BLOCKED with the reason, and move on. Never commit red.
+7. **When every item is DONE, PARTIAL or BLOCKED:**
+   1. run the final fresh-clone gate;
+   2. write the final report (§4) to `docs/ROUND20_REPORT.md`;
+   3. commit;
+   4. add the line `ROUND 20 COMPLETE` as the last line of `PROGRESS.md`.
+
+   That line stops the loop.
 
 ---
 
-## 1. Definition of DONE (Round 18's rule plus a real-speed rule)
+## 1. Definition of DONE (unchanged from Round 19)
 
-An item is DONE only when **all** of these hold:
-- A `BotSession`-level test drives it from its real trigger to a real mineflayer call.
-- **NEW: that test uses a real-speed fake.**
-  - Every async action takes time (`dig` ≥ 1 s, `toss`, `openContainer` and `placeBlock` ≥ 300 ms).
-  - A second `dig` aborts the first.
-  - `setGoal` restarts the walk, and arrival happens only if the goal is left alone.
-  - `findBlocks` returns **Vec3 coordinates**.
-  - `openContainer` rejects anything that is not a Block.
-
-  Put this fake in ONE shared helper (`tests/helpers/realSpeedBot.ts`) and use it for every skill test. Instant fakes may stay for pure logic tests only.
+- A real-speed `BotSession` test, using `tests/helpers/realSpeedBot.ts`, drives the feature from its real trigger to a real mineflayer call.
 - Every export has a production caller (the wiring audit stays green).
-- The fresh-clone gate is green.
+- The gates are green at the cadence in §0.2.
+
+Add to `realSpeedBot.ts` whatever new mineflayer behaviour an item needs (sleep and wake, `entitySleep`, the furnace API), and add a line to `docs/MINEFLAYER_CONTRACTS.md` with its test.
 
 ---
 
 ## 2. Hard rules (these apply to every item)
 
-- **Read-only files:** `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`, `round15Probes.test.ts`, `round16Probes.test.ts`, `round18Probes.test.ts` and `round19Probes.test.ts`. Never edit their assertions, delays or timeouts. They must all stay green after every WP.
+- **Read-only files:** `tests/unit/round13Probes.test.ts`, `round14Probes.test.ts`, `round15Probes.test.ts`, `round16Probes.test.ts`, `round18Probes.test.ts`, `round19Probes.test.ts` and `round20Probes.test.ts`. Never edit their assertions, delays or timeouts. They must all stay green after every WP.
 - **Never weaken an existing test to make it pass.** You may change a test you wrote yourself **only** when it encodes a bug this backlog is fixing. Each such change must be listed under "Deviations" with a one-line reason.
 - **Mineflayer-shaped data.** In tests, a player is `{ username, entity?: { position: Vec3, isValid, ... } }`, and positions are real `Vec3` objects from the `vec3` package. Mobs are mineflayer `Entity`-shaped (`name`, `type`, `position: Vec3`, `isValid`, `health` where relevant). No `as` casts on mineflayer objects; use runtime guards.
 - **NEW: real-library contract rule.** Anything handed to a third-party library (pathfinder goals, `Movements`, `bot.equip` / `bot.dig` / `bot.craft` / `bot.toss` arguments, `minecraft-data` lookups) must be checked against the **real** library in at least one test. A fake must never accept something the real library would reject. Round 15 shipped 22 green tests while every goal it built crashed the real pathfinder on the first tick.
@@ -74,7 +71,7 @@ An item is DONE only when **all** of these hold:
   - never dig within `protectedRadius` (default 24) of a remembered place (WP6);
   - only owners can command;
   - commands must be addressed to Elix.
-- **New code goes in new modules.** `bot.ts` is now 3,006 lines and `bridge.ts` is 1,640. R19-C splits them; after that, no file may grow past 800 lines.
+- **No file in `src/` may be over 800 lines** once R20-A is done, and a test enforces it.
 - **No new runtime dependencies** unless written down in `DECISIONS.md` with a reason. Prefer small in-house code over adding `mineflayer-pvp` and similar packages. `mineflayer-pathfinder`, `vec3` and the vendored `minecraft-data` are already available.
 - **Never** push, touch `.env`, print, log or commit a key, or commit the server IP anywhere new.
 - **Honesty in `PROGRESS.md`.** If something was not run, it says ❌. A test that only exercises a fake does not count as "live".
@@ -83,117 +80,85 @@ An item is DONE only when **all** of these hold:
 
 ## 3. The backlog (in this order)
 
-### R19-A — Skills at real speed (probes Z1–Z5)
+### R20-A — Split `bot.ts` and `bridge.ts` FIRST (no behaviour change)
 
-Build ONE shared base for every skill runtime (`src/skills/runtime.ts`) and move gather, give, deposit and craft onto it:
-- **An in-flight guard.** A tick never starts a step while the previous step's promise is still pending. The tick only checks "busy? then skip".
-- **Arrival before action.** After `setGoal`, wait until within reach: distance ≤ 4 for dig/place/open, ≤ `GIVE_RANGE` for toss. Use the distance check on the tick (or `goal_reached`) before digging, tossing, opening or placing.
-- **`setGoal` only when the goal changes.** Same target, same goal: do nothing. A moving target (the asker) gets a new goal only when it has moved more than 2 blocks since the last one.
-- **Craft advances one step only after the previous step has resolved.**
-- **Chests:** use `bot.blockAt(position)` to turn each `findBlocks` coordinate into a Block before reading `.name` or calling `openContainer`. Fix `chestViewOf` the same way.
-- **Stop:** clears the in-flight step, calls `bot.stopDigging()` and `pathfinder.stop()`, and the next tick does nothing.
-- **Tests:** `round19Probes` 6/6, plus your own real-speed `BotSession` tests per skill:
-  - stop mid-walk and mid-dig;
-  - the asker moves while Elix walks;
-  - a chest that is a coordinate (`findBlocks`) resolves to a Block;
-  - a craft that needs two steps.
+`bot.ts` is 3,143 lines and `bridge.ts` 1,640. Every later item reads and edits these files, so splitting them first makes the rest of the round faster and cheaper.
+- Use the four-step plan already in `PROGRESS.md` under "R19-C". Commit after **each step** (`R20-A1` … `R20-A4`), each with a full green gate, so a partial split is still progress.
+- Target: no file in `src/` over 800 lines. Add `tests/unit/fileSize.test.ts` that enforces this for all of `src/`. Add it only once every file passes; until then, list the remaining files in `PROGRESS.md`.
+- Test changes are allowed only in import paths. Every probe file and the wiring audit stay green.
 
-### R19-B — The mineflayer contract file
+### R20-B — Sleep like a friend (probes W1–W4)
 
-Create `docs/MINEFLAYER_CONTRACTS.md`: one line per API Elix uses, with the source line or docs section. It must cover at least:
-- `findBlocks` returns coordinates;
-- `findBlock` returns a Block;
-- `openContainer` needs a Block or Entity;
-- `placeBlock(reference, face)` places the **held** item;
-- `dig` aborts a running dig;
-- `stopDigging`;
-- `setGoal` resets the path and the control states;
-- `GoalNear` / `GoalGetToBlock` take numbers;
-- `toss(type, metadata, count)`;
-- `recipesFor` is synchronous;
-- `craft` needs the table Block for 3×3 recipes;
-- `oxygenLevel`, `food` and `health` are 0–20;
-- `whisper(username, text)`.
+- Track which players are really asleep from `entitySleep` / `entityWake`, and clear the list on respawn and disconnect. "Owner in bed" means an owner in that set.
+- `bot.wake()` is called, and awaited, before anything that needs Elix to move:
+  - a hostile within 8 blocks;
+  - any command (follow, come, gather, give, craft and the rest);
+  - a tool call;
+  - `elix stop`;
+  - the owner waking up (`entityWake`).
 
-Then add `tests/unit/mineflayerContracts.test.ts`, where every line is checked against the real installed library (source or behaviour), and make `realSpeedBot.ts` obey every line.
+  Never call `setGoal` while `bot.isSleeping` is true.
+- If `bot.sleep` throws (monsters nearby, not night), wait 30 s before trying again. Never retry on every tick.
+- Real-speed `BotSession` tests for each case, plus `round20Probes` 5/5.
 
-Then **audit every existing test fake** for these mistakes, especially `findBlocks` returning blocks. Fix the fakes, and list each one fixed under Deviations.
+### R20-C — Move the last instant-fake tests onto `realSpeedBot`
 
-### R19-C — Split `bot.ts` and `bridge.ts` (no behaviour change)
+Place memory ("take me to", "where is", "where did I die") and the model tool-call tests still use instant fakes (your own Round 19 note). Move them onto the real-speed helper, and fix anything that breaks. Tool-call actions must go through the same runtime base as typed commands, including the in-flight guard.
 
-`bot.ts` grew from 2,411 to 3,006 lines this round. Split it now, before more features land:
-- out of `bot.ts`, into `src/connection/`: chat dispatch, skill dispatch, the tick loop, presence, initiative wiring and crash guards;
-- out of `bridge.ts`, into `src/brain/`: audit store and gate, chat reply, wellbeing reply and tool-call execution.
+### R20-D — Smelting and an iron pickaxe (was R19-F)
 
-Target: no file over 800 lines, and add a test that enforces that for `src/`. Test changes are allowed only in import paths. Every probe and the wiring audit must stay green. If a step would change behaviour, stop that step, keep the ones done, and mark the item PARTIAL with the remaining steps listed.
+- "elix make an iron pickaxe" plans and runs the whole chain, each step on the runtime base:
+  1. gather iron ore;
+  2. find, or craft and place, a furnace;
+  3. smelt with `bot.openFurnace(furnaceBlock)`, `putFuel`, `putInput`, waiting for the output, then `takeOutput`;
+  4. sticks if needed;
+  5. the pickaxe on a table.
+- Missing materials get one honest line naming what is missing. Add contract lines for the furnace API, and real-speed tests.
 
-### R19-D — First-run wizard (was R18-J)
+### R20-E — More useful crafting chains
 
-- `pnpm elix setup` (and `elix.cmd setup`):
-  - asks for the owner's Minecraft name and writes `owners` in `config/elix.yaml`, keeping comments;
-  - checks which keys exist in `.env` **by name only**, never printing values;
-  - runs `elix doctor`, which now also checks Ollama reachability;
-  - prints the next three steps in plain words.
-- Tests with a temp project dir.
+- "elix make torches" (coal or charcoal plus sticks).
+- "elix make stone tools" (pickaxe, axe and sword from cobblestone).
+- "elix make a chest".
+- "elix make a furnace".
 
-### R19-E — Sleep when the owner sleeps (was R18-K)
+Each one reuses the R20-D planner, missing materials get one honest line, and each has a real-speed test.
 
-As specified in Round 18, built on the R19-A runtime base, with a real-speed `BotSession` test (`bot.sleep(bedBlock)`, `wake`).
+### R20-F — Voice, step 1 (no longer a stretch: voice is a big part of the owner's vision)
 
-### R19-F — First real Minecraft progression step: smelting and iron tools
+Do the offline-testable half of `docs/VOICE_PLAN.md`:
+- Simple Voice Chat packet encoding and decoding, built from the plugin's source for the pinned 26.2 build. Write the source references into the contract file.
+- AES encrypt and decrypt round trips.
+- The Opus 48 kHz / 20 ms frame pipeline, tested with constructed audio.
 
-- "elix make an iron pickaxe" plans and runs the whole chain, each step on the R19-A base:
-  1. gather iron ore (allow-list);
-  2. find or craft and place a furnace;
-  3. smelt with `bot.openFurnace(furnaceBlock)`, `putFuel`, `putInput` and `takeOutput`;
-  4. craft sticks if needed, then craft the pickaxe on a table.
-- Missing materials get one honest line naming what is missing.
-- Real-speed `BotSession` tests; contract lines for the furnace API.
-
-### R19-G — e2e rows for the owner
-
-Update `scripts/e2e-chat.ts` so the owner can run one command that walks through: get dirt, give, chest deposit, craft a wooden pickaxe, remember and where-is. Write the exact command into the report. Do not run it if you cannot reach the server.
-
-### R19-H — (stretch) Voice, step 1 (was R18-M)
-
-Offline-testable packet encoding and decoding and the Opus frame pipeline from `docs/VOICE_PLAN.md`, **disabled by default**.
+Everything stays behind `voice.enabled` (default false). No voice code runs when it is false, and a test proves that. Live voice comes in a later round.
 
 ---
 
-## 4. The final report (only once, at the very end)
+## 4. The final report (written to `docs/ROUND20_REPORT.md`)
 
 1. Fresh-clone and working-tree gates on the final commit.
-2. An item table: status by the §1 definition, commit, tests added, minutes.
-3. Probe files: round13 / 14 / 15 / 16 / 18 / 19 results.
-4. The contract file, and the list of test fakes it forced you to fix.
-5. The line counts of `bot.ts`, `bridge.ts` and the largest file in `src/`.
-6. Deviations, and questions for the owner.
-7. **Live-test steps for the owner, only for DONE items**, with the expected results.
-8. The vision checklist with Code / Real-speed test / Live columns.
-9. Secret scan, run immediately before the final commit. Do not push.
+2. An item table: status, commits, tests added, minutes.
+3. Probe files: round13 / 14 / 15 / 16 / 18 / 19 / 20 results.
+4. Line counts: the largest five files in `src/`.
+5. Deviations, and questions for the owner.
+6. **Live-test steps for the owner, only for DONE items**, with the expected results.
+7. The vision checklist with Code / Real-speed test / Live columns.
+8. Secret scan, run immediately before the final commit. Do not push.
 
 ---
 
 ## Appendix — the probe file
 
-`tests/unit/round19Probes.test.ts` was added verbatim from the reviewer's message and is READ-ONLY. Its header, in full:
+`tests/unit/round20Probes.test.ts` was added verbatim from the reviewer's message and is READ-ONLY. Baseline on `9e14c28`: **3 failed / 2 passed** (W1, W3 and W4 fail; the fixtures check and W2 pass). Its header, in full:
 
-> Round 19 — reviewer probes against 8807eb8: the skills at REAL SPEED.
+> Round 20 — reviewer probes against 9e14c28: sleeping like a friend, not like a rock.
 >
-> Every test asserts the WORKING behaviour. On 8807eb8 every test except the fixture check FAILS. Do not edit an assertion, delay or timeout. Fix the code.
+> Every test asserts the WORKING behaviour. On 9e14c28, W1, W3 and W4 FAIL; W2 is the positive control. Do not edit an assertion, delay or timeout. Fix the code.
 >
-> The Round 18 fakes resolve dig / toss / openContainer / placeBlock / craft in the same microtask, and the fake pathfinder never moves. The real ones take hundreds of ms to seconds, and the real mineflayer-pathfinder CLEARS the path and the control states on every setGoal (index.js resetPath('goal_updated'), clearStates = true). This fake bot keeps those two properties:
->
-> - every action takes real (fake-timer) time;
-> - dig() while a dig is running ABORTS the first one with "Digging aborted", exactly like mineflayer lib/plugins/digging.js line 127;
-> - setGoal() restarts the walk; Elix only arrives if the goal is left alone for 1 s.
->
-> What fails on 8807eb8, and why:
->
-> - **Z1** gather: step() runs every 50 ms with no in-flight guard and no arrival check. It digs 50 ms after setting the walk goal - out of reach - and the next tick's dig aborts the first, which ends the gather. Nothing is ever gathered.
-> - **Z2** give (asker 12 blocks away): walkToAsker() calls setGoal on every 50 ms tick, so the real pathfinder never gets to move. Elix never arrives; nothing is given.
-> - **Z3** give (asker close): toss() is re-entered while the first toss is awaited, so the owner gets the item several times.
-> - **Z4** deposit: never starts. bot.findBlocks returns COORDINATES (mineflayer docs/api.md: "the found block coordinates (not the blocks)"), but chestViewOf() reads found[0].position - always undefined - so every chest is "too far". Behind that, GiveRunner.chestNear() hands that Vec3 to openContainer(), which needs a Block, and openContainer() is re-entered on every 50 ms tick while the first open is awaited.
-> - **Z5** craft: run() advances the plan synchronously each tick, so "crafting" starts while "place-table" is still awaiting placeBlock, finds no table, and refuses.
+> - **W1** "owner in bed" is approximated as "an owner within 16 blocks of ANY bed", so at night near home Elix climbs into bed while the owner is awake and playing. A lone sleeper does not skip the night on a server, so he lies there until morning: no follow, no defend. mineflayer reports a real sleeper with the "entitySleep" event (docs/api.md), and "entityWake" when they get up.
+> - **W2** positive control: after the owner really sleeps ("entitySleep"), Elix walks to a free bed and calls bot.sleep(bedBlock).
+> - **W3** nothing ever calls bot.wake(). When a zombie comes close, the sleep runtime only clears its own flag - in the game Elix is still lying in the bed and cannot move.
+> - **W4** same for "elix follow me" while he is asleep: he must get up (bot.wake()) first.
 
-The full source is at `tests/unit/round19Probes.test.ts`, byte-for-byte as the reviewer wrote it.
+The full source is at `tests/unit/round20Probes.test.ts`, byte-for-byte as the reviewer wrote it.

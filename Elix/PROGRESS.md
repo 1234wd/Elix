@@ -5,7 +5,7 @@ leave the tree red.
 
 Round 17 finished at `ba2c275`. The reviewer's Round 18 brief is in `docs/LONG_RUN_BRIEF.md`.
 
-**RESUME HERE: R19-C (split bot.ts/bridge.ts - plan below), R19-F (smelting and iron tools), R19-H (voice, stretch).** R19-A, R19-B, R19-D, R19-E, R19-G DONE.
+**RESUME HERE: R20-A1 - extract the skill dispatch out of bot.ts into src/connection/skillDispatch.ts (the four-step plan is below), commit, then R20-A2 (chat dispatch), R20-A3 (tick loop), R20-A4 (bridge audit + wellbeing). Then R20-B sleep (probes W1-W4).**
 gather (X3), give (X4), world memory (X5), model tool calls (X6), NVIDIA/Ollama (X7).
 
 The single most important rule this round is §1 of the brief: **an item is DONE only with a
@@ -57,6 +57,7 @@ Read-only, never edited: `tests/unit/round13Probes.test.ts`, `round14Probes.test
 | R19-F smelting and iron tools | **NOT DONE** | `-` | 0 |
 | R19-G e2e rows for the owner | **DONE** | `f428552` | 6 new rows (S1-S6) |
 | R19-H voice, step 1 | **NOT DONE** | `-` | 0 |
+| R20-A split bot.ts/bridge.ts | **NEXT** | - | W1/W3/W4 failing |
 
 Baseline at `ba2c275`: **8 failed / 1 passed**. Now: **5 failed / 4 passed** (X0, X1, X2 and the
 fixture check).
@@ -455,3 +456,16 @@ four extractions, in this order, each re-exported verbatim from `bot.ts` so no i
 Then add the `src/` line-limit test. **Until every file is under 800 that test must NOT be
 added**: a limit test that only covers the files already split reads as "done" and is not.
 
+
+## Round 20 items
+
+| Item | Status | Commit | Tests |
+|---|---|---|---|
+| R20-A split bot.ts / bridge.ts (4 steps) | NEXT | - | 0 |
+| R20-B sleep like a friend (W1-W4) | NEXT | - | 0 |
+| R20-C move instant-fake tests to realSpeedBot | TODO | - | 0 |
+| R20-D smelting and an iron pickaxe | TODO | - | 0 |
+| R20-E more crafting chains | TODO | - | 0 |
+| R20-F voice step 1 | TODO | - | 0 |
+
+Round 20 probe baseline on `9e14c28`: **3 failed / 2 passed** (W1, W3, W4 fail; fixtures and W2 pass).
