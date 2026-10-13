@@ -160,6 +160,14 @@ export class RealSpeedBot extends EventEmitter implements BotLike {
 
   pathfinder = {
     setGoal: (goal: unknown): void => {
+      // Logging a goal set WHILE ASLEEP is how W4 catches a runtime that tries to walk out of
+      // a bed it never left.
+      this.goals.push({
+        x: (goal as { x?: number } | null)?.x,
+        y: (goal as { y?: number } | null)?.y,
+        z: (goal as { z?: number } | null)?.z,
+        whileAsleep: this.isSleeping,
+      });
       if (this.walk !== null) {
         clearTimeout(this.walk);
         this.goalResets += 1;
@@ -344,11 +352,39 @@ export class RealSpeedBot extends EventEmitter implements BotLike {
     this.stacks.push(makeItem(name, count, 40 + this.stacks.length));
   }
 
-  /** mineflayer's `bot.sleep(bedBlock)`. Overridden in the sleep tests to measure it. */
+  /** Set by `sleep`, cleared by `wake`. mineflayer exposes this as `bot.isSleeping`. */
+  isSleeping = false;
+  /** Every call, so a test can assert Elix did or did not get into a bed. */
+  sleepLog: string[] = [];
+  wakeLog: string[] = [];
+
+  /**
+   * mineflayer's `bot.sleep(bedBlock)`, with its refusals.
+   *
+   * The refusals matter: a fake that always succeeds hides the retry rule, and a bot that
+   * calls `sleep` on a chest every 50 ms is exactly the bug R20-B is fixing.
+   */
   async sleep(block: unknown): Promise<void> {
-    void block;
-    await new Promise((r) => setTimeout(r, 300));
+    const bed = block as { name?: unknown; position?: Vec3 } | null;
+    if (bed === null || typeof bed.name !== "string" || !bed.name.endsWith("_bed")) {
+      throw new Error("wrong block : not a bed block");
+    }
+    if (this.time?.isDay === true) throw new Error("it's not night and it's not a thunderstorm");
+    await new Promise((r) => setTimeout(r, 200));
+    this.isSleeping = true;
+    this.sleepLog.push("sleep");
   }
+
+  /** mineflayer's `bot.wake()`. Throws when already awake, as the real one does. */
+  async wake(): Promise<void> {
+    if (!this.isSleeping) throw new Error("already awake");
+    await new Promise((r) => setTimeout(r, 100));
+    this.isSleeping = false;
+    this.wakeLog.push("wake");
+  }
+
+  /** Every goal this fake was given, in order, with whether Elix was asleep at the time. */
+  goals: Array<{ x?: number; y?: number; z?: number; whileAsleep: boolean }> = [];
 
   _client = { on: (): void => {}, write: (): void => {} };
   quit(): void {

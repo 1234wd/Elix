@@ -99,10 +99,18 @@ async function started(setup: (bot: SleepBot) => void, isNight = false) {
   return { bot: bots[0]! };
 }
 
-/** Night, an owner nearby, a free bed two blocks away. The case that should sleep. */
-function nightWithBed(bot: SleepBot): void {
+/**
+ * Night, an owner ASLEEP, and a free bed two blocks away. The case that should sleep.
+ *
+ * R20-B: the owner has to be really asleep - mineflayer's `entitySleep` - not merely near a
+ * bed. These tests used to set the night and stop there, which is the approximation that put
+ * Elix in bed while the owner sat awake beside him.
+ */
+function nightWithBed(bot: SleepBot, owner: unknown): void {
   bot.time = { isDay: false };
   bot.world.set("2,64,0", "red_bed");
+  const asleep = owner as { username?: string; entity?: unknown } | undefined;
+  if (asleep?.entity !== undefined) bot.emit("entitySleep", asleep.entity);
 }
 
 beforeEach(() => {

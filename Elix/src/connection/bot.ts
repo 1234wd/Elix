@@ -645,6 +645,20 @@ function bedBlockIds(): number[] {
 }
 
 /**
+ * A player's name from an entity, for `entitySleep` / `entityWake`.
+ *
+ * mineflayer hands the raw entity, and depending on the version the name is on `username`
+ * or on `name` - so both are read and a guard picks the first real string.
+ */
+function playerNameOf(entity: unknown): string | null {
+  if (entity === null || typeof entity !== "object") return null;
+  const record = entity as { username?: unknown; name?: unknown };
+  if (typeof record.username === "string") return record.username;
+  if (typeof record.name === "string") return record.name;
+  return null;
+}
+
+/**
  * Hostile entity positions, from mineflayer's own entity map.
  *
  * Elix's OWN defender decides what counts as hostile (`isHostileMob`, which asks minecraft-data
@@ -947,6 +961,16 @@ export class BotSession {
   private readonly memory: MemoryStore | null;
   /** R19-E: the sleep runner. Created with the bot, like every other runtime. */
   private sleep: SleepRunner | null = null;
+
+  /**
+   * R20-B: the players mineflayer has reported as REALLY asleep.
+   *
+   * `entitySleep` puts a name in and `entityWake` takes it out; death, respawn and a fresh spawn
+   * clear it, because a name left in this set is a player Elix will follow into a bed they are
+   * not lying in.
+   */
+  private asleepPlayers = new Set<string>();
+
   private readonly scheduler = new ReconnectScheduler();
   /** Per-session outbound chat queue; created on first spawn. */
   private say: SayQueue | null = null;
@@ -1157,7 +1181,7 @@ export class BotSession {
    *   - `stop` maps to the same command, so it cancels whatever is running, mid-dig
    *     included.
    */
-  private runToolCall(bot: BotLike, call: ToolCall, askedBy: string): void {
+  private async runToolCall(bot: BotLike, call: ToolCall, askedBy: string): Promise<void> {
     const owners = (this.deps.config.owners ?? []).map((o) => o.toLowerCase());
     if (!owners.includes(askedBy.toLowerCase())) {
       this.deps.log.info({ askedBy, tool: call.tool }, "tool call refused: not an owner");
@@ -1173,6 +1197,8 @@ export class BotSession {
       this.deps.log.info({ tool: call.tool }, "tool call has no command yet");
       return;
     }
+    // R20-B: a tool call is not a chat line, so handleChat's wake does not cover it.
+    await this.sleep?.wakeNow();
     void this.runCommand(bot, askedBy, action, askedBy);
   }
 
@@ -1193,6 +1219,8 @@ export class BotSession {
     }
     return {
       following: this.follow?.busy === true,
+      // R20-B: mineflayer's own "these players are really asleep" set.
+      asleepOwners: [...this.asleepPlayers],
       skillBusy: this.gather !== null || this.craft !== null || this.give !== null,
       hostilePositions: hostilePositionsOf(bot),
       ownerPositions,
@@ -1718,9 +1746,7 @@ export class BotSession {
     // this "where did i die" has nothing to answer from.
     this.watchDeaths(bot);
     // R18-G: and the model's tool calls come in through the same door as typed commands.
-    this.deps.chatBridge?.setToolExecutor?.((call, askedBy) => {
-      this.runToolCall(bot, call, askedBy);
-    });
+    this.deps.chatBridge?.setToolExecutor?.((call, askedBy) => this.runToolCall(bot, call, askedBy));
     // R19-E: the sleep runner, on the shared real-speed base. The server's own `wake` event
     // is the honest signal that the night is over, so it is bound here rather than guessed.
     this.sleep = new SleepRunner({
@@ -1731,10 +1757,36 @@ export class BotSession {
     const wake = (): void => {
       this.sleep?.wake();
     };
-    (bot as { on?: (event: string, fn: () => void) => void }).on?.call(bot, "wake", wake);
+    const on = (bot as { on?: (event: string, fn: (...args: unknown[]) => void) => void }).on;
+    if (typeof on === "function") {
+      on.call(bot, "wake", wake);
+      // R20-B: who is REALLY asleep. An owner standing near a bed is not an owner in one, and
+      // treating the two the same is what put Elix to bed every night while the owner sat
+      // awake beside him.
+      on.call(bot, "entitySleep", (entity: unknown) => {
+        const name = playerNameOf(entity);
+        if (name !== null) this.asleepPlayers.add(name.toLowerCase());
+      });
+      on.call(bot, "entityWake", (entity: unknown) => {
+        const name = playerNameOf(entity);
+        if (name === null) return;
+        this.asleepPlayers.delete(name.toLowerCase());
+        // The owner is up and about, so Elix has no reason to be in bed either.
+        void this.sleep?.wakeNow();
+      });
+      on.call(bot, "playerGone", () => {
+        this.asleepPlayers.clear();
+      });
+      on.call(bot, "end", () => {
+        this.asleepPlayers.clear();
+      });
+    }
+    // A fresh bot has no sleepers, and is not in a bed.
+    this.asleepPlayers.clear();
     this.deps.chatBridge?.setOwners?.(this.deps.config.owners ?? []);
-    bot.on("chat", ((username: string, message: string) =>
-      this.handleChat(bot, username, message)) as never);
+    bot.on("chat", ((username: string, message: string) => {
+      void this.handleChat(bot, username, message);
+    }) as never);
     bot.on("kicked", ((raw: unknown) => this.handleKicked(raw)) as never);
     bot.on("end", ((reason: string) => this.handleEnd(reason)) as never);
 
@@ -1993,7 +2045,10 @@ export class BotSession {
     }, 30_000);
   }
 
-  private handleChat(bot: BotLike, username: string, message: string): void {
+  private async handleChat(bot: BotLike, username: string, message: string): Promise<void> {
+    // R20-B: `bot.wake()` is async and a goal set in the same millisecond still finds Elix IN
+    // BED. So the wake is awaited here, once, before any line-driven action - the W4 failure was
+    // a goal issued while he was still in the sheets.
     const { profile, log } = this.deps;
     if (username === profile.username) return;
     bus.emit("bot:chat", { username, text: message });
@@ -2027,6 +2082,10 @@ export class BotSession {
     // R18-C: a SKILL line runs the skill. This sits between the wellbeing floor and the
     // command parse, so "elix get 5 dirt" never reaches the chat model - which is what the
     // reviewer's X3 probe measures, and what "nothing happens" looked like on a live server.
+    // R20-B: anything addressed to Elix may need him to MOVE, and `bot.wake()` is the only
+    // thing that takes him out of a bed. One call here covers commands and skills alike, because
+    // before this the runtime only cleared a flag and Elix stayed in the bed in the game.
+    await this.sleep?.wakeNow();
     if (this.dispatchGather(bot, username, message)) return;
     // R18-D: same rules, same place - craft is a skill line, not a chat line.
     if (this.dispatchCraft(bot, username, message)) return;
